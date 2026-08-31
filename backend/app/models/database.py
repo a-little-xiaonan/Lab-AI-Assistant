@@ -20,6 +20,8 @@ class ChatSession(Base):
     """对话会话：MVP 单知识库，knowledge_base_id 固定 kb_default（Phase 2-02 放开）。
 
     name：会话标题。首轮对话后由 AI 自动生成；用户手动改名后 AI 不再覆盖（用户优先）。
+    deleted_at：逻辑删除标记（NULL=活跃，非空=已删除可恢复）；物理清理由
+    session_cleanup 按 purge 天数执行。
     """
 
     __tablename__ = "sessions"
@@ -27,6 +29,7 @@ class ChatSession(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)  # sess_ 前缀 UUID
     knowledge_base_id: Mapped[str] = mapped_column(String(64), default="kb_default")
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 

@@ -84,7 +84,8 @@ class Settings(BaseSettings):
     memory_idle_ttl_seconds: int = 3600  # 实例空闲过期时间
 
     # ----- 会话保留（自动清理）-----
-    session_retention_days: int = 3            # 超过 N 天未更新的会话自动删除
+    session_retention_days: int = 3            # 超过 N 天未更新的活跃会话 → 逻辑删除
+    session_purge_days: int = 30               # 已逻辑删除超过 N 天 → 物理删除（含消息与长期记忆）
     session_cleanup_interval_hours: int = 6    # 定时清理间隔（小时；启动时也清一次）
 
     # ----- 长期记忆（Phase 3-03）-----

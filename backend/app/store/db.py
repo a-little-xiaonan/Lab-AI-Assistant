@@ -136,11 +136,28 @@ def _migrate_and_cleanup() -> None:
         db.commit()
 
 
+def _migrate_add_deleted_at() -> None:
+    """增量迁移：sessions 表加 deleted_at 列（逻辑删除标记，NULL=活跃）。"""
+    from sqlalchemy import inspect as sa_inspect
+
+    insp = sa_inspect(engine)
+    if "sessions" not in insp.get_table_names():
+        return
+    cols = {c["name"] for c in insp.get_columns("sessions")}
+    if "deleted_at" in cols:
+        return
+    with SessionLocal() as db:
+        db.execute(text("ALTER TABLE sessions ADD COLUMN deleted_at DATETIME NULL"))
+        db.commit()
+    logger.info("迁移完成：sessions 表新增 deleted_at 列（逻辑删除）")
+
+
 def init_db() -> None:
     _ensure_mysql_database()
     Base.metadata.create_all(engine)
     _migrate_add_session_name()
     _migrate_add_chunk_updated_at()
+    _migrate_add_deleted_at()
     _seed_default_knowledge_base()
     _migrate_and_cleanup()
 

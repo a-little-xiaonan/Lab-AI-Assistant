@@ -34,7 +34,7 @@ from app.llm.errors import LLMError
 from app.llm.prompt_templates import build_session_name_messages
 from app.memory.long_term import long_term_memory
 from app.memory.memory_manager import memory_manager
-from app.models.database import ChatSession, Message
+from app.models.database import ChatSession, Message, utcnow
 from app.models.schemas import (
     ChatRequest,
     SessionBatchDelete,
@@ -56,9 +56,21 @@ def _new_session_id() -> str:
 
 def _get_or_create_session(db: Session, session_id: str | None, kb_id: str) -> ChatSession:
     if session_id:
-        session = db.get(ChatSession, session_id)
+        session = db.scalar(
+            select(ChatSession).where(
+                ChatSession.id == session_id, ChatSession.deleted_at.is_(None)
+            )
+        )
         if session is not None:
             return session
+        # 已逻辑删除的会话 id 传入 → 复活（误删可恢复，记忆/消息都还在）
+        deleted = db.get(ChatSession, session_id)
+        if deleted is not None:
+            deleted.deleted_at = None
+            db.commit()
+            db.refresh(deleted)
+            logger.info("复活已删除会话：%s", session_id)
+            return deleted
         # 未知 session_id：自动创建（记录在案的一致行为）
         session = ChatSession(id=session_id, knowledge_base_id=kb_id)
     else:
@@ -259,12 +271,22 @@ def rename_session(
 
 @router.get("/chat/sessions", response_model=list[SessionOut])
 def list_sessions(db: Session = Depends(get_db)) -> list[ChatSession]:
-    return list(db.scalars(select(ChatSession).order_by(ChatSession.updated_at.desc())))
+    return list(
+        db.scalars(
+            select(ChatSession)
+            .where(ChatSession.deleted_at.is_(None))
+            .order_by(ChatSession.updated_at.desc())
+        )
+    )
 
 
 @router.get("/chat/sessions/{session_id}", response_model=SessionDetailOut)
 def get_session(session_id: str, db: Session = Depends(get_db)) -> ChatSession:
-    session = db.get(ChatSession, session_id)
+    session = db.scalar(
+        select(ChatSession).where(
+            ChatSession.id == session_id, ChatSession.deleted_at.is_(None)
+        )
+    )
     if session is None:
         raise NotFoundError("session_not_found", f"会话不存在：{session_id}")
     return session
@@ -272,31 +294,55 @@ def get_session(session_id: str, db: Session = Depends(get_db)) -> ChatSession:
 
 @router.delete("/chat/sessions/{session_id}")
 def delete_session(session_id: str, db: Session = Depends(get_db)) -> dict:
+    """逻辑删除（软删）：标记 deleted_at，数据与记忆保留，可恢复（见 restore）。"""
+    session = db.scalar(
+        select(ChatSession).where(
+            ChatSession.id == session_id, ChatSession.deleted_at.is_(None)
+        )
+    )
+    if session is None:
+        raise NotFoundError("session_not_found", f"会话不存在：{session_id}")
+    session.deleted_at = utcnow()
+    db.commit()
+    return {"deleted": session_id}
+
+
+@router.put("/chat/sessions/{session_id}/restore")
+def restore_session(session_id: str, db: Session = Depends(get_db)) -> SessionOut:
+    """恢复已逻辑删除的会话（消息与长期记忆都保留）。"""
     session = db.get(ChatSession, session_id)
     if session is None:
         raise NotFoundError("session_not_found", f"会话不存在：{session_id}")
-    long_term_memory.clear_session(session_id, session.knowledge_base_id)  # 同步清该会话的记忆
-    db.delete(session)  # 级联删除消息（cascade="all, delete-orphan"）
+    session.deleted_at = None
     db.commit()
-    return {"deleted": session_id}
+    db.refresh(session)
+    return session
 
 
 @router.delete("/chat/sessions")
 def batch_delete_sessions(
     body: SessionBatchDelete, db: Session = Depends(get_db)
 ) -> dict:
-    """批量删除会话（session_ids 指定；缺省或 all=true → 全部）。
-
-    每个会话同步清理其长期记忆；级联删除消息。返回删除数量。
-    """
+    """批量逻辑删除（session_ids 指定；缺省或 all=true → 全部活跃会话）。"""
     if body.all or not body.session_ids:
-        targets = list(db.scalars(select(ChatSession)))
+        targets = list(
+            db.scalars(select(ChatSession).where(ChatSession.deleted_at.is_(None)))
+        )
     else:
-        targets = [t for t in (db.get(ChatSession, sid) for sid in body.session_ids) if t is not None]
+        targets = [
+            t
+            for t in (
+                db.scalar(
+                    select(ChatSession).where(
+                        ChatSession.id == sid, ChatSession.deleted_at.is_(None)
+                    )
+                )
+                for sid in body.session_ids
+            )
+            if t is not None
+        ]
     for s in targets:
-        long_term_memory.clear_session(s.id, s.knowledge_base_id)
-    for s in targets:
-        db.delete(s)
+        s.deleted_at = utcnow()
     db.commit()
-    logger.info("批量删除会话 %d 个（all=%s）", len(targets), body.all or not body.session_ids)
+    logger.info("批量逻辑删除会话 %d 个（all=%s）", len(targets), body.all or not body.session_ids)
     return {"deleted": len(targets)}
