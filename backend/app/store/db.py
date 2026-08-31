@@ -75,6 +75,25 @@ def _seed_default_knowledge_base() -> None:
         db.commit()
 
 
+def _migrate_add_session_name() -> None:
+    """增量迁移：sessions 表加 name 列（create_all 不动已存在表）。
+
+    幂等：inspect 检查列是否存在，不存在才 ALTER（MySQL/SQLite 都支持 ADD COLUMN）。
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    insp = sa_inspect(engine)
+    if "sessions" not in insp.get_table_names():
+        return
+    cols = {c["name"] for c in insp.get_columns("sessions")}
+    if "name" in cols:
+        return
+    with SessionLocal() as db:
+        db.execute(text("ALTER TABLE sessions ADD COLUMN name VARCHAR(255) NULL"))
+        db.commit()
+    logger.info("迁移完成：sessions 表新增 name 列")
+
+
 def _migrate_and_cleanup() -> None:
     """启动期一次性迁移与清扫（全部幂等，重复执行无副作用）。
 
@@ -103,6 +122,7 @@ def _migrate_and_cleanup() -> None:
 def init_db() -> None:
     _ensure_mysql_database()
     Base.metadata.create_all(engine)
+    _migrate_add_session_name()
     _seed_default_knowledge_base()
     _migrate_and_cleanup()
 

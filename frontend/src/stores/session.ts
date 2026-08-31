@@ -153,6 +153,8 @@ export const useSessionStore = defineStore("session", {
             assistantMsg.sources = evt.data.sources;
             assistantMsg.streaming = false;
             await this.loadSessions();
+            // AI 会话命名是后台异步的：延迟二次刷新，让列表显示新标题
+            setTimeout(() => this.loadSessions(), 3000);
           } else if (evt.event === "error") {
             flush();
             assistantMsg.streaming = false;

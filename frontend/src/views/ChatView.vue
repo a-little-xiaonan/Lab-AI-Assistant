@@ -11,24 +11,30 @@
         </el-button>
       </div>
       <el-scrollbar class="session-list">
+        <div class="session-count" v-if="store.sessions.length > 5">
+          共 {{ store.sessions.length }} 个会话，显示前 5 个
+        </div>
         <div
-          v-for="s in store.sessions"
+          v-for="s in store.sessions.slice(0, 5)"
           :key="s.id"
           class="session-item"
           :class="{ active: s.id === store.currentSessionId }"
           @click="store.switchSession(s.id)"
         >
-          <span class="session-title">{{ s.id.slice(0, 8) }}</span>
-          <el-button
-            v-if="s.id === store.currentSessionId"
-            link
-            type="danger"
-            size="small"
-            class="session-delete"
-            @click.stop="confirmDelete(s)"
-          >
-            删
-          </el-button>
+          <span class="session-title">{{ s.name || "新会话" }}</span>
+          <span class="session-actions" @click.stop>
+            <el-button link size="small" title="重命名" @click="renameSession(s)">✎</el-button>
+            <el-button
+              v-if="s.id === store.currentSessionId"
+              link
+              type="danger"
+              size="small"
+              title="删除会话"
+              @click="confirmDelete(s)"
+            >
+              删
+            </el-button>
+          </span>
         </div>
       </el-scrollbar>
     </el-aside>
@@ -82,8 +88,10 @@ import { onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import ChatMessage from "../components/ChatMessage.vue";
 import MessageInput from "../components/MessageInput.vue";
+import { renameSession as apiRenameSession } from "../api/sessions";
 import { useSessionStore } from "../stores/session";
 import { useKnowledgeBasesStore } from "../stores/knowledgeBases";
+import type { SessionItem } from "../types";
 
 const store = useSessionStore();
 const kbStore = useKnowledgeBasesStore();
@@ -94,6 +102,24 @@ function scrollToBottom() {
     const el = scrollbarRef.value;
     if (el) el.setScrollTop(el.wrapRef?.scrollHeight ?? 0);
   });
+}
+
+async function renameSession(session: SessionItem) {
+  try {
+    const { value } = await ElMessageBox.prompt("修改会话名称", "重命名", {
+      inputValue: session.name || "",
+      confirmButtonText: "保存",
+      cancelButtonText: "取消",
+      inputPlaceholder: "输入会话名称",
+    });
+    const name = value.trim();
+    if (!name) return;
+    await apiRenameSession(session.id, name);
+    await store.loadSessions();
+    ElMessage.success("已重命名");
+  } catch {
+    /* 取消 */
+  }
 }
 
 async function confirmDelete(session: { id: string }) {
@@ -161,9 +187,20 @@ watch(
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
 }
-.session-delete {
+.session-actions {
   flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.session-item:hover .session-actions {
+  opacity: 1;
+}
+.session-count {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  padding: 4px 16px;
 }
 .header {
   display: flex;

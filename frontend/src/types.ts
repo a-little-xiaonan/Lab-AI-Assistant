@@ -19,6 +19,7 @@ export interface Source {
 export interface SessionItem {
   id: string;
   knowledge_base_id: string;
+  name: string | null;
   created_at: string;
   updated_at: string;
 }

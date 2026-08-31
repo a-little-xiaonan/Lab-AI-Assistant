@@ -29,12 +29,20 @@ from sqlalchemy.orm import Session
 
 from app.api.errors import ApiError, BadRequestError, NotFoundError
 from app.core.rag_pipeline import answer, answer_stream
+from app.llm import qwen
 from app.llm.errors import LLMError
+from app.llm.prompt_templates import build_session_name_messages
 from app.memory.long_term import long_term_memory
 from app.memory.memory_manager import memory_manager
 from app.models.database import ChatSession, Message
-from app.models.schemas import ChatRequest, SessionCreate, SessionDetailOut, SessionOut
-from app.store.db import get_db
+from app.models.schemas import (
+    ChatRequest,
+    SessionCreate,
+    SessionDetailOut,
+    SessionOut,
+    SessionRename,
+)
+from app.store.db import SessionLocal, get_db
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +135,16 @@ def _remember_turn(
     except Exception:
         logger.exception("短期记忆更新失败：session=%s", session_id)
     _schedule_memory_extract(session_id, kb_id, user_content, assistant_content)
+    _schedule_auto_name(session_id)  # 首轮后为未命名会话生成标题
+
+
+def _schedule_background(fn) -> None:
+    """后台线程执行（Fire-and-forget）：有事件循环走 to_thread，否则起守护线程。"""
+
+    try:
+        asyncio.get_running_loop().create_task(asyncio.to_thread(fn))
+    except RuntimeError:  # 无事件循环的调用上下文兜底
+        threading.Thread(target=fn, daemon=True).start()
 
 
 def _schedule_memory_extract(
@@ -139,10 +157,43 @@ def _schedule_memory_extract(
             session_id, kb_id, [("user", user_content), ("assistant", assistant_content)]
         )
 
+    _schedule_background(_run)
+
+
+def _auto_name_session(session_id: str) -> None:
+    """AI 命名：首轮对话后为未命名会话生成标题（≤15 字）。
+
+    用户已改名（name 非空）→ 跳过，不覆盖（用户优先）。
+    """
     try:
-        asyncio.get_running_loop().create_task(asyncio.to_thread(_run))
-    except RuntimeError:  # 无事件循环的调用上下文兜底
-        threading.Thread(target=_run, daemon=True).start()
+        db = SessionLocal()
+        try:
+            session = db.get(ChatSession, session_id)
+            if session is None or session.name:
+                return
+            first = db.scalar(
+                select(Message)
+                .where(Message.session_id == session_id, Message.role == "user")
+                .order_by(Message.id)
+                .limit(1)
+            )
+            if first is None:
+                return
+            title = qwen.chat_completion(build_session_name_messages(first.content))
+            title = title.strip().strip('"\'"').strip("「」").strip()[:20]
+            if not title:
+                return
+            session.name = title
+            db.commit()
+            logger.info("AI 生成会话标题：%s → %s", session_id, title)
+        finally:
+            db.close()
+    except Exception:
+        logger.exception("会话命名失败：%s", session_id)
+
+
+def _schedule_auto_name(session_id: str) -> None:
+    _schedule_background(lambda: _auto_name_session(session_id))
 
 
 @router.post("/chat")
@@ -183,8 +234,23 @@ def create_session(body: SessionCreate | None = None, db: Session = Depends(get_
     session = ChatSession(
         id=_new_session_id(),
         knowledge_base_id=body.knowledge_base_id if body else "kb_default",
+        name=body.name if body else None,
     )
     db.add(session)
+    db.commit()
+    db.refresh(session)
+    return session
+
+
+@router.put("/chat/sessions/{session_id}", response_model=SessionOut)
+def rename_session(
+    session_id: str, body: SessionRename, db: Session = Depends(get_db)
+) -> SessionOut:
+    """用户改名（用户优先：AI 命名只在 name 为空时生成，不覆盖用户设置）。"""
+    session = db.get(ChatSession, session_id)
+    if session is None:
+        raise NotFoundError("session_not_found", f"会话不存在：{session_id}")
+    session.name = body.name.strip()
     db.commit()
     db.refresh(session)
     return session

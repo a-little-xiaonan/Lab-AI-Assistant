@@ -114,6 +114,18 @@ def build_summarize_history_messages(messages: list[tuple[str, str]]) -> list[di
     ]
 
 
+SESSION_NAME_SYSTEM = """你是对话标题生成器。根据用户的第一条消息，生成一个简短的中文标题
+（不超过 15 个字），概括对话主题。只输出标题本身，不要引号、不要任何其他内容。"""
+
+
+def build_session_name_messages(first_message: str) -> list[dict]:
+    """首轮对话后为会话生成标题（AI 命名，≤15 字）。"""
+    return [
+        {"role": "system", "content": SESSION_NAME_SYSTEM},
+        {"role": "user", "content": f"第一条消息：{first_message}"},
+    ]
+
+
 def build_query_rewrite_messages(query: str) -> list[dict]:
     """[Phase 3-01 占位] 查询改写。"""
     return [

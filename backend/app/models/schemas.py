@@ -26,11 +26,17 @@ class ChatResponse(BaseModel):
 
 class SessionCreate(BaseModel):
     knowledge_base_id: str = "kb_default"
+    name: str | None = None  # 可选：创建时直接命名（不传则由 AI 首轮后生成）
+
+
+class SessionRename(BaseModel):
+    name: str = Field(min_length=1, max_length=50)  # 用户改名（AI 命名后不再覆盖）
 
 
 class SessionOut(BaseModel):
     id: str
     knowledge_base_id: str
+    name: str | None = None
     created_at: datetime
     updated_at: datetime
     model_config = ConfigDict(from_attributes=True)

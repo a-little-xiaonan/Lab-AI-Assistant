@@ -27,3 +27,13 @@ export async function deleteSession(sessionId: string): Promise<void> {
   const resp = await fetch(`/api/chat/sessions/${sessionId}`, { method: "DELETE" });
   if (!resp.ok) throw new Error(`删除会话失败（${resp.status}）`);
 }
+
+export async function renameSession(sessionId: string, name: string): Promise<SessionItem> {
+  const resp = await fetch(`/api/chat/sessions/${sessionId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!resp.ok) throw new Error(`重命名失败（${resp.status}）`);
+  return resp.json();
+}
