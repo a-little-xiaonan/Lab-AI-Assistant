@@ -44,7 +44,6 @@
             :value="kb.id"
           />
         </el-select>
-        <el-button link @click="$router.push('/settings')">设置</el-button>
       </el-header>
 
       <el-main class="main">
