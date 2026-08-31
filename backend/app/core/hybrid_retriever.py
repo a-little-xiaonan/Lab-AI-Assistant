@@ -2,7 +2,7 @@
 
 - 向量侧：查询（单条；Phase 3-01 起支持多查询并发）→ embed → 各查 top-k → 按 chunk_id
   合并（score 取 max）→ 排序取 top-k 作为单条有序列表参与 RRF
-- 关键词侧：默认只用原始问题（keyword_use_rewritten=true 时同多查询合并逻辑）
+- 关键词侧：原问题 + 术语展开变体（Phase 3-01 规则兜底；keyword_use_rewritten=true 时同向量侧多查询）
 - RRF：score = Σ 1/(k + rank)，k=60；按 chunk_id（≡ (doc_id, chunk_index)）去重
 - similarity_threshold 不再硬过滤（关键词独有命中不能被阈值误杀），只做观测日志
 - 顺序：候选 top-20 → （Phase 3-02 重排，rerank_enabled）→ 取 top-n → token 预算截断
@@ -76,15 +76,22 @@ def _merge_query_results(
     return [(cid, sim, text, md) for cid, (sim, text, md) in ranked]
 
 
-def _keyword_hits(kb_id: str, query: str, top_k: int) -> list[tuple[str, float, str, dict]]:
-    """BM25 关键词检索 → [(chunk_id, score, text, meta)]，meta 从索引取。"""
-    out = []
-    for chunk_id, score in keyword_index.search(kb_id, query, top_k):
-        text = keyword_index.get_text(kb_id, chunk_id)
-        meta = keyword_index.get_meta(kb_id, chunk_id)
-        if text is not None and meta is not None:
-            out.append((chunk_id, score, text, meta))
-    return out
+def _keyword_hits(kb_id: str, queries: list[str], top_k: int) -> list[tuple[str, float, str, dict]]:
+    """多查询 BM25 检索 → 按 chunk_id 合并（score 取 max）→ 降序截 top_k。
+
+    术语展开变体与 LLM 改写查询共用此路径（合并语义与向量侧一致）。
+    """
+    merged: dict[str, tuple[float, str, dict]] = {}
+    for q in queries:
+        for chunk_id, score in keyword_index.search(kb_id, q, top_k):
+            prev = merged.get(chunk_id)
+            if prev is None or score > prev[0]:
+                text = keyword_index.get_text(kb_id, chunk_id)
+                meta = keyword_index.get_meta(kb_id, chunk_id)
+                if text is not None and meta is not None:
+                    merged[chunk_id] = (score, text, meta)
+    ranked = sorted(merged.items(), key=lambda kv: kv[1][0], reverse=True)[:top_k]
+    return [(cid, s, t, m) for cid, (s, t, m) in ranked]
 
 
 def retrieve(
@@ -114,9 +121,19 @@ def retrieve(
     vector_list = _merge_query_results(kb_id, queries, vector_top_k)
     vector_ids = {cid for cid, *_ in vector_list}
 
-    # 关键词侧（默认只用原问题：词面精确优先）
-    kw_query = query_text
-    kw_list = _keyword_hits(kb_id, kw_query, kw_top_k)
+    # 关键词侧查询：默认 原问题 + 术语展开变体（Phase 3-01 补强：口语→标准术语的
+    # 规则兜底，喂词面匹配侧收益最大）；keyword_use_rewritten=true → 同向量侧全列表
+    if settings.keyword_use_rewritten:
+        kw_queries = queries
+    else:
+        try:
+            from app.core.term_aliases import term_aliases
+
+            kw_queries = term_aliases.expand(query_text)
+        except Exception:
+            logger.exception("术语展开失败，关键词侧降级为原问题")
+            kw_queries = [query_text]
+    kw_list = _keyword_hits(kb_id, kw_queries, kw_top_k)
 
     # RRF 融合（按 chunk_id 去重）
     rrf: dict[str, tuple[float, RetrievedChunk]] = {}

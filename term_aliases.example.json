@@ -1,0 +1,7 @@
+{
+  "_comment": "术语归一化映射表（示例）。复制为 data/term_aliases.json 后按需编辑；键为知识库中的标准术语，值为用户可能使用的口语/别名；查询命中别名时自动替换为标准术语参与关键词检索（改文件热生效，不用重启）。",
+  "通义千问": ["千问", "qwen", "Qwen", "qwen-plus"],
+  "阿里云百炼": ["百炼", "bailian", "model studio", "模型工作室"],
+  "TextReRank": ["rerank模型", "rerank 模型", "重排模型"],
+  "text-embedding-v3": ["embedding模型", "embedding 模型", "向量模型"]
+}

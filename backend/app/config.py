@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     rewrite_query_count: int = 3            # 改写总数上限（含原查询）
     rewrite_model: str = ""                 # 改写用模型；空 → llm_model（可用独立模型验证降级）
 
+    # ----- 术语归一化（Phase 3-01 补强：规则兜底）-----
+    term_aliases_enabled: bool = True       # 口语别名 → 标准术语（喂关键词侧；false 时关键词侧只用原问题）
+    term_aliases_file: str = "./data/term_aliases.json"  # 相对项目根；不存在时回退 term_aliases.example.json
+    term_alias_max_expansions: int = 4      # 单查询展开变体上限（防查询列表爆炸）
+
     # ----- 重排（Phase 3-02）-----
     rerank_enabled: bool = False            # 默认关（评估后定）；开启后 RRF 候选集精排
     rerank_top_n: int = 5                   # 重排后进上下文的条数
