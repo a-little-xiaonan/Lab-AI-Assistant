@@ -6,6 +6,9 @@
         <el-button type="primary" size="small" style="width: 100%" @click="store.createSession()">
           ＋ 新建会话
         </el-button>
+        <el-button size="small" style="width: 100%; margin: 8px 0 0" @click="$router.push('/knowledge-bases')">
+          📚 知识库管理
+        </el-button>
       </div>
       <el-scrollbar class="session-list">
         <div
@@ -33,9 +36,9 @@
     <el-container>
       <!-- 顶部：知识库选择器 -->
       <el-header class="header">
-        <el-select v-model="store.kbId" placeholder="选择知识库" style="width: 220px">
+        <el-select v-model="kbStore.kbId" placeholder="选择知识库" style="width: 220px" @change="kbStore.selectKb">
           <el-option
-            v-for="kb in store.knowledgeBases"
+            v-for="kb in kbStore.knowledgeBases"
             :key="kb.id"
             :label="`${kb.name}（${kb.document_count} 文档）`"
             :value="kb.id"
@@ -65,7 +68,7 @@
           />
         </el-scrollbar>
         <MessageInput
-          :disabled="!store.kbId"
+          :disabled="!kbStore.kbId"
           :streaming="store.streaming"
           @send="store.sendMessage"
           @stop="store.stopStreaming"
@@ -81,8 +84,10 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import ChatMessage from "../components/ChatMessage.vue";
 import MessageInput from "../components/MessageInput.vue";
 import { useSessionStore } from "../stores/session";
+import { useKnowledgeBasesStore } from "../stores/knowledgeBases";
 
 const store = useSessionStore();
+const kbStore = useKnowledgeBasesStore();
 const scrollbarRef = ref();
 
 function scrollToBottom() {

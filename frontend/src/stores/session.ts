@@ -1,4 +1,5 @@
 // 会话状态：消息数组是唯一数据源；流式 delta 追加、done 写 sources、error 置顶部提示
+// 知识库选择（kbId/列表）在 stores/knowledgeBases.ts（与管理页共用，Phase 3-04 迁出）
 import { defineStore } from "pinia";
 import { reactive } from "vue";
 import { chatStream } from "../api/chat";
@@ -8,8 +9,8 @@ import {
   getSession,
   listSessions,
 } from "../api/sessions";
-import { listKnowledgeBases } from "../api/knowledgeBases";
-import type { KnowledgeBase, MessageItem, SessionItem, Source } from "../types";
+import { useKnowledgeBasesStore } from "./knowledgeBases";
+import type { MessageItem, SessionItem, Source } from "../types";
 
 export interface ChatMessage {
   role: "user" | "assistant";
@@ -24,8 +25,6 @@ const STORAGE_KEY = "rag_current_session";
 export const useSessionStore = defineStore("session", {
   state: () => ({
     sessions: [] as SessionItem[],
-    knowledgeBases: [] as KnowledgeBase[],
-    kbId: "" as string,
     currentSessionId: null as string | null,
     messages: [] as ChatMessage[],
     streaming: false,
@@ -42,9 +41,9 @@ export const useSessionStore = defineStore("session", {
 
   actions: {
     async init() {
-      const [kbs] = await Promise.all([listKnowledgeBases()]);
-      this.knowledgeBases = kbs;
-      if (!this.kbId && kbs.length) this.kbId = kbs[0].id;
+      const kbStore = useKnowledgeBasesStore();
+      await kbStore.load();
+      kbStore.restoreSelection();
       await this.loadSessions();
       const savedId = localStorage.getItem(STORAGE_KEY);
       if (savedId && this.sessions.some((s) => s.id === savedId)) {
@@ -62,7 +61,8 @@ export const useSessionStore = defineStore("session", {
     },
 
     async createSession() {
-      const session = await apiCreateSession(this.kbId || undefined);
+      const kbId = useKnowledgeBasesStore().kbId;
+      const session = await apiCreateSession(kbId || undefined);
       this.sessions.unshift(session);
       await this.switchSession(session.id);
       return session;
@@ -135,7 +135,7 @@ export const useSessionStore = defineStore("session", {
         for await (const evt of chatStream(
           {
             session_id: this.currentSessionId,
-            knowledge_base_id: this.kbId,
+            knowledge_base_id: useKnowledgeBasesStore().kbId,
             message: trimmed,
             stream: true,
           },

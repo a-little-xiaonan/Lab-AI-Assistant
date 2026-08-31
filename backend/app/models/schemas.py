@@ -87,3 +87,23 @@ class UploadDocumentOut(BaseModel):
     status: str  # processing（异步处理中）
     file_size: int
     kb_id: str
+
+
+# ----- 重新索引（Phase 3-05）-----
+
+class ReindexRequest(BaseModel):
+    doc_id: str | None = None  # 缺省 = 全库重建
+
+
+class ReindexStatusOut(BaseModel):
+    kb_id: str
+    doc_id: str | None = None
+    status: str  # idle / running / done / failed
+    total: int = 0
+    done: int = 0
+    current_doc: str | None = None
+    docs_before: int | None = None
+    docs_after: int | None = None
+    error_message: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None

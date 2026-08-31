@@ -9,7 +9,7 @@ import logging
 import time
 from collections.abc import Iterator
 
-from dashscope import Generation, TextEmbedding
+from dashscope import Generation, TextEmbedding, TextReRank
 
 from app.config import settings
 from app.llm.errors import LLMError
@@ -208,3 +208,26 @@ def embed_texts(
 def embed_query(text: str) -> list[float]:
     """单条查询向量化（复用批量入口，保持同模型同参数）。"""
     return embed_texts([text])[0]
+
+
+def rerank_texts(
+    query: str, documents: list[str], model: str | None = None
+) -> list[tuple[int, float]]:
+    """DashScope 重排（Phase 3-02）：返回 [(原文下标, relevance_score)] 分数降序。
+
+    SDK 契约（已核对 dashscope 1.27.2 源码）：TextReRank.call(...) →
+    ReRankResponse.output.results 为 [{index, relevance_score, document}] 列表，
+    index 指向 documents 原列表下标，SDK 已按分数降序返回（此处再排一次保序）。
+    """
+    key = _api_key()
+    resp = _retry(
+        TextReRank.call,
+        model=model or settings.rerank_model,
+        query=query,
+        documents=documents,
+        top_n=len(documents),
+        api_key=key,
+        timeout=settings.llm_timeout,
+    )
+    results = sorted(resp.output.results, key=lambda r: r.relevance_score, reverse=True)
+    return [(r.index, r.relevance_score) for r in results]

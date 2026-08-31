@@ -91,6 +91,12 @@ def _migrate_and_cleanup() -> None:
         )
         if result.rowcount:
             logger.warning("清扫 %d 条中断的 processing 文档 → failed", result.rowcount)
+        # reindexing 中断（Phase 3-05）：回 ready——live 索引与 DB chunk 记录仍是旧的一致状态
+        result = db.execute(
+            text("UPDATE documents SET status='ready' WHERE status='reindexing'")
+        )
+        if result.rowcount:
+            logger.warning("清扫 %d 条中断的 reindexing 文档 → ready", result.rowcount)
         db.commit()
 
 

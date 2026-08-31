@@ -4,7 +4,7 @@
 > **路线图条目**：§11 Phase 3 第 2 项「Re-ranking（重排序）」
 > **参考章节**：§4.2 RAG Pipeline（Re-rank 环节）· 附录 B（检索质量风险）
 > **前置依赖**：Phase 1-05（向量检索）、Phase 3-06（混合检索 + RRF 融合）、Phase 2-04（评估基线）
-> **状态**：待开发
+> **状态**：✅ 已完成（2026-08-31）
 
 ## 1. 目标与范围
 
@@ -12,17 +12,17 @@
 
 ## 2. 任务拆解
 
-- [ ] `app/core/reranker.py`：
+- [x] `app/core/reranker.py`：
   - `rerank(query, candidates: list[Chunk]) -> list[Chunk]`（返回重排后的有序列表）
   - **后端 A — 本地 Cross-Encoder**：如 `BAAI/bge-reranker-base`（transformers，需首次下载模型）
   - **后端 B — DashScope re-rank API**（实现时以官方文档为准，如无现成接口则后端 A 为准）
   - 由配置 `RERANKER_TYPE=local|api` 切换
-- [ ] `rag_pipeline` 接入：`混合检索 + RRF 融合（Phase 3-06）→ rerank → 取前 N 进上下文`
+- [x] `rag_pipeline` 接入：`混合检索 + RRF 融合（Phase 3-06）→ rerank → 取前 N 进上下文`
   - 重排在 **RRF 融合之后**执行（候选集 = 混合检索放宽后的 top-20），只对候选精排
   - `RERANK_TOP_N`（≤ 融合候选集规模，默认 5）决定最终进上下文的条数
-- [ ] 开关与参数：`RERANK_ENABLED`（默认关，评估后决定默认值）、`RERANK_TOP_N=5`、`RERANKER_TYPE`
-- [ ] 效果对比：样例集 重排开/关 对比，重点看**引用来源是否更准**（重排的价值在 precision，不在 recall）
-- [ ] 性能评估：记录单次重排耗时（本地模型首次加载时间 vs 每轮推理时间）
+- [x] 开关与参数：`RERANK_ENABLED`（默认关，评估后决定默认值）、`RERANK_TOP_N=5`、`RERANKER_TYPE`
+- [x] 效果对比：样例集 重排开/关 对比，重点看**引用来源是否更准**（重排的价值在 precision，不在 recall）
+- [x] 性能评估：记录单次重排耗时（本地模型首次加载时间 vs 每轮推理时间）
 
 ## 3. 设计要点
 
@@ -46,11 +46,11 @@ docs/eval/results-*.md  # 开/关对比记录
 
 ## 5. 验收标准
 
-- [ ] 构造含噪声候选的场景（top-k 中混入低相关片段）：重排后相关片段排在前 3
-- [ ] 开关切换无报错；`RERANK_ENABLED=false` 行为与 Phase 2 一致
-- [ ] 本地后端：首次加载可完成，后续推理 < 200ms/次（记录实测值）
-- [ ] 样例集对比记录归档：重排后引用来源准确率不劣于重排前
-- [ ] 重排失败（模型加载失败等）→ 降级为原顺序，回答正常
+- [x] 构造含噪声候选的场景（top-k 中混入低相关片段）：重排后相关片段排在前 3
+- [x] 开关切换无报错；`RERANK_ENABLED=false` 行为与 Phase 2 一致
+- [x] 本地后端：首次加载可完成，后续推理 < 200ms/次（记录实测值）
+- [x] 样例集对比记录归档：重排后引用来源准确率不劣于重排前
+- [x] 重排失败（模型加载失败等）→ 降级为原顺序，回答正常
 
 ## 6. 风险与注意事项
 

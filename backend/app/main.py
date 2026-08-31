@@ -8,6 +8,14 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+# 应用日志级别：root 默认 WARNING 会吞掉全部 logger.info（检索观测、索引重建等）。
+# uvicorn 先于本模块配置了 root handler，basicConfig 可能 no-op，故显式 setLevel 兜底
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logging.getLogger().setLevel(logging.INFO)
+
 from app.api import chat, documents, health, knowledge_base, memory, stats
 from app.api.errors import ApiError
 from app.config import ensure_data_dirs, settings

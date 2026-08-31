@@ -24,8 +24,12 @@ class VectorStore:
         self._lock = threading.RLock()
         self._collections: dict[str, object] = {}
 
-    def _get_collection(self, kb_id: str):
-        name = f"kb_{kb_id}_docs"
+    def _collection_name(self, kb_id: str, suffix: str = "docs") -> str:
+        """collection 命名：kb_{kb_id}_{suffix}（docs / docs_new / docs_old）。"""
+        return f"kb_{kb_id}_{suffix}"
+
+    def _get_collection(self, kb_id: str, suffix: str = "docs"):
+        name = self._collection_name(kb_id, suffix)
         with self._lock:
             coll = self._collections.get(name)
             if coll is None:
@@ -35,13 +39,14 @@ class VectorStore:
                 self._collections[name] = coll
             return coll
 
-    def add_chunks(self, kb_id: str, chunks: list, embeddings: list[list[float]]) -> None:
-        """幂等写入：先删同 doc_id 的旧 chunk 再插入。"""
+    def add_chunks(self, kb_id: str, chunks: list, embeddings: list[list[float]],
+                   suffix: str = "docs") -> None:
+        """幂等写入：先删同 doc_id 的旧 chunk 再插入（suffix 供 reindex 写临时 collection）。"""
         if not chunks:
             return
         doc_id = chunks[0].doc_id
         with self._lock:
-            coll = self._get_collection(kb_id)
+            coll = self._get_collection(kb_id, suffix)
             coll.delete(where={"doc_id": doc_id})  # 旧数据不存在时无副作用
             coll.add(
                 ids=[f"{doc_id}_{c.chunk_index}" for c in chunks],
@@ -61,19 +66,76 @@ class VectorStore:
         res = coll.query(query_embeddings=[query_embedding], n_results=top_k)
         return list(zip(res["ids"][0], res["documents"][0], res["metadatas"][0], res["distances"][0]))
 
-    def delete_document(self, kb_id: str, doc_id: str) -> None:
-        coll = self._get_collection(kb_id)
+    def delete_document(self, kb_id: str, doc_id: str, suffix: str = "docs") -> None:
+        coll = self._get_collection(kb_id, suffix)
         coll.delete(where={"doc_id": doc_id})
 
     def delete_collection(self, kb_id: str) -> None:
-        """删除知识库全部向量（Phase 2-02 删除知识库时用）。"""
-        name = f"kb_{kb_id}_docs"
+        """删除知识库全部向量：docs / docs_new / docs_old / memory（KB 级联删除与 reindex 共用）。"""
+        for suffix in ("docs", "docs_new", "docs_old", "memory"):
+            name = self._collection_name(kb_id, suffix)
+            with self._lock:
+                try:
+                    self._client.delete_collection(name)
+                except Exception:
+                    pass  # 不存在即幂等
+                self._collections.pop(name, None)
+
+    # ----- 双 buffer 重索引（Phase 3-05）-----
+
+    def create_temp_collection(self, kb_id: str) -> None:
+        """双 buffer 起点：清理上次遗留的 docs_old/docs_new，重建 docs_new。"""
         with self._lock:
+            for stale in ("docs_old", "docs_new"):
+                name = self._collection_name(kb_id, stale)
+                try:
+                    self._client.delete_collection(name)
+                except Exception:
+                    pass
+                self._collections.pop(name, None)
+            name = self._collection_name(kb_id, "docs_new")
+            coll = self._client.get_or_create_collection(
+                name=name, metadata={"hnsw:space": "cosine"}
+            )
+            self._collections[name] = coll
+
+    def swap_collections(self, kb_id: str) -> None:
+        """双 buffer 切换：两次改名零删除 → 检索零中断窗口。
+
+        序列（持锁；_get_collection 同锁 → 切换期间新查询阻塞毫秒级后拿到新句柄）：
+        ① docs → docs_old（rename 保留 collection uuid，在途查询句柄仍有效）
+        ② docs_new → docs（缓存键迁移）
+        ③ docs_old 不删——留到下次 create_temp_collection 起点清理（在途查询永不撞删除）
+        失败回滚：① 成功 ② 失败 → 尝试把 docs_old 改回 docs 恢复旧索引后抛异常。
+        """
+        with self._lock:
+            old = self._get_collection(kb_id, "docs")
+            new = self._get_collection(kb_id, "docs_new")
+            if new.count() == 0:
+                raise ValueError(f"临时 collection 为空，拒绝切换：{kb_id}")
+            old.modify(name=self._collection_name(kb_id, "docs_old"))
+            self._collections.pop(self._collection_name(kb_id, "docs"), None)
+            self._collections[self._collection_name(kb_id, "docs_old")] = old
             try:
-                self._client.delete_collection(name)
+                new.modify(name=self._collection_name(kb_id, "docs"))
             except Exception:
-                logger.warning("删除 collection %s 失败（可能不存在）", name)
-            self._collections.pop(name, None)
+                # 回滚：恢复旧索引
+                try:
+                    old.modify(name=self._collection_name(kb_id, "docs"))
+                except Exception:
+                    logger.exception("切换回滚失败（kb=%s），docs_old 将留待下次重建清理", kb_id)
+                raise
+            self._collections.pop(self._collection_name(kb_id, "docs_new"), None)
+            self._collections[self._collection_name(kb_id, "docs")] = new
+
+    def count(self, kb_id: str, suffix: str = "docs") -> int:
+        return self._get_collection(kb_id, suffix).count()
+
+    def get_doc_ids(self, kb_id: str, suffix: str = "docs") -> set[str]:
+        """collection 内全部 doc_id 集合（reindex 一致性校验用）。"""
+        coll = self._get_collection(kb_id, suffix)
+        res = coll.get(include=["metadatas"])
+        return {md["doc_id"] for md in res["metadatas"]}
 
     # ----- 长期记忆 collection（Phase 3-03；命名 kb_{kb_id}_memory，与 docs 隔离）-----
 
@@ -117,9 +179,6 @@ class VectorStore:
         if ids:
             coll.delete(ids=ids)
         return len(ids)
-
-    def count(self, kb_id: str) -> int:
-        return self._get_collection(kb_id).count()
 
 
 vector_store = VectorStore()

@@ -68,6 +68,13 @@ def _persist_upload(
         vector_store.delete_document(kb_id, existing.id)
         db.delete(existing)
         db.commit()
+        # 关键词索引同步（failed 旧文档的 chunk 也在索引里）
+        try:
+            from app.core.keyword_index import keyword_index
+
+            keyword_index.remove_document(kb_id, existing.id)
+        except Exception:
+            logger.exception("关键词索引同步失败（doc=%s）", existing.id)
 
     doc_id = _new_doc_id()
     save_dir = settings.uploads_dir / kb_id
@@ -102,8 +109,15 @@ async def upload_document_to_kb(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> UploadDocumentOut:
-    """上传文档到指定知识库：立即返回 202 + processing，处理后台异步执行。"""
+    """上传文档到指定知识库：立即返回 202 + processing，处理后台异步执行。
+
+    重建索引进行中禁止上传（swap 会丢弃重建期间写入 live 的新文档，Phase 3-05 互斥）。
+    """
     _require_kb(db, kb_id)
+    from app.core.reindex import reindex_manager
+
+    if reindex_manager.is_running(kb_id):
+        raise ConflictError("reindex_in_progress", "该知识库正在重建索引，请稍后再试")
     content = await file.read()
     doc = _persist_upload(db, content, file.filename or "", kb_id)
     background_tasks.add_task(process_document, doc.id)
@@ -149,6 +163,13 @@ def delete_kb_document(kb_id: str, doc_id: str, db: Session = Depends(get_db)) -
     Path(doc.file_path).unlink(missing_ok=True)
     db.delete(doc)
     db.commit()
+    # 关键词索引同步（缓存，异常不阻断）
+    try:
+        from app.core.keyword_index import keyword_index
+
+        keyword_index.remove_document(kb_id, doc_id)
+    except Exception:
+        logger.exception("关键词索引同步失败（doc=%s）", doc_id)
     return {"deleted": doc_id}
 
 

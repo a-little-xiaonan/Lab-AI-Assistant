@@ -58,6 +58,25 @@ class Settings(BaseSettings):
     similarity_threshold: float = 0.45
     max_context_tokens: int = 3000
 
+    # ----- 混合检索（Phase 3-06）-----
+    hybrid_retrieval_enabled: bool = True   # 总开关；false → 行为与 Phase 2 完全一致
+    hybrid_vector_top_k: int = 10           # 向量侧每查询 top-k
+    hybrid_keyword_top_k: int = 10          # 关键词侧 top-k
+    hybrid_fusion_candidates: int = 20      # RRF 融合后候选集规模（供重排）
+    keyword_use_rewritten: bool = False     # 关键词侧是否也用改写查询（默认关：词面精确优先）
+    keyword_jieba_dict: str = ""            # jieba 自定义词典路径（相对项目根；空 = 不加载）
+
+    # ----- 查询改写（Phase 3-01）-----
+    rewrite_enabled: bool = True
+    rewrite_query_count: int = 3            # 改写总数上限（含原查询）
+    rewrite_model: str = ""                 # 改写用模型；空 → llm_model（可用独立模型验证降级）
+
+    # ----- 重排（Phase 3-02）-----
+    rerank_enabled: bool = False            # 默认关（评估后定）；开启后 RRF 候选集精排
+    rerank_top_n: int = 5                   # 重排后进上下文的条数
+    reranker_type: str = "dashscope"        # dashscope / local（本地 Cross-Encoder 需自行装 transformers）
+    rerank_model: str = "gte-rerank-v2"     # DashScope 重排模型（实测 2026-08-31：gte-rerank 403 未开通，v2/qwen3-rerank 可用）
+
     # ----- 短期记忆（Phase 2-03）-----
     history_max_turns: int = 10          # 窗口轮数：超过 2 倍触发摘要压缩
     history_max_tokens: int = 4000       # 历史段 token 预算（超限丢最旧）

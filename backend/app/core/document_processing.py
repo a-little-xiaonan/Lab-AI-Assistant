@@ -31,8 +31,20 @@ def _fail(db, doc: Document, message: str) -> None:
     db.commit()
 
 
-def process_document(doc_id: str) -> None:
-    """后台处理单个文档。永不抛异常：失败一律状态化（failed + 可读错误），日志留痕。"""
+def load_and_chunk(doc: Document) -> tuple[str, list]:
+    """解析 + 分块（process_document 与 reindex 共享，禁止复制逻辑）。
+
+    失败抛 UnsupportedFormatError/DocumentParseError（由调用方处理状态化）。
+    """
+    fmt, elements = document_loader.load(Path(doc.file_path))
+    return fmt, chunker.chunk(elements, doc.id, doc.kb_id, doc.filename)
+
+
+def process_document(doc_id: str, target_suffix: str = "docs") -> None:
+    """后台处理单个文档。永不抛异常：失败一律状态化（failed + 可读错误），日志留痕。
+
+    target_suffix：reindex（Phase 3-05）写临时 collection 时传 docs_new；默认 docs。
+    """
     db = SessionLocal()
     try:
         doc = db.get(Document, doc_id)
@@ -48,21 +60,20 @@ def process_document(doc_id: str) -> None:
             return
 
         try:
-            fmt, elements = document_loader.load(Path(doc.file_path))
-            chunks = chunker.chunk(elements, doc_id, doc.kb_id, doc.filename)
+            fmt, chunks = load_and_chunk(doc)
             logger.info("后台解析完成：%s fmt=%s %d chunks", doc.filename, fmt, len(chunks))
         except (UnsupportedFormatError, DocumentParseError) as exc:
             _fail(db, doc, str(exc))
             return
 
         try:
-            chunk_count = embedder.embed_and_store(doc.kb_id, doc_id, chunks)
+            chunk_count = embedder.embed_and_store(doc.kb_id, doc_id, chunks, suffix=target_suffix)
         except LLMError as exc:
             _fail(db, doc, exc.message)
             return
         except Exception:
             logger.exception("向量化未知异常，清理残留：doc=%s", doc_id)
-            vector_store.delete_document(doc.kb_id, doc_id)  # 兜底清理可能半写入的向量
+            vector_store.delete_document(doc.kb_id, doc_id, suffix=target_suffix)  # 兜底清理
             _fail(db, doc, "向量化失败，请重试")
             return
 
@@ -87,6 +98,13 @@ def process_document(doc_id: str) -> None:
         doc.chunk_count = chunk_count
         db.commit()
         logger.info("文档处理完成：%s chunk_count=%d", doc.filename, chunk_count)
+        # 关键词索引同步（缓存失同步可被全量重建治愈；异常不阻断主链路）
+        try:
+            from app.core.keyword_index import keyword_index
+
+            keyword_index.add_document(doc.kb_id, doc_id, chunks)
+        except Exception:
+            logger.exception("关键词索引同步失败（doc=%s）", doc_id)
     except Exception:
         logger.exception("后台处理未知异常：doc=%s", doc_id)
         try:

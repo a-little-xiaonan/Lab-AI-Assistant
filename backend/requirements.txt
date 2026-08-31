@@ -21,3 +21,5 @@ pymysql
 
 # 测试
 pytest
+jieba==0.42.1          # 混合检索关键词分词（Phase 3-06）
+rank-bm25==0.2.2       # 混合检索 BM25（Phase 3-06）

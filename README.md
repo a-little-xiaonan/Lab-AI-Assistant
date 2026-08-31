@@ -5,7 +5,7 @@
 - 后端：FastAPI + 通义千问（DashScope qwen-plus / text-embedding-v3）+ ChromaDB + MySQL/SQLite
 - 前端：Vite + Vue 3 + TypeScript + Element Plus（聊天界面）
 - 技术设计文档：`docs/RAG-AI-Assistant-技术设计文档.md`；分阶段开发文档：`docs/development/`
-- 当前进度：**Phase 2 完成**（SSE 流式 / 多知识库 / 短期记忆 / Prompt 优化与引用标注 / 前端聊天界面），**Phase 3 长期记忆完成**，其余（Query Rewrite / Re-ranking 等）按路线图推进
+- 当前进度：**Phase 3 全部完成**（混合检索 / 查询改写 / 重排 / 重新索引 / 长期记忆 / 前端知识库管理界面），Phase 4 生产化按路线图推进
 
 ## 快速开始
 
@@ -143,7 +143,11 @@ data/                    # 运行时数据（gitignore）：chroma/、uploads/�
 - **文档格式**：PDF（PyMuPDF）/ DOCX（python-docx）/ MD / TXT 专用解析；PPTX/HTML 走 unstructured；**Excel 用 openpyxl 直读行结构**（unstructured 会把整个 sheet 拍平成单块文本，产不出规格要求的行区块与 row_range 元数据）；未知格式走四级兜底链（L1 专用 → L2 unstructured → L3 文本试探 UTF-8/GBK → L4 优雅拒绝标记 failed）
 - **分块**：结构分块（标题节/slide/页内段落等）+ 固定分块（512 字/块、64 字重叠、overlap 不跨结构块），中文句子优先不切断
 - **spaCy 模型**：unstructured 首次解析 PPT/Excel 时会自动下载 en_core_web_sm（走 GitHub，国内可能失败），所以上面第 2 步预先装好
-- **阈值 0.45**：检索相似度阈值（cosine 语义，similarity = 1 - distance），实测标定（2026-08-30）；无关中文文本噪声地板 ~0.35-0.41，相关命中 0.5+
+- **阈值 0.45**：检索相似度阈值（cosine 语义，similarity = 1 - distance），实测标定（2026-08-30）；**混合检索开启后不再硬过滤**（关键词独有命中不能被阈值误杀），仅作观测日志；关闭混合时恢复 Phase 2 行为
+- **混合检索**（Phase 3-06）：向量 ∥ BM25（jieba 分词，进程内索引懒构建，与 ChunkRecord 表同步）→ RRF 融合 → top-20 候选；`HYBRID_RETRIEVAL_ENABLED=false` 完全回退 Phase 2
+- **查询改写**（Phase 3-01）：LLM 扩展 2-3 条检索查询并发召回，只喂向量侧；失败自动降级原查询
+- **重排**（Phase 3-02）：DashScope rerank API（`gte-rerank-v2`，实测可用；`gte-rerank` 需单独开通），默认关（评估后开）；失败降级 RRF 原顺序
+- **重新索引**（Phase 3-05）：`POST /api/knowledge-bases/{id}/reindex`（单文档/全库）+ 双 buffer 切换（重建期间检索零中断）；重建中重复触发/上传 → 409；内容变更后重建即可生效
 - **短期记忆**：滑动窗口 10 轮 + LLM 摘要压缩（超窗自动触发）；摘要是进程内运行时态，重启后从消息表重建窗口；不同会话记忆隔离
 - **长期记忆**（Phase 3-03）：每轮对话后台提取（LLM → 置信度过滤 → 向量入库 `kb_{kb_id}_memory`），提问时召回相关记忆拼入 prompt（参考资料 → 相关记忆 → 对话历史 → 问题）；按知识库隔离、跨会话共享；清理入口 `DELETE /api/memory/{session_id}`
 - **上传异步化**：Phase 2 起上传立即返回 202 + processing，后台处理完成后 status=ready/failed（失败带 error_message），前端轮询列表

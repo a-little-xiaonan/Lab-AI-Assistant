@@ -46,3 +46,42 @@ export interface ChatPayload {
   message: string;
   stream: boolean;
 }
+
+// ---- Phase 3-04 知识库管理 ----
+
+export interface DocumentItem {
+  doc_id: string;
+  filename: string;
+  file_size: number;
+  status: string; // processing / ready / failed / reindexing
+  error_message: string | null;
+  chunk_count: number;
+  created_at: string;
+}
+
+export interface KnowledgeBaseDetail extends KnowledgeBase {
+  documents: DocumentItem[];
+}
+
+export interface Stats {
+  document_count: number;
+  chunk_count: number;
+  storage_size: number;
+  knowledge_base_count: number;
+  vector_dim: number;
+  knowledge_bases: { id: string; name: string; document_count: number; chunk_count: number }[];
+}
+
+export interface ReindexStatus {
+  kb_id: string;
+  doc_id: string | null;
+  status: string; // idle / running / done / failed
+  total: number;
+  done: number;
+  current_doc: string | null;
+  docs_before: number | null;
+  docs_after: number | null;
+  error_message: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}

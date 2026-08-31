@@ -9,8 +9,13 @@ from app.store.vector_store import vector_store
 logger = logging.getLogger(__name__)
 
 
-def embed_and_store(kb_id: str, doc_id: str, chunks: list, progress_cb=None) -> int:
-    """把文档的 chunk 全部向量化并写入向量库，返回 chunk 数。"""
+def embed_and_store(
+    kb_id: str, doc_id: str, chunks: list, progress_cb=None, suffix: str = "docs"
+) -> int:
+    """把文档的 chunk 全部向量化并写入向量库，返回 chunk 数。
+
+    suffix：reindex（Phase 3-05）写临时 collection（docs_new）时用；默认 docs 兼容既有调用。
+    """
     if not chunks:
         return 0
     texts = [c.text for c in chunks]
@@ -21,6 +26,6 @@ def embed_and_store(kb_id: str, doc_id: str, chunks: list, progress_cb=None) -> 
             progress_cb(done, total)
 
     embeddings = embed_texts(texts, on_batch=_log_progress)
-    vector_store.add_chunks(kb_id, chunks, embeddings)
-    logger.info("入库完成 %s：%d chunks", doc_id, len(chunks))
+    vector_store.add_chunks(kb_id, chunks, embeddings, suffix=suffix)
+    logger.info("入库完成 %s：%d chunks（collection=%s）", doc_id, len(chunks), suffix)
     return len(chunks)
