@@ -9,6 +9,14 @@
         <el-button size="small" style="width: 100%; margin: 8px 0 0" @click="$router.push('/knowledge-bases')">
           📚 知识库管理
         </el-button>
+        <el-button
+          size="small"
+          style="width: 100%; margin: 8px 0 0"
+          :type="batchMode ? 'warning' : 'default'"
+          @click="toggleBatchMode"
+        >
+          {{ batchMode ? "退出批量" : "🗑 批量删除" }}
+        </el-button>
       </div>
       <el-scrollbar class="session-list">
         <div v-if="store.sessions.length > 5" class="session-count">
@@ -21,11 +29,17 @@
           v-for="s in displayedSessions"
           :key="s.id"
           class="session-item"
-          :class="{ active: s.id === store.currentSessionId }"
-          @click="store.switchSession(s.id)"
+          :class="{ active: !batchMode && s.id === store.currentSessionId, selected: batchMode && selected[s.id] }"
+          @click="batchMode ? toggleSelect(s.id) : store.switchSession(s.id)"
         >
+          <el-checkbox
+            v-if="batchMode"
+            :model-value="!!selected[s.id]"
+            class="session-check"
+            @click.stop="toggleSelect(s.id)"
+          />
           <span class="session-title">{{ s.name || "新会话" }}</span>
-          <span class="session-actions" @click.stop>
+          <span v-if="!batchMode" class="session-actions" @click.stop>
             <el-button link size="small" title="重命名" @click="renameSession(s)">✎</el-button>
             <el-button
               v-if="s.id === store.currentSessionId"
@@ -40,6 +54,20 @@
           </span>
         </div>
       </el-scrollbar>
+      <!-- 批量操作工具条 -->
+      <div v-if="batchMode" class="batch-bar">
+        <el-checkbox
+          :model-value="displayedSessions.length > 0 && selectedCount === displayedSessions.length"
+          @change="selectAll"
+        >
+          全选
+        </el-checkbox>
+        <span class="batch-count">已选 {{ selectedCount }}</span>
+        <el-button size="small" type="danger" :disabled="!selectedCount" @click="deleteSelected">
+          删除所选
+        </el-button>
+        <el-button size="small" type="danger" plain @click="deleteAll">全部</el-button>
+      </div>
     </el-aside>
 
     <el-container>
@@ -105,6 +133,61 @@ const showAllSessions = ref(false);
 const displayedSessions = computed(() =>
   showAllSessions.value ? store.sessions : store.sessions.slice(0, 5),
 );
+
+// 批量删除模式
+const batchMode = ref(false);
+const selected = ref<Record<string, boolean>>({});
+const selectedCount = computed(
+  () => Object.values(selected.value).filter(Boolean).length,
+);
+
+function toggleBatchMode() {
+  batchMode.value = !batchMode.value;
+  selected.value = {};
+}
+
+function toggleSelect(id: string) {
+  selected.value[id] = !selected.value[id];
+}
+
+function selectAll(checked: boolean | string | number) {
+  const on = !!checked;
+  const map: Record<string, boolean> = {};
+  for (const s of displayedSessions.value) map[s.id] = on;
+  selected.value = map;
+}
+
+async function deleteSelected() {
+  const ids = Object.keys(selected.value).filter((k) => selected.value[k]);
+  if (!ids.length) return;
+  try {
+    await ElMessageBox.confirm(`确定删除选中的 ${ids.length} 个会话？消息与记忆一并清除。`, "批量删除", {
+      type: "warning",
+      confirmButtonText: "删除",
+      cancelButtonText: "取消",
+    });
+    const deleted = await store.batchDelete(ids);
+    ElMessage.success(`已删除 ${deleted} 个会话`);
+    batchMode.value = false;
+  } catch {
+    /* 取消 */
+  }
+}
+
+async function deleteAll() {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除全部 ${store.sessions.length} 个会话？此操作不可恢复。`,
+      "删除全部会话",
+      { type: "warning", confirmButtonText: "全部删除", cancelButtonText: "取消" },
+    );
+    const deleted = await store.batchDelete();
+    ElMessage.success(`已删除 ${deleted} 个会话`);
+    batchMode.value = false;
+  } catch {
+    /* 取消 */
+  }
+}
 
 function scrollToBottom() {
   requestAnimationFrame(() => {
@@ -191,6 +274,13 @@ watch(
   background: var(--el-fill-color-light);
   border-left-color: var(--el-color-primary);
 }
+.session-item.selected {
+  background: var(--el-color-primary-light-9);
+  border-left-color: var(--el-color-primary);
+}
+.session-check {
+  margin-right: 6px;
+}
 .session-title {
   font-size: 13px;
   overflow: hidden;
@@ -210,6 +300,18 @@ watch(
   font-size: 12px;
   color: var(--el-text-color-secondary);
   padding: 4px 16px;
+}
+.batch-bar {
+  border-top: 1px solid var(--el-border-color-light);
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.batch-count {
+  flex: 1;
+  color: var(--el-text-color-secondary);
 }
 .header {
   display: flex;

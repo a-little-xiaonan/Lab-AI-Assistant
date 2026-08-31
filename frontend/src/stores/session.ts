@@ -4,6 +4,7 @@ import { defineStore } from "pinia";
 import { reactive } from "vue";
 import { chatStream } from "../api/chat";
 import {
+  batchDeleteSessions as apiBatchDeleteSessions,
   createSession as apiCreateSession,
   deleteSession as apiDeleteSession,
   getSession,
@@ -76,6 +77,25 @@ export const useSessionStore = defineStore("session", {
         this.messages = [];
         localStorage.removeItem(STORAGE_KEY);
       }
+    },
+
+    /** 批量删除（ids 缺省 → 全部）；返回删除数量 */
+    async batchDelete(ids?: string[]): Promise<number> {
+      const deleted = await apiBatchDeleteSessions(ids);
+      this.sessions = ids?.length
+        ? this.sessions.filter((s) => !ids.includes(s.id))
+        : [];
+      if (ids?.length && this.currentSessionId && ids.includes(this.currentSessionId)) {
+        this.currentSessionId = null;
+        this.messages = [];
+        localStorage.removeItem(STORAGE_KEY);
+      }
+      if (!ids?.length) {
+        this.currentSessionId = null;
+        this.messages = [];
+        localStorage.removeItem(STORAGE_KEY);
+      }
+      return deleted;
     },
 
     async switchSession(id: string) {

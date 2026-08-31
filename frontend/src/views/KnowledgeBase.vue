@@ -86,22 +86,47 @@
       />
     </el-drawer>
 
-    <!-- chunk 明细抽屉：每块内容 + 大小 + 位置元数据 -->
-    <el-drawer v-model="showChunks" :title="chunksTitle" size="520px">
+    <!-- chunk 明细：大抽屉 + 左导航右详情 -->
+    <el-drawer v-model="showChunks" :title="chunksTitle" size="75%">
       <div v-if="chunksLoading" class="chunks-loading">加载中...</div>
-      <el-scrollbar v-else class="chunks-scroll">
-        <div v-for="c in chunks" :key="c.chunk_index" class="chunk-item">
-          <div class="chunk-meta">
-            <el-tag size="small">#{{ c.chunk_index }}</el-tag>
-            <span class="chunk-size">{{ c.char_length }} 字符 · ≈{{ c.token_estimate }} tokens</span>
-            <span v-if="c.page != null" class="chunk-loc">P{{ c.page }}</span>
-            <span v-else-if="c.slide_number != null" class="chunk-loc">slide {{ c.slide_number }}</span>
-            <span v-else-if="c.sheet_name" class="chunk-loc">{{ c.sheet_name }}[{{ c.row_range }}]</span>
+      <div v-else class="chunks-layout">
+        <!-- 左：chunk 导航列表 -->
+        <div class="chunk-nav">
+          <div
+            v-for="c in chunks"
+            :key="c.chunk_index"
+            class="chunk-nav-item"
+            :class="{ active: selectedChunk?.chunk_index === c.chunk_index }"
+            @click="selectedChunk = c"
+          >
+            <div class="chunk-nav-title">#{{ c.chunk_index }}</div>
+            <div class="chunk-nav-preview">{{ c.text.slice(0, 40) }}</div>
           </div>
-          <pre class="chunk-text">{{ c.text }}</pre>
+          <el-empty v-if="!chunks.length" description="该文档没有 chunk" />
         </div>
-        <el-empty v-if="!chunks.length" description="该文档没有 chunk" />
-      </el-scrollbar>
+        <!-- 右：选中 chunk 详情 -->
+        <div v-if="selectedChunk" class="chunk-detail">
+          <el-descriptions :column="2" size="small" border class="chunk-meta-table">
+            <el-descriptions-item label="chunk 编号">#{{ selectedChunk.chunk_index }}</el-descriptions-item>
+            <el-descriptions-item label="大小">
+              {{ selectedChunk.char_length }} 字符 · ≈{{ selectedChunk.token_estimate }} tokens
+            </el-descriptions-item>
+            <el-descriptions-item label="位置">
+              <span v-if="selectedChunk.page != null">P{{ selectedChunk.page }}</span>
+              <span v-else-if="selectedChunk.slide_number != null">slide {{ selectedChunk.slide_number }}</span>
+              <span v-else-if="selectedChunk.sheet_name">{{ selectedChunk.sheet_name }}[{{ selectedChunk.row_range }}]</span>
+              <span v-else>—</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="创建时间">{{ formatTime(selectedChunk.created_at) }}</el-descriptions-item>
+            <el-descriptions-item label="修改时间">{{ formatTime(selectedChunk.updated_at) }}</el-descriptions-item>
+            <el-descriptions-item label="文档 ID">{{ selectedDocId }}</el-descriptions-item>
+          </el-descriptions>
+          <div class="chunk-detail-text">
+            <pre>{{ selectedChunk.text }}</pre>
+          </div>
+        </div>
+        <el-empty v-else description="选择左侧 chunk 查看详情" />
+      </div>
     </el-drawer>
   </el-container>
 </template>
@@ -141,16 +166,26 @@ const showChunks = ref(false);
 const chunks = ref<ChunkItem[]>([]);
 const chunksTitle = ref("");
 const chunksLoading = ref(false);
+const selectedChunk = ref<ChunkItem | null>(null);
+const selectedDocId = ref("");
+
+function formatTime(t: string | undefined | null): string {
+  if (!t) return "—";
+  return new Date(t).toLocaleString("zh-CN", { hour12: false });
+}
 
 async function openChunks(row: DocumentItem) {
   showChunks.value = true;
-  chunksTitle.value = `${row.filename} 的 chunk（共 ${row.chunk_count} 块）`;
+  chunksTitle.value = `${row.filename} 的 chunk`;
   chunksLoading.value = true;
   chunks.value = [];
+  selectedChunk.value = null;
+  selectedDocId.value = row.doc_id;
   try {
     const data = await getDocChunks(row.doc_id);
     chunks.value = data.chunks;
     chunksTitle.value = `${row.filename} 的 chunk（共 ${data.total} 块）`;
+    if (data.chunks.length) selectedChunk.value = data.chunks[0];
   } catch (e) {
     ElMessage.error((e as Error).message);
   } finally {
@@ -333,40 +368,69 @@ onBeforeUnmount(() => timers.forEach((t) => window.clearInterval(t)));
   color: var(--el-text-color-secondary);
   padding: 40px 0;
 }
-.chunks-scroll {
-  height: calc(100vh - 80px);
-}
-.chunk-item {
-  border: 1px solid var(--el-border-color-light);
-  border-radius: 8px;
-  padding: 10px 12px;
-  margin-bottom: 12px;
-}
-.chunk-meta {
+.chunks-layout {
   display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 6px;
+  gap: 16px;
+  height: calc(100vh - 90px);
 }
-.chunk-size {
+.chunk-nav {
+  width: 220px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--el-border-color-light);
+  padding-right: 8px;
+}
+.chunk-nav-item {
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  margin-bottom: 6px;
+  border: 1px solid var(--el-border-color-lighter);
+}
+.chunk-nav-item:hover {
+  background: var(--el-fill-color-light);
+}
+.chunk-nav-item.active {
+  background: var(--el-color-primary-light-9);
+  border-color: var(--el-color-primary);
+}
+.chunk-nav-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-color-primary);
+}
+.chunk-nav-preview {
   font-size: 12px;
   color: var(--el-text-color-secondary);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.chunk-loc {
-  font-size: 12px;
-  color: var(--el-color-primary);
-  background: var(--el-color-primary-light-9);
-  padding: 1px 6px;
-  border-radius: 4px;
+.chunk-detail {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
-.chunk-text {
+.chunk-meta-table {
+  margin-bottom: 12px;
+}
+.chunk-detail-text {
+  flex: 1;
+  min-height: 0;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 8px;
+  overflow: auto;
+  background: var(--el-fill-color-lighter);
+}
+.chunk-detail-text pre {
   margin: 0;
-  font-size: 13px;
-  line-height: 1.7;
+  padding: 14px 16px;
+  font-size: 14px;
+  line-height: 1.8;
   white-space: pre-wrap;
   word-break: break-word;
   font-family: inherit;
-  max-height: 220px;
-  overflow-y: auto;
 }
 </style>

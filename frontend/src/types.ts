@@ -96,6 +96,8 @@ export interface ChunkItem {
   slide_number: number | null;
   sheet_name: string | null;
   row_range: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface ChunkList {

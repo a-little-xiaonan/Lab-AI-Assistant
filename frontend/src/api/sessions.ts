@@ -37,3 +37,15 @@ export async function renameSession(sessionId: string, name: string): Promise<Se
   if (!resp.ok) throw new Error(`重命名失败（${resp.status}）`);
   return resp.json();
 }
+
+/** 批量删除会话：sessionIds 缺省或传空 → 全部删除（后端语义） */
+export async function batchDeleteSessions(sessionIds?: string[]): Promise<number> {
+  const resp = await fetch("/api/chat/sessions", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(sessionIds?.length ? { session_ids: sessionIds } : { all: true }),
+  });
+  if (!resp.ok) throw new Error(`删除失败（${resp.status}）`);
+  const data = await resp.json();
+  return data.deleted as number;
+}

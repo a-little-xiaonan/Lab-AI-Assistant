@@ -37,6 +37,7 @@ from app.memory.memory_manager import memory_manager
 from app.models.database import ChatSession, Message
 from app.models.schemas import (
     ChatRequest,
+    SessionBatchDelete,
     SessionCreate,
     SessionDetailOut,
     SessionOut,
@@ -274,6 +275,28 @@ def delete_session(session_id: str, db: Session = Depends(get_db)) -> dict:
     session = db.get(ChatSession, session_id)
     if session is None:
         raise NotFoundError("session_not_found", f"会话不存在：{session_id}")
+    long_term_memory.clear_session(session_id, session.knowledge_base_id)  # 同步清该会话的记忆
     db.delete(session)  # 级联删除消息（cascade="all, delete-orphan"）
     db.commit()
     return {"deleted": session_id}
+
+
+@router.delete("/chat/sessions")
+def batch_delete_sessions(
+    body: SessionBatchDelete, db: Session = Depends(get_db)
+) -> dict:
+    """批量删除会话（session_ids 指定；缺省或 all=true → 全部）。
+
+    每个会话同步清理其长期记忆；级联删除消息。返回删除数量。
+    """
+    if body.all or not body.session_ids:
+        targets = list(db.scalars(select(ChatSession)))
+    else:
+        targets = [t for t in (db.get(ChatSession, sid) for sid in body.session_ids) if t is not None]
+    for s in targets:
+        long_term_memory.clear_session(s.id, s.knowledge_base_id)
+    for s in targets:
+        db.delete(s)
+    db.commit()
+    logger.info("批量删除会话 %d 个（all=%s）", len(targets), body.all or not body.session_ids)
+    return {"deleted": len(targets)}

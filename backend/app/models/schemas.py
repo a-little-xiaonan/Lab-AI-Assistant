@@ -33,6 +33,11 @@ class SessionRename(BaseModel):
     name: str = Field(min_length=1, max_length=50)  # 用户改名（AI 命名后不再覆盖）
 
 
+class SessionBatchDelete(BaseModel):
+    session_ids: list[str] | None = None  # 指定删除的会话；缺省或 all=true → 全部
+    all: bool = False
+
+
 class SessionOut(BaseModel):
     id: str
     knowledge_base_id: str

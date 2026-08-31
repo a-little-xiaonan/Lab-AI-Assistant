@@ -231,6 +231,8 @@ def list_chunks(
                 "slide_number": r.slide_number,
                 "sheet_name": r.sheet_name,
                 "row_range": r.row_range,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
             }
             for r in rows
         ],

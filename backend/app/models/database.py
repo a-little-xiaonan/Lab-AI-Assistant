@@ -112,5 +112,6 @@ class ChunkRecord(Base):
     sheet_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     row_range: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)  # 重索引/重传时更新
 
     document: Mapped[Document] = relationship(back_populates="chunks")

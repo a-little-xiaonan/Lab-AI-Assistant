@@ -94,6 +94,23 @@ def _migrate_add_session_name() -> None:
     logger.info("迁移完成：sessions 表新增 name 列")
 
 
+def _migrate_add_chunk_updated_at() -> None:
+    """增量迁移：chunks 表加 updated_at 列（已有行回填 = created_at）。"""
+    from sqlalchemy import inspect as sa_inspect
+
+    insp = sa_inspect(engine)
+    if "chunks" not in insp.get_table_names():
+        return
+    cols = {c["name"] for c in insp.get_columns("chunks")}
+    if "updated_at" in cols:
+        return
+    with SessionLocal() as db:
+        db.execute(text("ALTER TABLE chunks ADD COLUMN updated_at DATETIME NULL"))
+        db.execute(text("UPDATE chunks SET updated_at = created_at WHERE updated_at IS NULL"))
+        db.commit()
+    logger.info("迁移完成：chunks 表新增 updated_at 列（回填 created_at）")
+
+
 def _migrate_and_cleanup() -> None:
     """启动期一次性迁移与清扫（全部幂等，重复执行无副作用）。
 
@@ -123,6 +140,7 @@ def init_db() -> None:
     _ensure_mysql_database()
     Base.metadata.create_all(engine)
     _migrate_add_session_name()
+    _migrate_add_chunk_updated_at()
     _seed_default_knowledge_base()
     _migrate_and_cleanup()
 
