@@ -11,11 +11,14 @@
         </el-button>
       </div>
       <el-scrollbar class="session-list">
-        <div class="session-count" v-if="store.sessions.length > 5">
-          共 {{ store.sessions.length }} 个会话，显示前 5 个
+        <div v-if="store.sessions.length > 5" class="session-count">
+          共 {{ store.sessions.length }} 个会话
+          <el-button link size="small" type="primary" @click="showAllSessions = !showAllSessions">
+            {{ showAllSessions ? "收起" : "查看全部" }}
+          </el-button>
         </div>
         <div
-          v-for="s in store.sessions.slice(0, 5)"
+          v-for="s in displayedSessions"
           :key="s.id"
           class="session-item"
           :class="{ active: s.id === store.currentSessionId }"
@@ -84,7 +87,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import ChatMessage from "../components/ChatMessage.vue";
 import MessageInput from "../components/MessageInput.vue";
@@ -96,6 +99,12 @@ import type { SessionItem } from "../types";
 const store = useSessionStore();
 const kbStore = useKnowledgeBasesStore();
 const scrollbarRef = ref();
+const showAllSessions = ref(false);
+
+/** 会话列表：默认前 5 个，「查看全部」展开（旧会话也能选到） */
+const displayedSessions = computed(() =>
+  showAllSessions.value ? store.sessions : store.sessions.slice(0, 5),
+);
 
 function scrollToBottom() {
   requestAnimationFrame(() => {

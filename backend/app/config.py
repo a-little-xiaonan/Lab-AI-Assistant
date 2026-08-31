@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     memory_max_instances: int = 200      # 进程内记忆实例上限（LRU 淘汰，DB 是源可重建）
     memory_idle_ttl_seconds: int = 3600  # 实例空闲过期时间
 
+    # ----- 会话保留（自动清理）-----
+    session_retention_days: int = 3            # 超过 N 天未更新的会话自动删除
+    session_cleanup_interval_hours: int = 6    # 定时清理间隔（小时；启动时也清一次）
+
     # ----- 长期记忆（Phase 3-03）-----
     memory_confidence_threshold: float = 0.7  # 提取置信度阈值：低于此值的记忆不入库（唯一防线）
     memory_recall_top_k: int = 3              # 每轮召回记忆条数上限（防 prompt 膨胀）

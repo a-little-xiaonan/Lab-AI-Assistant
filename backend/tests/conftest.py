@@ -66,9 +66,10 @@ def _fake_long_term_memory(monkeypatch):
 
 @pytest.fixture()
 def client(monkeypatch):
-    """TestClient：内存库会话、跳过真实数据库初始化。"""
+    """TestClient：内存库会话、跳过真实数据库初始化与过期会话清理。"""
     Base.metadata.create_all(TEST_ENGINE)
     monkeypatch.setattr("app.main.init_db", lambda: None)  # 不连真实 MySQL
+    monkeypatch.setattr("app.main.cleanup_expired_sessions", lambda: 0)  # 清理不碰真实库
     app.dependency_overrides[get_db] = _override_get_db
     with TestClient(app) as c:
         yield c

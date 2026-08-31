@@ -1,6 +1,7 @@
 """FastAPI 入口：应用实例、CORS、路由注册、统一异常处理。"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -19,18 +20,31 @@ logging.getLogger().setLevel(logging.INFO)
 from app.api import chat, documents, health, knowledge_base, memory, stats
 from app.api.errors import ApiError
 from app.config import ensure_data_dirs, settings
+from app.core.session_cleanup import cleanup_expired_sessions
 from app.llm.errors import LLMError
 from app.store.db import init_db
 
 logger = logging.getLogger(__name__)
 
 
+async def _periodic_cleanup() -> None:
+    """定期清理过期会话（启动时清一次 + 按配置间隔循环）。"""
+    while True:
+        try:
+            await asyncio.to_thread(cleanup_expired_sessions)
+        except Exception:
+            logger.exception("定时清理过期会话异常")
+        await asyncio.sleep(settings.session_cleanup_interval_hours * 3600)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_data_dirs()
     init_db()
-    logger.info("服务启动：数据目录就绪，数据库已初始化")
+    cleanup_task = asyncio.create_task(_periodic_cleanup())
+    logger.info("服务启动：数据目录就绪，数据库已初始化，过期会话清理已启动")
     yield
+    cleanup_task.cancel()
 
 
 def create_app() -> FastAPI:
