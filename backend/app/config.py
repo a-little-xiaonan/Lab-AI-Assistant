@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     llm_model_fallback: str = "qwen-max"  # 备用模型（预留，主模型失败时切换）
     embedding_model: str = "text-embedding-v3"
     llm_timeout: int = 60
+    llm_stream_timeout: int = 300  # 流式超时放宽：长回答生成期间无单个块超时风险
 
     # ----- 服务 -----
     app_host: str = "0.0.0.0"
@@ -56,6 +57,12 @@ class Settings(BaseSettings):
     # 相关命中 0.5+，故从设计文档建议值 0.3 上调到 0.45，防噪声混入引用
     similarity_threshold: float = 0.45
     max_context_tokens: int = 3000
+
+    # ----- 短期记忆（Phase 2-03）-----
+    history_max_turns: int = 10          # 窗口轮数：超过 2 倍触发摘要压缩
+    history_max_tokens: int = 4000       # 历史段 token 预算（超限丢最旧）
+    memory_max_instances: int = 200      # 进程内记忆实例上限（LRU 淘汰，DB 是源可重建）
+    memory_idle_ttl_seconds: int = 3600  # 实例空闲过期时间
 
     @property
     def chroma_dir(self) -> Path:

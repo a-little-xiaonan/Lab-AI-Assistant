@@ -4,8 +4,10 @@ API Key 只从 settings 读取；日志中禁止打印 key。
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import time
+from collections.abc import Iterator
 
 from dashscope import Generation, TextEmbedding
 
@@ -62,7 +64,7 @@ def _retry(fn, *args, **kwargs):
 
 
 def chat_completion(messages: list[dict], model: str | None = None, stream: bool = False) -> str:
-    """非流式对话。stream 参数为 Phase 2-01（SSE）预留，MVP 恒为 False。"""
+    """非流式对话（流式请用 chat_completion_stream；stream 参数保留仅为兼容旧调用）。"""
     key = _api_key()
     model = model or settings.llm_model
     resp = _retry(
@@ -77,6 +79,86 @@ def chat_completion(messages: list[dict], model: str | None = None, stream: bool
     if not text.strip():
         raise LLMError(code="llm_empty_response", message="模型返回为空")
     return text
+
+
+def _start_stream_with_retry(fn) -> Iterator:
+    """流式首块前重试（实测：Generation.call(stream=True) 返回同步生成器）。
+
+    连接级失败（首块 429/5xx）可以整体重试——尚未产出任何 token，无重复风险；
+    一旦首块成功（200），后续块不再重试（中途重试会产生重复输出），以
+    llm_stream_interrupted 快速失败。返回 chain([first], rest)，首块不丢失。
+    """
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            gen = fn()
+            first = next(gen)  # 空生成器 → StopIteration 落入 except 走重试
+            if first.status_code == 200:
+                return itertools.chain([first], gen)
+            if first.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES - 1:
+                wait = 2 ** attempt
+                logger.warning(
+                    "流式首块返回 %s，%.1fs 后重试（第 %d 次）", first.status_code, wait, attempt + 1
+                )
+                time.sleep(wait)
+                continue
+            raise LLMError(
+                code=f"llm_status_{first.status_code}",
+                message=f"模型接口返回错误（{first.status_code}）："
+                f"{getattr(first, 'message', '') or first.code}",
+            )
+        except LLMError:
+            raise
+        except Exception as exc:  # 网络异常、空生成器等
+            last_err = exc
+            if attempt < MAX_RETRIES - 1:
+                wait = 2 ** attempt
+                logger.warning("流式调用异常：%s，%.1fs 后重试（第 %d 次）", exc, wait, attempt + 1)
+                time.sleep(wait)
+    raise LLMError(code="llm_call_failed", message=f"模型调用失败：{last_err}")
+
+
+def chat_completion_stream(messages: list[dict], model: str | None = None) -> Iterator[str]:
+    """流式对话：逐增量 yield 文本（SSE delta 的数据源）。
+
+    实测（2026-08-31 smoke_test_stream.py）：
+    - 显式 incremental_output=True 时每块 text 是纯增量（如 '  \\n2'）；
+    - 不传时（qwen 系 merge 模式）每块 text 是累积全文。
+    因此做差分兜底：text 以 prev 开头 → 按累积处理切出差量，否则按增量处理直接产出，
+    两种模式下输出都是正确增量。
+    - 流结束块 text 为空且 status=200，跳过；全程无产出 → llm_empty_response（与非流式口径一致）。
+    """
+    key = _api_key()
+    model = model or settings.llm_model
+    gen = _start_stream_with_retry(
+        lambda: Generation.call(
+            model=model,
+            messages=messages,
+            api_key=key,
+            stream=True,
+            incremental_output=True,
+            timeout=settings.llm_stream_timeout,
+        )
+    )
+    prev = ""
+    emitted = False
+    for chunk in gen:
+        if chunk.status_code != 200:
+            raise LLMError(
+                code="llm_stream_interrupted",
+                message=f"流式输出中断（{chunk.status_code}）：{getattr(chunk, 'message', '') or chunk.code}",
+            )
+        text = getattr(getattr(chunk, "output", None), "text", None) or ""
+        if text.startswith(prev):
+            delta = text[len(prev):]  # merge 模式：累积 → 切差量
+        else:
+            delta = text  # incremental 模式：本身就是增量
+        prev = text
+        if delta:
+            emitted = True
+            yield delta
+    if not emitted:
+        raise LLMError(code="llm_empty_response", message="模型返回为空")
 
 
 def embed_texts(

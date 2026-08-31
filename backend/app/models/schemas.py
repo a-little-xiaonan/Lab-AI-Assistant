@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ChatRequest(BaseModel):
@@ -45,3 +45,45 @@ class MessageOut(BaseModel):
 
 class SessionDetailOut(SessionOut):
     messages: list[MessageOut] = []
+
+
+# ----- 知识库 / 文档（Phase 2-02）-----
+
+class KnowledgeBaseCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+    embedding_model: str | None = None  # 不传默认全局模型；与全局不同 → 400（每库模型选择后置）
+
+
+class KnowledgeBaseOut(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    embedding_model: str
+    document_count: int = 0
+    chunk_count: int = 0
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DocumentOut(BaseModel):
+    doc_id: str
+    filename: str
+    file_size: int
+    status: str  # processing / ready / failed
+    error_message: str | None = None
+    chunk_count: int
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class KnowledgeBaseDetailOut(KnowledgeBaseOut):
+    documents: list[DocumentOut] = []
+
+
+class UploadDocumentOut(BaseModel):
+    doc_id: str
+    filename: str
+    status: str  # processing（异步处理中）
+    file_size: int
+    kb_id: str

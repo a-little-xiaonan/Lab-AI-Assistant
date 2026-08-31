@@ -12,20 +12,20 @@
 
 ## 2. 任务拆解
 
-- [ ] 数据模型（SQLAlchemy 新增两张表）：
+- [x] 数据模型（SQLAlchemy 新增两张表）：
   - `KnowledgeBase`：id（`kb_` 前缀 UUID）、name、description、embedding_model、created_at
   - `Document`：id（`doc_` 前缀 UUID）、kb_id（外键）、filename、chunk_count、status、error_message、created_at
-- [ ] `app/api/knowledge_base.py` 路由（§8.2）：
+- [x] `app/api/knowledge_base.py` 路由（§8.2）：
   - `POST /api/knowledge-bases`（建库：校验名称唯一）
   - `GET /api/knowledge-bases`、`GET /api/knowledge-bases/{id}`（详情含文档列表与统计）
   - `DELETE /api/knowledge-bases/{id}`（事务性级联删除，见设计要点）
-- [ ] `app/api/documents.py` 路由（§8.2）：
+- [x] `app/api/documents.py` 路由（§8.2）：
   - `POST /api/knowledge-bases/{id}/documents`：上传 → 走 Phase 1-04 pipeline（解析→清洗→分块→向量化→入库）
   - `GET /api/knowledge-bases/{id}/documents`：文档列表（含 chunk 数、状态）
   - `DELETE /api/knowledge-bases/{id}/documents/{doc_id}`：删 chunk 向量 + 记录 + 原始文件
-- [ ] 文档处理改为**异步后台任务**：上传接口立即返回，处理在后台执行；`Document.status` 状态机：`processing → ready / failed`（失败带 error_message）
-- [ ] `GET /api/stats` 扩展：文档总数、chunk 总数、各库统计
-- [ ] 默认知识库迁移：`kb_default` 在建库接口中保留兼容（Phase 1 的隐式库显式化）
+- [x] 文档处理改为**异步后台任务**：上传接口立即返回，处理在后台执行；`Document.status` 状态机：`processing → ready / failed`（失败带 error_message）
+- [x] `GET /api/stats` 扩展：文档总数、chunk 总数、各库统计
+- [x] 默认知识库迁移：`kb_default` 在建库接口中保留兼容（Phase 1 的隐式库显式化）
 
 ## 3. 设计要点
 
@@ -50,11 +50,11 @@ backend/app/
 
 ## 5. 验收标准
 
-- [ ] curl 完成全流程：建库 → 上传 2 个文档 → 文档状态 processing → ready（chunk 数正确）→ 查询列表 → 删除文档 → 删除知识库
-- [ ] 删除知识库后：SQLite 无残留、ChromaDB 无该 collection、uploads 目录已清理
-- [ ] 上传损坏文件 → 文档状态 failed，error_message 可读，不影响库内其他文档
-- [ ] 重复上传同名文件 → 返回已存在提示（不重复入库）
-- [ ] 不存在的 kb_id 操作 → 404，错误结构统一
+- [x] curl 完成全流程：建库 → 上传 2 个文档 → 文档状态 processing → ready（chunk 数正确）→ 查询列表 → 删除文档 → 删除知识库
+- [x] 删除知识库后：SQLite 无残留、ChromaDB 无该 collection、uploads 目录已清理
+- [x] 上传损坏文件 → 文档状态 failed，error_message 可读，不影响库内其他文档
+- [x] 重复上传同名文件 → 返回已存在提示（不重复入库）
+- [x] 不存在的 kb_id 操作 → 404，错误结构统一
 
 ## 6. 风险与注意事项
 

@@ -45,8 +45,28 @@ class Message(Base):
     session: Mapped[ChatSession] = relationship(back_populates="messages")
 
 
+class KnowledgeBase(Base):
+    """知识库（Phase 2-02）：kb_default 为系统默认库（init_db 幂等种子创建，禁止删除）。
+
+    不配 documents relationship：documents.kb_id 无数据库外键（既有表无迁移框架），
+    级联删除由 API 层显式执行（见 knowledge_base.delete_knowledge_base）。
+    """
+
+    __tablename__ = "knowledge_bases"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # kb_ 前缀 UUID
+    name: Mapped[str] = mapped_column(String(255), unique=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_model: Mapped[str] = mapped_column(String(64), default="text-embedding-v3")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class Document(Base):
-    """文档登记表：上传去重、索引状态、chunk 统计。"""
+    """文档登记表：上传去重、索引状态、chunk 统计。
+
+    kb_id 不设数据库外键（既有表无迁移框架，create_all 不会补约束），
+    由 API 层操作前校验 + 应用层级联保证一致性；ORM 层仍配 relationship。
+    """
 
     __tablename__ = "documents"
 
@@ -56,7 +76,7 @@ class Document(Base):
     file_hash: Mapped[str] = mapped_column(String(32), index=True)
     file_size: Mapped[int] = mapped_column(Integer, default=0)  # 字节
     file_path: Mapped[str] = mapped_column(String(512))
-    status: Mapped[str] = mapped_column(String(16), default="processing")  # processing/indexed/failed
+    status: Mapped[str] = mapped_column(String(16), default="processing")  # processing/ready/failed
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

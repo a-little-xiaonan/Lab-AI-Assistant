@@ -12,19 +12,19 @@
 
 ## 2. 任务拆解
 
-- [ ] `app/llm/qwen.py`：`chat_completion` 支持 `stream=True`，迭代返回增量文本（SDK 流式事件 → 字符串生成器）
-- [ ] `app/core/rag_pipeline.py`：新增 `answer_stream(query, kb_id, session_id)` 生成器函数
+- [x] `app/llm/qwen.py`：`chat_completion` 支持 `stream=True`，迭代返回增量文本（SDK 流式事件 → 字符串生成器）
+- [x] `app/core/rag_pipeline.py`：新增 `answer_stream(query, kb_id, session_id)` 生成器函数
   - 检索、拼装流程与非流式复用同一套代码
   - 生成阶段改为迭代 yield 增量文本
-- [ ] `app/api/chat.py`：`stream=true` 时返回 `StreamingResponse(media_type="text/event-stream")`
-- [ ] **SSE 事件协议**（前后端契约）：
+- [x] `app/api/chat.py`：`stream=true` 时返回 `StreamingResponse(media_type="text/event-stream")`
+- [x] **SSE 事件协议**（前后端契约）：
   - `event: meta` → `{session_id}`（首帧，告知会话）
   - `event: delta` → `{text}`（增量片段，多条）
   - `event: done` → `{full_text, sources}`（终帧，一次性下发引用来源）
   - `event: error` → `{code, message}`（异常时发送，随后正常关闭连接）
-- [ ] 中断处理：客户端断开（`request.is_disconnected()` 或生成器抛 `CancelledError`）→ 停止 LLM 流式调用，回收资源，不写半条消息到数据库
-- [ ] 落库策略：回答完整后落库（或周期累积后落库），避免流式中途写脏数据
-- [ ] 冒烟：`curl -N` 观察逐字输出与终帧结构
+- [x] 中断处理：客户端断开（`request.is_disconnected()` 或生成器抛 `CancelledError`）→ 停止 LLM 流式调用，回收资源，不写半条消息到数据库
+- [x] 落库策略：回答完整后落库（或周期累积后落库），避免流式中途写脏数据
+- [x] 冒烟：`curl -N` 观察逐字输出与终帧结构
 
 ## 3. 设计要点
 
@@ -45,10 +45,10 @@ backend/app/
 
 ## 5. 验收标准
 
-- [ ] `curl -N -X POST /api/chat`（stream=true）看到 `event: delta` 逐字输出，结尾收到 `event: done`（含完整回答与 sources）
-- [ ] 流式回答完整落库（流结束后 `GET /api/chat/sessions/{id}` 能看到完整消息）
-- [ ] 客户端中途断开 → 服务端日志记录中断，无残留半条消息、无连接泄漏
-- [ ] `stream=false` 路径行为与 Phase 1-07 完全一致（回归）
+- [x] `curl -N -X POST /api/chat`（stream=true）看到 `event: delta` 逐字输出，结尾收到 `event: done`（含完整回答与 sources）
+- [x] 流式回答完整落库（流结束后 `GET /api/chat/sessions/{id}` 能看到完整消息）
+- [x] 客户端中途断开 → 服务端日志记录中断，无残留半条消息、无连接泄漏
+- [x] `stream=false` 路径行为与 Phase 1-07 完全一致（回归）
 
 ## 6. 风险与注意事项
 
