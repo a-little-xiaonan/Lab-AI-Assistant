@@ -1,5 +1,6 @@
 // 会话状态：消息数组是唯一数据源；流式 delta 追加、done 写 sources、error 置顶部提示
 import { defineStore } from "pinia";
+import { reactive } from "vue";
 import { chatStream } from "../api/chat";
 import {
   createSession as apiCreateSession,
@@ -108,12 +109,14 @@ export const useSessionStore = defineStore("session", {
 
       // user 消息 + assistant 占位
       this.messages.push({ role: "user", content: trimmed, sources: [], streaming: false });
-      const assistantMsg: ChatMessage = {
+      // 必须用 reactive 创建：直接 push 普通对象会被 Vue 转成另一个代理，
+      // 之后对原对象的增量修改不会触发渲染（经典坑：切会话才显示）
+      const assistantMsg: ChatMessage = reactive({
         role: "assistant",
         content: "",
         sources: [],
         streaming: true,
-      };
+      });
       this.messages.push(assistantMsg);
 
       this.streaming = true;
