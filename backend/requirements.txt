@@ -1,0 +1,23 @@
+# Phase 1 MVP 直接依赖（安装成功后用 uv pip freeze 生成 requirements.lock 锁全量版本）
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-multipart
+
+# 文档解析（unstructured 的 pptx/xlsx 解析依赖在 extras 中）
+pymupdf==1.28.2
+python-docx
+unstructured[pptx,xlsx]
+
+# 向量库
+chromadb==1.5.9
+
+# LLM
+dashscope
+
+# 存储（SQLite 或 MySQL + pymysql）
+sqlalchemy
+pymysql
+
+# 测试
+pytest
