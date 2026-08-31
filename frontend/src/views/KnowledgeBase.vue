@@ -69,8 +69,9 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="120">
+        <el-table-column label="操作" width="160">
           <template #default="{ row }">
+            <el-button link size="small" @click="openChunks(row)">查看</el-button>
             <el-button link size="small" :loading="reindexingId === row.doc_id" @click="reindexDoc(row.doc_id)">重建</el-button>
             <el-button link size="small" type="danger" @click="confirmDeleteDoc(row)">删除</el-button>
           </template>
@@ -84,6 +85,24 @@
         style="margin-top: 8px"
       />
     </el-drawer>
+
+    <!-- chunk 明细抽屉：每块内容 + 大小 + 位置元数据 -->
+    <el-drawer v-model="showChunks" :title="chunksTitle" size="520px">
+      <div v-if="chunksLoading" class="chunks-loading">加载中...</div>
+      <el-scrollbar v-else class="chunks-scroll">
+        <div v-for="c in chunks" :key="c.chunk_index" class="chunk-item">
+          <div class="chunk-meta">
+            <el-tag size="small">#{{ c.chunk_index }}</el-tag>
+            <span class="chunk-size">{{ c.char_length }} 字符 · ≈{{ c.token_estimate }} tokens</span>
+            <span v-if="c.page != null" class="chunk-loc">P{{ c.page }}</span>
+            <span v-else-if="c.slide_number != null" class="chunk-loc">slide {{ c.slide_number }}</span>
+            <span v-else-if="c.sheet_name" class="chunk-loc">{{ c.sheet_name }}[{{ c.row_range }}]</span>
+          </div>
+          <pre class="chunk-text">{{ c.text }}</pre>
+        </div>
+        <el-empty v-if="!chunks.length" description="该文档没有 chunk" />
+      </el-scrollbar>
+    </el-drawer>
   </el-container>
 </template>
 
@@ -94,12 +113,13 @@ import DocumentUpload from "../components/DocumentUpload.vue";
 import { useKnowledgeBasesStore } from "../stores/knowledgeBases";
 import {
   deleteDocument as apiDeleteDocument,
+  getDocChunks,
   getKnowledgeBaseDetail,
   getStats,
   reindex as apiReindex,
   reindexStatus,
 } from "../api/knowledgeBases";
-import type { DocumentItem, KnowledgeBase, Stats } from "../types";
+import type { ChunkItem, DocumentItem, KnowledgeBase, Stats } from "../types";
 
 const kbStore = useKnowledgeBasesStore();
 const stats = ref<Stats>({ document_count: 0, chunk_count: 0, storage_size: 0, knowledge_base_count: 0, vector_dim: 1024, knowledge_bases: [] });
@@ -115,6 +135,28 @@ const detailDocs = ref<DocumentItem[]>([]);
 const detailError = ref("");
 const reindexingId = ref(""); // 正在重建的 doc_id 或 kb_id（按钮 loading）
 const timers: number[] = [];
+
+// chunk 明细
+const showChunks = ref(false);
+const chunks = ref<ChunkItem[]>([]);
+const chunksTitle = ref("");
+const chunksLoading = ref(false);
+
+async function openChunks(row: DocumentItem) {
+  showChunks.value = true;
+  chunksTitle.value = `${row.filename} 的 chunk（共 ${row.chunk_count} 块）`;
+  chunksLoading.value = true;
+  chunks.value = [];
+  try {
+    const data = await getDocChunks(row.doc_id);
+    chunks.value = data.chunks;
+    chunksTitle.value = `${row.filename} 的 chunk（共 ${data.total} 块）`;
+  } catch (e) {
+    ElMessage.error((e as Error).message);
+  } finally {
+    chunksLoading.value = false;
+  }
+}
 
 async function refreshStats() {
   stats.value = await getStats();
@@ -285,5 +327,46 @@ onBeforeUnmount(() => timers.forEach((t) => window.clearInterval(t)));
 .kb-actions {
   display: flex;
   gap: 8px;
+}
+.chunks-loading {
+  text-align: center;
+  color: var(--el-text-color-secondary);
+  padding: 40px 0;
+}
+.chunks-scroll {
+  height: calc(100vh - 80px);
+}
+.chunk-item {
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+.chunk-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.chunk-size {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.chunk-loc {
+  font-size: 12px;
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.chunk-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  max-height: 220px;
+  overflow-y: auto;
 }
 </style>

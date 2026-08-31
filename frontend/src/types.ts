@@ -85,3 +85,23 @@ export interface ReindexStatus {
   started_at: string | null;
   finished_at: string | null;
 }
+
+export interface ChunkItem {
+  chunk_index: number;
+  text: string;
+  char_length: number;
+  token_estimate: number;
+  page: number | null;
+  slide_number: number | null;
+  sheet_name: string | null;
+  row_range: string | null;
+}
+
+export interface ChunkList {
+  doc_id: string;
+  filename: string;
+  total: number;
+  offset: number;
+  limit: number;
+  chunks: ChunkItem[];
+}

@@ -1,5 +1,6 @@
 // 知识库管理 API（Phase 3-04：建/删/详情/上传/删除文档/重索引/统计）
 import type {
+  ChunkList,
   DocumentItem,
   KnowledgeBase,
   KnowledgeBaseDetail,
@@ -91,6 +92,13 @@ export async function reindexStatus(kbId: string): Promise<ReindexStatus> {
 
 export async function getStats(): Promise<Stats> {
   const resp = await fetch("/api/stats");
+  if (!resp.ok) throw await parseError(resp);
+  return resp.json();
+}
+
+/** 文档 chunk 明细（内容/大小/位置元数据，复用后端 Phase 1 接口） */
+export async function getDocChunks(docId: string, limit = 200): Promise<ChunkList> {
+  const resp = await fetch(`/api/documents/${docId}/chunks?limit=${limit}`);
   if (!resp.ok) throw await parseError(resp);
   return resp.json();
 }
