@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Request
@@ -29,6 +30,7 @@ from sqlalchemy.orm import Session
 from app.api.errors import ApiError, BadRequestError, NotFoundError
 from app.core.rag_pipeline import answer, answer_stream
 from app.llm.errors import LLMError
+from app.memory.long_term import long_term_memory
 from app.memory.memory_manager import memory_manager
 from app.models.database import ChatSession, Message
 from app.models.schemas import ChatRequest, SessionCreate, SessionDetailOut, SessionOut
@@ -94,7 +96,7 @@ async def _sse_stream(
                     )
                 )
                 db.commit()
-                _remember_turn(session.id, req.message, item["full_text"])
+                _remember_turn(session.id, req.knowledge_base_id, req.message, item["full_text"])
                 yield format_sse_event(
                     "done",
                     {"full_text": item["full_text"], "sources": item["sources"]},
@@ -114,14 +116,33 @@ async def _sse_stream(
         yield format_sse_event("error", {"code": "internal_error", "message": "服务内部错误"})
 
 
-def _remember_turn(session_id: str, user_content: str, assistant_content: str) -> None:
-    """回合收尾：user+assistant 写入短期记忆窗口（回合原子，两条都成功才更新）。"""
+def _remember_turn(
+    session_id: str, kb_id: str, user_content: str, assistant_content: str
+) -> None:
+    """回合收尾：短期记忆窗口更新 + 长期记忆后台提取（都失败不影响主链路）。"""
     try:
         mem = memory_manager.get(session_id)
         mem.add_message("user", user_content)
         mem.add_message("assistant", assistant_content)
     except Exception:
         logger.exception("短期记忆更新失败：session=%s", session_id)
+    _schedule_memory_extract(session_id, kb_id, user_content, assistant_content)
+
+
+def _schedule_memory_extract(
+    session_id: str, kb_id: str, user_content: str, assistant_content: str
+) -> None:
+    """长期记忆提取放后台线程（Fire-and-forget：每轮多一次 LLM 调用，不阻塞回答）。"""
+
+    def _run() -> None:
+        long_term_memory.extract_and_store(
+            session_id, kb_id, [("user", user_content), ("assistant", assistant_content)]
+        )
+
+    try:
+        asyncio.get_running_loop().create_task(asyncio.to_thread(_run))
+    except RuntimeError:  # 无事件循环的调用上下文兜底
+        threading.Thread(target=_run, daemon=True).start()
 
 
 @router.post("/chat")
@@ -153,7 +174,7 @@ async def chat(
         ]
     )
     db.commit()
-    _remember_turn(session.id, req.message, result["answer"])
+    _remember_turn(session.id, req.knowledge_base_id, req.message, result["answer"])
     return {"answer": result["answer"], "sources": result["sources"]}
 
 

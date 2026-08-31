@@ -29,6 +29,7 @@ from app.llm.prompt_templates import (
     build_rag_answer_messages,
     format_retrieved_chunks,
 )
+from app.memory.long_term import format_memories, long_term_memory
 from app.memory.memory_manager import memory_manager
 
 logger = logging.getLogger(__name__)
@@ -66,22 +67,24 @@ def _dedup_sources(chunks: list[retriever.RetrievedChunk]) -> list[dict]:
 
 
 def _prepare(query: str, kb_id: str, history: str = "") -> tuple[list[retriever.RetrievedChunk], list[dict]]:
-    """检索 + 场景分支（answer 与 answer_stream 共享）。
+    """检索 + 场景分支 + 长期记忆召回（answer 与 answer_stream 共享）。
 
     检索为空/全部低于阈值 → no_context 模板（无参考资料段，明确告知未找到）；
-    检索失败降级纯 LLM（日志标记）。
+    检索失败降级纯 LLM（日志标记）。长期记忆（Phase 3-03）在两种场景都拼入，
+    记忆召回失败返回空段，不阻断主链路。
     """
     try:
         chunks = retriever.retrieve(kb_id, query)
     except Exception:
         logger.exception("检索失败，降级为纯 LLM 回答：kb=%s", kb_id)
         chunks = []
+    memories = format_memories(long_term_memory.recall(query, kb_id))
     if chunks:
         messages = build_rag_answer_messages(
-            query, retrieved=format_retrieved_chunks(chunks), history=history
+            query, retrieved=format_retrieved_chunks(chunks), history=history, memories=memories
         )
     else:
-        messages = build_no_context_messages(query, history=history)
+        messages = build_no_context_messages(query, history=history, memories=memories)
     return chunks, messages
 
 

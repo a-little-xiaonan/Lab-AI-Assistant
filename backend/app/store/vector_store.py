@@ -75,6 +75,49 @@ class VectorStore:
                 logger.warning("删除 collection %s 失败（可能不存在）", name)
             self._collections.pop(name, None)
 
+    # ----- 长期记忆 collection（Phase 3-03；命名 kb_{kb_id}_memory，与 docs 隔离）-----
+
+    def _get_memory_collection(self, kb_id: str):
+        name = f"kb_{kb_id}_memory"
+        return self._client.get_or_create_collection(
+            name=name, metadata={"hnsw:space": "cosine"}
+        )
+
+    def add_memories(self, kb_id: str, entries: list[dict]) -> None:
+        """写入记忆条目：entries=[{id, content, embedding, metadata}]。
+
+        upsert：同 id（同 session 同内容 hash）覆盖，天然去重。
+        """
+        if not entries:
+            return
+        with self._lock:
+            coll = self._get_memory_collection(kb_id)
+            coll.upsert(
+                ids=[e["id"] for e in entries],
+                documents=[e["content"] for e in entries],
+                embeddings=[e["embedding"] for e in entries],
+                metadatas=[e["metadata"] for e in entries],
+            )
+
+    def query_memories(
+        self, kb_id: str, query_embedding: list[float], top_k: int
+    ) -> list[tuple[str, dict, float]]:
+        """召回记忆：返回 (content, metadata, distance)，距离升序。"""
+        coll = self._get_memory_collection(kb_id)
+        if coll.count() == 0:
+            return []
+        res = coll.query(query_embeddings=[query_embedding], n_results=top_k)
+        return list(zip(res["documents"][0], res["metadatas"][0], res["distances"][0]))
+
+    def delete_session_memories(self, kb_id: str, session_id: str) -> int:
+        """删除某会话贡献的记忆（清理入口），返回删除条数。"""
+        coll = self._get_memory_collection(kb_id)
+        res = coll.get(where={"session_id": session_id})
+        ids = res["ids"]
+        if ids:
+            coll.delete(ids=ids)
+        return len(ids)
+
     def count(self, kb_id: str) -> int:
         return self._get_collection(kb_id).count()
 

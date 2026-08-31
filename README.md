@@ -5,7 +5,7 @@
 - 后端：FastAPI + 通义千问（DashScope qwen-plus / text-embedding-v3）+ ChromaDB + MySQL/SQLite
 - 前端：Vite + Vue 3 + TypeScript + Element Plus（聊天界面）
 - 技术设计文档：`docs/RAG-AI-Assistant-技术设计文档.md`；分阶段开发文档：`docs/development/`
-- 当前进度：**Phase 2 完成**（SSE 流式 / 多知识库 / 短期记忆 / Prompt 优化与引用标注 / 前端聊天界面），Phase 3（Query Rewrite / Re-ranking / 长期记忆等）按路线图推进
+- 当前进度：**Phase 2 完成**（SSE 流式 / 多知识库 / 短期记忆 / Prompt 优化与引用标注 / 前端聊天界面），**Phase 3 长期记忆完成**，其余（Query Rewrite / Re-ranking 等）按路线图推进
 
 ## 快速开始
 
@@ -145,6 +145,7 @@ data/                    # 运行时数据（gitignore）：chroma/、uploads/�
 - **spaCy 模型**：unstructured 首次解析 PPT/Excel 时会自动下载 en_core_web_sm（走 GitHub，国内可能失败），所以上面第 2 步预先装好
 - **阈值 0.45**：检索相似度阈值（cosine 语义，similarity = 1 - distance），实测标定（2026-08-30）；无关中文文本噪声地板 ~0.35-0.41，相关命中 0.5+
 - **短期记忆**：滑动窗口 10 轮 + LLM 摘要压缩（超窗自动触发）；摘要是进程内运行时态，重启后从消息表重建窗口；不同会话记忆隔离
+- **长期记忆**（Phase 3-03）：每轮对话后台提取（LLM → 置信度过滤 → 向量入库 `kb_{kb_id}_memory`），提问时召回相关记忆拼入 prompt（参考资料 → 相关记忆 → 对话历史 → 问题）；按知识库隔离、跨会话共享；清理入口 `DELETE /api/memory/{session_id}`
 - **上传异步化**：Phase 2 起上传立即返回 202 + processing，后台处理完成后 status=ready/failed（失败带 error_message），前端轮询列表
 - **引用规范**：正文 `[来源: 文件名 P页码]` + 末尾「参考来源：」汇总段（同源合并、snippet ≤50 字）；幻觉防护（越界引用剔除、直写不存在的来源剔除）
 - **评估基线**：`docs/eval/qa-samples.md` 18 条样例 + `scripts/eval_run.py`，Phase 3 每个增强跑同一批对比

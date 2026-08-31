@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import chat, documents, health, knowledge_base, stats
+from app.api import chat, documents, health, knowledge_base, memory, stats
 from app.api.errors import ApiError
 from app.config import ensure_data_dirs, settings
 from app.llm.errors import LLMError
@@ -37,7 +37,8 @@ def create_app() -> FastAPI:
     )
 
     # 路由统一 /api 前缀
-    for router in (health.router, stats.router, documents.router, chat.router, knowledge_base.router):
+    for router in (health.router, stats.router, documents.router, chat.router,
+                   knowledge_base.router, memory.router):
         app.include_router(router, prefix="/api")
 
     @app.exception_handler(ApiError)

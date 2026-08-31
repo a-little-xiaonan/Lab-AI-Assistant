@@ -56,6 +56,14 @@ def _fake_memory_manager(monkeypatch):
     monkeypatch.setattr(memory_manager, "get", fake_get)
 
 
+@pytest.fixture(autouse=True)
+def _fake_long_term_memory(monkeypatch):
+    """测试环境隔离：长期记忆召回打桩为空（不触发 embed_query 真实 API 调用）。"""
+    from app.memory.long_term import long_term_memory
+
+    monkeypatch.setattr(long_term_memory, "recall", lambda query, kb_id, top_k=None: [])
+
+
 @pytest.fixture()
 def client(monkeypatch):
     """TestClient：内存库会话、跳过真实数据库初始化。"""

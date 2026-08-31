@@ -26,8 +26,19 @@ SUMMARIZE_HISTORY_SYSTEM = (
 # ---- Phase 3 占位模板（先定义常量与 builder，实现后置）----
 QUERY_REWRITE_SYSTEM = """你是一个查询改写器。请把用户的问题改写得更适合向量检索：
 补充上下文、纠正错别字、拆解多意图。只输出改写后的问题。"""  # TODO Phase 3-01
-MEMORY_EXTRACT_SYSTEM = """你是一个记忆提取器。请从对话中提取值得长期记住的事实与偏好。
-只输出结构化条目，不要输出其他内容。"""  # TODO Phase 3-03
+MEMORY_EXTRACT_SYSTEM = """你是一个记忆提取器。分析以下对话，提取值得长期记住的信息。
+
+提取规则：
+1. 仅提取非显而易见的、有长期价值的信息（过滤常识、寒暄、一次性闲聊）
+2. 记忆类型（type 从以下四类中选择）：
+   - user_preference：用户偏好（语言风格、领域偏好、习惯等）
+   - key_fact：关键事实（用户提到的重要信息、身份、背景）
+   - faq_pair：高频问答对（用户反复问的问题及标准回答）
+   - entity：实体信息（人名、产品名、设备、概念关联）
+3. confidence 为该信息值得长期记住的置信度（0-1，不重要的给低分）
+
+只输出 JSON 数组，不要输出任何其他内容，格式：
+[{"type": "user_preference", "content": "记忆内容", "confidence": 0.9}]"""  # Phase 3-03 实装
 
 
 def format_retrieved_chunks(chunks: list[Chunk]) -> str:
@@ -50,10 +61,13 @@ def build_rag_answer_messages(
     query: str,
     retrieved: str,
     history: str,
+    memories: str = "",
     system_prompt: str = RAG_ANSWER_SYSTEM,
 ) -> list[dict]:
-    """主场景：System + 参考资料 + 对话历史 + 用户问题。"""
+    """主场景：System + 参考资料 + 相关记忆 + 对话历史 + 用户问题（§7.4 拼装顺序）。"""
     parts = [f"## 参考资料\n{retrieved}"] if retrieved else []
+    if memories:
+        parts.append(f"## 相关记忆\n{memories}")
     if history:
         parts.append(f"## 对话历史\n{history}")
     parts.append(f"## 用户问题\n{query}")
@@ -66,10 +80,13 @@ def build_rag_answer_messages(
 def build_no_context_messages(
     query: str,
     history: str,
+    memories: str = "",
     system_prompt: str = NO_CONTEXT_SYSTEM,
 ) -> list[dict]:
-    """检索为空/全被阈值过滤：无参考资料段，明确告知未找到 + 建议。"""
+    """检索为空/全被阈值过滤：无参考资料段，明确告知未找到 + 建议（记忆段保留，偏好仍生效）。"""
     parts = []
+    if memories:
+        parts.append(f"## 相关记忆\n{memories}")
     if history:
         parts.append(f"## 对话历史\n{history}")
     parts.append(f"## 用户问题\n{query}")
