@@ -1,59 +1,47 @@
-"""知识库 ACL：所有检索与管理操作在此收口，避免前端隐藏按钮成为唯一防线。"""
+"""知识库等级授权：读取向下兼容，操作必须高一级。
+
+guest 是匿名态（不入 roles 表）；登录用户的有效等级取其全部角色中的最高等级。
+历史 visibility / ACL 表保留给旧数据和接口兼容，但不再作为本规则的授权来源。
+"""
 from __future__ import annotations
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.errors import ApiError, NotFoundError
-from app.auth.dependencies import has_role
-from app.models.database import (
-    KnowledgeBase,
-    KnowledgeBaseRolePermission,
-    KnowledgeBaseUserPermission,
-    User,
-)
+from app.models.database import KnowledgeBase, User
 
-_LEVEL = {"read": 1, "write": 2, "manage": 3}
+ACCESS_LEVELS = ("guest", "student", "editor", "admin")
+LEVEL_VALUE = {name: index for index, name in enumerate(ACCESS_LEVELS)}
 
 
-def _grants(permission: str, required: str) -> bool:
-    return _LEVEL.get(permission, 0) >= _LEVEL[required]
-
-
-def can_access_kb(db: Session, kb: KnowledgeBase, user: User | None, required: str) -> bool:
-    """判断当前用户对单个活跃知识库的权限。"""
-    if kb.status != "active":
-        return False
-    if user is not None and has_role(user, "admin"):
-        return True
-    if user is not None and kb.owner_id == user.id:
-        return True
-    if required == "read":
-        if kb.visibility == "public":
-            return True
-        if kb.visibility == "authenticated" and user is not None:
-            return True
+def effective_level(user: User | None) -> str:
+    """获取身份的最高等级；多角色用户按最高权限生效。"""
     if user is None:
-        return False
+        return "guest"
+    roles = {role.code for role in user.roles}
+    return max((role for role in roles if role in LEVEL_VALUE), key=LEVEL_VALUE.get, default="guest")
 
-    direct = db.scalars(
-        select(KnowledgeBaseUserPermission.permission).where(
-            KnowledgeBaseUserPermission.kb_id == kb.id,
-            KnowledgeBaseUserPermission.user_id == user.id,
-        )
-    )
-    if any(_grants(p, required) for p in direct):
-        return True
-    role_ids = [role.id for role in user.roles]
-    if not role_ids:
+
+def can_read_kb(kb: KnowledgeBase, user: User | None) -> bool:
+    """读取规则：用户等级不低于知识库等级。"""
+    return kb.status == "active" and LEVEL_VALUE[effective_level(user)] >= LEVEL_VALUE.get(kb.access_level, 0)
+
+
+def can_operate_kb(kb: KnowledgeBase, user: User | None) -> bool:
+    """操作规则：普通角色必须高于目标库；admin 是系统兜底，可维护 admin 库。"""
+    level = effective_level(user)
+    if level == "admin":
+        return kb.status == "active"
+    return kb.status == "active" and LEVEL_VALUE[level] > LEVEL_VALUE.get(kb.access_level, 0)
+
+
+def can_create_kb(user: User | None, access_level: str) -> bool:
+    """创建规则：editor 可创建 guest/student 库；admin 可创建全部等级。"""
+    level = effective_level(user)
+    if access_level not in LEVEL_VALUE:
         return False
-    inherited = db.scalars(
-        select(KnowledgeBaseRolePermission.permission).where(
-            KnowledgeBaseRolePermission.kb_id == kb.id,
-            KnowledgeBaseRolePermission.role_id.in_(role_ids),
-        )
-    )
-    return any(_grants(p, required) for p in inherited)
+    return level == "admin" or LEVEL_VALUE[level] > LEVEL_VALUE[access_level]
 
 
 def require_kb_permission(
@@ -62,16 +50,25 @@ def require_kb_permission(
     kb = db.get(KnowledgeBase, kb_id)
     if kb is None or kb.status != "active":
         raise NotFoundError("knowledge_base_not_found", "知识库不存在或不可用")
-    if not can_access_kb(db, kb, user, required):
-        if user is None and kb.visibility != "public":
-            raise ApiError(401, "authentication_required", "请登录后访问该知识库")
-        raise ApiError(403, "forbidden", "无权访问该知识库")
-    return kb
+    allowed = can_read_kb(kb, user) if required == "read" else can_operate_kb(kb, user)
+    if allowed:
+        return kb
+    if user is None and LEVEL_VALUE.get(kb.access_level, 0) > 0:
+        raise ApiError(401, "authentication_required", "请登录后访问该等级知识库")
+    raise ApiError(403, "forbidden", "当前角色等级不足，无法操作该知识库")
 
 
 def list_readable_kbs(db: Session, user: User | None) -> list[KnowledgeBase]:
-    """知识库规模小，首期在应用层统一判定，避免 ACL SQL 过早复杂化。"""
+    """聊天与列表共用：只返回当前身份可读取的活动知识库。"""
     all_kbs = db.scalars(
         select(KnowledgeBase).where(KnowledgeBase.status == "active").order_by(KnowledgeBase.created_at)
     ).all()
-    return [kb for kb in all_kbs if can_access_kb(db, kb, user, "read")]
+    return [kb for kb in all_kbs if can_read_kb(kb, user)]
+
+
+def list_operable_kbs(db: Session, user: User | None) -> list[KnowledgeBase]:
+    """管理端只展示当前角色可维护的知识库。"""
+    all_kbs = db.scalars(
+        select(KnowledgeBase).where(KnowledgeBase.status == "active").order_by(KnowledgeBase.created_at)
+    ).all()
+    return [kb for kb in all_kbs if can_operate_kb(kb, user)]

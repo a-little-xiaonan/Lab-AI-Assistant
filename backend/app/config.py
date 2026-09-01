@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     jwt_refresh_token_days: int = 7
     auth_cookie_secure: bool = False  # 本地 HTTP 开发 false；HTTPS 部署必须 true
     auth_cookie_samesite: str = "lax"
+    # 首次启动时自动创建总管理员；只从 .env 读取，创建成功后不会覆盖已有账号。
+    initial_admin_username: str = "admin"
+    initial_admin_password: str = ""
+    initial_admin_nickname: str = "总管理员"
 
     # ----- 存储（相对路径统一锚定项目根目录，与运行目录无关）-----
     chroma_persist_dir: str = "./data/chroma"
@@ -87,6 +91,8 @@ class Settings(BaseSettings):
     topic_retrieval_top_k: int = 10
     topic_coverage_per_sub_query: int = 1
     retrieval_topics_file: str = "./data/retrieval_topics.json"
+    ai_topic_labeling_enabled: bool = True  # 上传后 AI 仅生成待审核主题，不直接影响检索
+    ai_topic_label_max: int = 3
 
     # ----- 术语归一化（Phase 3-01 补强：规则兜底）-----
     term_aliases_enabled: bool = True       # 口语别名 → 标准术语（喂关键词侧；false 时关键词侧只用原问题）

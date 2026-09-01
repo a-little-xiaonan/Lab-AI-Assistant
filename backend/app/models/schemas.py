@@ -8,7 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class ChatRequest(BaseModel):
     session_id: str | None = None      # 不传则后端自动创建会话
-    knowledge_base_id: str = "kb_default"
+    # 不再由客户端选择知识库；保留字段仅兼容旧客户端，服务端会忽略其值。
+    knowledge_base_id: str | None = None
     message: str
     stream: bool = False               # Phase 2-01 支持流式，MVP 传 true 返回 400
 
@@ -86,7 +87,7 @@ class ChatResponse(BaseModel):
 
 
 class SessionCreate(BaseModel):
-    knowledge_base_id: str = "kb_default"
+    knowledge_base_id: str | None = None  # 保留兼容字段，服务端统一使用自动范围
     name: str | None = None  # 可选：创建时直接命名（不传则由 AI 首轮后生成）
 
 
@@ -125,7 +126,7 @@ class KnowledgeBaseCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     description: str | None = None
     embedding_model: str | None = None  # 不传默认全局模型；与全局不同 → 400（每库模型选择后置）
-    visibility: str = Field(default="public", pattern="^(public|authenticated|restricted)$")
+    access_level: str = Field(default="guest", pattern="^(guest|student|editor|admin)$")
 
 
 class KnowledgeBaseOut(BaseModel):
@@ -133,7 +134,7 @@ class KnowledgeBaseOut(BaseModel):
     name: str
     description: str | None = None
     embedding_model: str
-    visibility: str = "public"
+    access_level: str = "guest"
     document_count: int = 0
     chunk_count: int = 0
     created_at: datetime
@@ -148,6 +149,7 @@ class DocumentOut(BaseModel):
     error_message: str | None = None
     chunk_count: int
     topics: list[str] = []
+    topic_suggestions: list["TopicSuggestionOut"] = []
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
@@ -156,6 +158,13 @@ class DocumentTopicsUpdate(BaseModel):
     """管理员手动主题标注；主题 code 必须来自 retrieval_topics 配置。"""
 
     topic_codes: list[str] = Field(default_factory=list, max_length=8)
+
+
+class TopicSuggestionOut(BaseModel):
+    topic_code: str
+    source: str
+    confidence: float | None = None
+    review_status: str
 
 
 class KnowledgeBaseDetailOut(KnowledgeBaseOut):

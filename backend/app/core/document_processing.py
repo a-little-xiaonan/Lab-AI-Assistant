@@ -98,6 +98,13 @@ def process_document(doc_id: str, target_suffix: str = "docs") -> None:
         doc.chunk_count = chunk_count
         db.commit()
         logger.info("文档处理完成：%s chunk_count=%d", doc.filename, chunk_count)
+        # AI 只生成待审核主题；失败不影响文档 ready，也不会影响全局检索。
+        try:
+            from app.core.topic_suggester import suggest_topics
+
+            suggest_topics(db, doc, chunks)
+        except Exception:
+            logger.exception("主题初标调度失败：doc=%s", doc.id)
         # 关键词索引同步（缓存失同步可被全量重建治愈；异常不阻断主链路）
         try:
             from app.core.keyword_index import keyword_index

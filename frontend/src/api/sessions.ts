@@ -8,11 +8,11 @@ export async function listSessions(): Promise<SessionItem[]> {
   return resp.json();
 }
 
-export async function createSession(knowledgeBaseId?: string): Promise<SessionItem> {
+export async function createSession(): Promise<SessionItem> {
   const resp = await apiFetch("/api/chat/sessions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(knowledgeBaseId ? { knowledge_base_id: knowledgeBaseId } : {}),
+    body: JSON.stringify({}),
   });
   if (!resp.ok) throw await parseApiError(resp);
   return resp.json();

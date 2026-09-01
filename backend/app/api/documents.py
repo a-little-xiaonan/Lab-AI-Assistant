@@ -19,13 +19,13 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.api.errors import BadRequestError, ConflictError, NotFoundError
-from app.auth.dependencies import get_optional_current_user
+from app.auth.dependencies import get_optional_current_user, require_roles
 from app.authorization.permissions import require_kb_permission
 from app.config import settings
 from app.core.document_processing import process_document
 from app.core.retriever import estimate_tokens
-from app.models.database import ChunkRecord, Document, DocumentTopic, KnowledgeBase, User
-from app.models.schemas import DocumentOut, DocumentTopicsUpdate, UploadDocumentOut
+from app.models.database import ChunkRecord, Document, DocumentTopic, KnowledgeBase, User, utcnow
+from app.models.schemas import DocumentOut, DocumentTopicsUpdate, TopicSuggestionOut, UploadDocumentOut
 from app.store.db import get_db
 from app.store.vector_store import vector_store
 
@@ -36,15 +36,30 @@ router = APIRouter(tags=["documents"])
 KB_DEFAULT = "kb_default"
 
 
-def _topic_map(db: Session, doc_ids: list[str]) -> dict[str, list[str]]:
+def _topic_map(db: Session, doc_ids: list[str]) -> dict[str, dict[str, list]]:
+    """主题按审核状态拆分：只有 approved 会作为正式标签返回。"""
     if not doc_ids:
         return {}
     rows = db.execute(
-        select(DocumentTopic.doc_id, DocumentTopic.topic_code).where(DocumentTopic.doc_id.in_(doc_ids))
+        select(
+            DocumentTopic.doc_id, DocumentTopic.topic_code, DocumentTopic.source,
+            DocumentTopic.confidence, DocumentTopic.review_status,
+        ).where(DocumentTopic.doc_id.in_(doc_ids))
     ).all()
-    out: dict[str, list[str]] = {doc_id: [] for doc_id in doc_ids}
-    for doc_id, topic_code in rows:
-        out.setdefault(doc_id, []).append(topic_code)
+    out: dict[str, dict[str, list]] = {
+        doc_id: {"approved": [], "suggestions": []} for doc_id in doc_ids
+    }
+    for doc_id, topic_code, source, confidence, review_status in rows:
+        entry = out.setdefault(doc_id, {"approved": [], "suggestions": []})
+        if review_status == "approved":
+            entry["approved"].append(topic_code)
+        else:
+            entry["suggestions"].append(
+                TopicSuggestionOut(
+                    topic_code=topic_code, source=source,
+                    confidence=confidence, review_status=review_status,
+                )
+            )
     return out
 
 
@@ -164,7 +179,8 @@ def list_kb_documents(
             status=d.status,
             error_message=d.error_message,
             chunk_count=d.chunk_count,
-            topics=topics.get(d.id, []),
+            topics=topics.get(d.id, {}).get("approved", []),
+            topic_suggestions=topics.get(d.id, {}).get("suggestions", []),
             created_at=d.created_at,
         )
         for d in docs
@@ -190,7 +206,8 @@ def get_document_topics(
     doc = db.get(Document, doc_id)
     if doc is None or doc.kb_id != kb_id:
         raise NotFoundError("document_not_found", f"文档不存在：{doc_id}")
-    return {"doc_id": doc_id, "topic_codes": _topic_map(db, [doc_id]).get(doc_id, [])}
+    details = _topic_map(db, [doc_id]).get(doc_id, {"approved": [], "suggestions": []})
+    return {"doc_id": doc_id, "topic_codes": details["approved"], "topic_suggestions": details["suggestions"]}
 
 
 @router.put("/knowledge-bases/{kb_id}/documents/{doc_id}/topics")
@@ -199,10 +216,10 @@ def update_document_topics(
     doc_id: str,
     body: DocumentTopicsUpdate,
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_current_user),
+    user: User = Depends(require_roles("admin")),
 ) -> dict:
-    """人工主题标注：替换式写入；不写 Chroma metadata，检索按 SQL doc_id 过滤。"""
-    require_kb_permission(db, kb_id, user, "write")
+    """管理员审核主题：选中的标签批准，其余 AI 待审建议驳回。"""
+    require_kb_permission(db, kb_id, user, "manage")
     doc = db.get(Document, doc_id)
     if doc is None or doc.kb_id != kb_id:
         raise NotFoundError("document_not_found", f"文档不存在：{doc_id}")
@@ -211,10 +228,33 @@ def update_document_topics(
     valid = retrieval_topics.valid_codes(body.topic_codes)
     if set(valid) != set(body.topic_codes):
         raise BadRequestError("invalid_topic_code", "存在无效主题，请刷新主题配置后重试")
-    db.execute(delete(DocumentTopic).where(DocumentTopic.doc_id == doc_id))
-    db.add_all(DocumentTopic(doc_id=doc_id, topic_code=code, source="manual") for code in valid)
+    existing = {
+        row.topic_code: row
+        for row in db.scalars(select(DocumentTopic).where(DocumentTopic.doc_id == doc_id))
+    }
+    now = utcnow()
+    for code, row in existing.items():
+        if code in valid:
+            row.review_status = "approved"
+            row.reviewed_by = user.id
+            row.reviewed_at = now
+            if row.source == "ai_suggested":
+                row.source = "ai_approved"
+        elif row.review_status == "pending":
+            row.review_status = "rejected"
+            row.reviewed_by = user.id
+            row.reviewed_at = now
+        else:
+            db.delete(row)  # 管理员取消此前已批准的标签
+    db.add_all(
+        DocumentTopic(
+            doc_id=doc_id, topic_code=code, source="manual", review_status="approved",
+            reviewed_by=user.id, reviewed_at=now,
+        )
+        for code in valid if code not in existing
+    )
     db.commit()
-    return {"doc_id": doc_id, "topic_codes": valid}
+    return {"doc_id": doc_id, "topic_codes": valid, "reviewed": True}
 
 
 @router.delete("/knowledge-bases/{kb_id}/documents/{doc_id}")

@@ -33,12 +33,12 @@ export async function listKnowledgeBases(): Promise<KnowledgeBase[]> {
 export async function createKnowledgeBase(
   name: string,
   description?: string,
-  visibility: "public" | "authenticated" | "restricted" = "public",
+  accessLevel: "guest" | "student" | "editor" | "admin" = "guest",
 ): Promise<KnowledgeBase> {
   const resp = await apiFetch("/api/knowledge-bases", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, description: description || null, visibility }),
+    body: JSON.stringify({ name, description: description || null, access_level: accessLevel }),
   });
   if (!resp.ok) throw await parseError(resp);
   return resp.json();

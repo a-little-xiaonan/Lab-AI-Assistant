@@ -62,6 +62,16 @@ MEMORY_EXTRACT_SYSTEM = """你是一个记忆提取器。分析以下对话，�
 只输出 JSON 数组，不要输出任何其他内容，格式：
 [{"type": "user_preference", "content": "记忆内容", "confidence": 0.9}]"""  # Phase 3-03 实装
 
+DOCUMENT_TOPIC_SYSTEM = """你是实验室资料主题标注助手。根据文档内容，从给定主题中挑选最相关的 0-3 个主题。
+
+只输出 JSON 数组，不要 Markdown、不要解释，格式：
+[{"code":"主题代码","confidence":0.0}]
+
+规则：
+1. code 必须来自给定主题；不确定时输出 []；
+2. confidence 取 0-1；
+3. 这只是推荐，最终需要管理员审核。"""
+
 
 def format_retrieved_chunks(chunks: list[Chunk]) -> str:
     """参考资料段：带 [n] 编号与来源标注，模型可在回答中用 [n] 引用。"""
@@ -165,6 +175,15 @@ def build_memory_extract_messages(messages: list[tuple[str, str]]) -> list[dict]
     return [
         {"role": "system", "content": MEMORY_EXTRACT_SYSTEM},
         {"role": "user", "content": format_history(messages) or "（无对话内容）"},
+    ]
+
+
+def build_document_topic_messages(text: str, topics: list[dict]) -> list[dict]:
+    """文档主题 AI 初标：传入受控主题清单，模型只能从其中选择 code。"""
+    topic_lines = "\n".join(f"- {item['code']}：{item['name']}" for item in topics)
+    return [
+        {"role": "system", "content": DOCUMENT_TOPIC_SYSTEM},
+        {"role": "user", "content": f"可选主题：\n{topic_lines}\n\n文档内容：\n{text[:6000]}"},
     ]
 
 

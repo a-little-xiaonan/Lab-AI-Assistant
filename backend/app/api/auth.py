@@ -119,13 +119,16 @@ def refresh(request: Request, response: Response, db: Session = Depends(get_db))
 
 
 @router.post("/logout", status_code=204)
-def logout(request: Request, response: Response, db: Session = Depends(get_db)) -> Response:
+def logout(request: Request, db: Session = Depends(get_db)) -> Response:
     raw_refresh = request.cookies.get(REFRESH_COOKIE)
     if raw_refresh:
         row = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw_refresh)))
         if row is not None and row.revoked_at is None:
             row.revoked_at = utcnow()
             db.commit()
+    # 不返回 FastAPI 注入的临时 Response：它的 status_code 可能为 None，
+    # Uvicorn 记录访问日志时会按 %d 格式化并报错。
+    response = Response(status_code=204)
     response.delete_cookie(REFRESH_COOKIE, path="/api/auth")
     return response
 

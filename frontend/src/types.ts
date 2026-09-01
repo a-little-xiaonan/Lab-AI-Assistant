@@ -5,7 +5,7 @@ export interface KnowledgeBase {
   name: string;
   description: string | null;
   embedding_model: string;
-  visibility: "public" | "authenticated" | "restricted";
+  access_level: "guest" | "student" | "editor" | "admin";
   document_count: number;
   chunk_count: number;
   created_at: string;
@@ -64,7 +64,7 @@ export type SSEEvent =
 
 export interface ChatPayload {
   session_id?: string | null;
-  knowledge_base_id: string;
+  // 聊天范围由后端按当前身份计算，客户端不再传知识库 ID。
   message: string;
   stream: boolean;
 }
@@ -100,7 +100,15 @@ export interface DocumentItem {
   error_message: string | null;
   chunk_count: number;
   topics: string[];
+  topic_suggestions: TopicSuggestion[];
   created_at: string;
+}
+
+export interface TopicSuggestion {
+  topic_code: string;
+  source: string;
+  confidence: number | null;
+  review_status: "pending" | "rejected";
 }
 
 export interface RetrievalTopic {

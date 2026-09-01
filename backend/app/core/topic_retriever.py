@@ -33,6 +33,7 @@ def _topic_document_ids(kb_id: str, topic_codes: list[str]) -> set[str]:
                 Document.kb_id == kb_id,
                 Document.status == "ready",
                 DocumentTopic.topic_code.in_(topic_codes),
+                DocumentTopic.review_status == "approved",
             )
         ).all()
     return set(rows)

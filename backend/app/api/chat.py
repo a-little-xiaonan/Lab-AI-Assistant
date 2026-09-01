@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 
 from app.api.errors import ApiError, BadRequestError, NotFoundError
 from app.auth.dependencies import get_optional_current_user
-from app.authorization.permissions import require_kb_permission
+from app.authorization.permissions import list_readable_kbs
 from app.authorization.session_access import require_session_owner
 from app.core.rag_pipeline import answer, answer_stream
 from app.config import settings
@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["chat"])
 ANONYMOUS_COOKIE = "rag_anonymous_id"
+AUTO_KB_SCOPE = "kb_auto"
 
 
 def _new_session_id() -> str:
@@ -122,6 +123,7 @@ async def _sse_stream(
     db: Session,
     session: ChatSession,
     user_id: str | None = None,
+    readable_kb_ids: list[str] | None = None,
 ) -> None:
     """SSE 生成器：meta → delta* → done（或 error，替代 done 后正常关闭）。
 
@@ -135,7 +137,7 @@ async def _sse_stream(
     yield format_sse_event("meta", {"session_id": session.id})
 
     sync_iter = answer_stream(
-        req.message, req.knowledge_base_id, session_id=session.id, user_id=user_id
+        req.message, readable_kb_ids or [], session_id=session.id, user_id=user_id
     )
     try:
         while True:
@@ -153,7 +155,7 @@ async def _sse_stream(
                     )
                 )
                 db.commit()
-                _remember_turn(session.id, req.knowledge_base_id, req.message, item["full_text"], user_id)
+                _remember_turn(session.id, AUTO_KB_SCOPE, req.message, item["full_text"], user_id)
                 yield format_sse_event(
                     "done",
                     {"full_text": item["full_text"], "sources": item["sources"]},
@@ -258,13 +260,13 @@ async def chat(
     if not req.message.strip():
         raise BadRequestError("empty_message", "消息不能为空")
 
-    require_kb_permission(db, req.knowledge_base_id, user, "read")
+    readable_kb_ids = [kb.id for kb in list_readable_kbs(db, user)]
     anonymous_id, set_anonymous = _get_anonymous_id(request)
-    session = _get_or_create_session(db, req.session_id, req.knowledge_base_id, user, anonymous_id)
+    session = _get_or_create_session(db, req.session_id, AUTO_KB_SCOPE, user, anonymous_id)
 
     if req.stream:
         stream_response = StreamingResponse(
-            _sse_stream(req, request, db, session, user.id if user else None),
+            _sse_stream(req, request, db, session, user.id if user else None, readable_kb_ids),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -273,7 +275,7 @@ async def chat(
         return stream_response
 
     # 非流式（Phase 1 行为不变，历史由 pipeline 从短期记忆取）
-    result = answer(req.message, req.knowledge_base_id, session_id=session.id, user_id=user.id if user else None)
+    result = answer(req.message, readable_kb_ids, session_id=session.id, user_id=user.id if user else None)
 
     # 消息落库（user + assistant 成对）+ 记忆窗口更新
     db.add_all(
@@ -283,7 +285,7 @@ async def chat(
         ]
     )
     db.commit()
-    _remember_turn(session.id, req.knowledge_base_id, req.message, result["answer"], user.id if user else None)
+    _remember_turn(session.id, AUTO_KB_SCOPE, req.message, result["answer"], user.id if user else None)
     response = JSONResponse({"answer": result["answer"], "sources": result["sources"]})
     if set_anonymous and user is None:
         _set_anonymous_cookie(response, anonymous_id)
@@ -298,10 +300,8 @@ def create_session(
     db: Session = Depends(get_db),
     user: User | None = Depends(get_optional_current_user),
 ) -> SessionOut:
-    kb_id = body.knowledge_base_id if body else "kb_default"
-    require_kb_permission(db, kb_id, user, "read")
     anonymous_id, set_anonymous = _get_anonymous_id(request)
-    session = _get_or_create_session(db, None, kb_id, user, anonymous_id)
+    session = _get_or_create_session(db, None, AUTO_KB_SCOPE, user, anonymous_id)
     if body and body.name:
         session.name = body.name.strip()
         session.name_source = "user"

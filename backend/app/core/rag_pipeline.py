@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.config import settings
 from app.core import retriever
@@ -66,8 +67,63 @@ def _dedup_sources(chunks: list[retriever.RetrievedChunk]) -> list[dict]:
     return out
 
 
+def _retrieve_scope(kb_ids: list[str], query: str, history: str) -> tuple[list[retriever.RetrievedChunk], str]:
+    """自动知识库范围检索：先在每库完成自身混合检索，再做跨库 RRF 融合。
+
+    每个 chunk id 含 doc_id，跨库天然不冲突。每库异常只跳过该库，避免一个权限范围
+    内的坏索引拖垮整个聊天请求。
+    """
+    if not kb_ids:
+        return [], ""
+    answer_outline = ""
+    per_kb: dict[str, list[retriever.RetrievedChunk]] = {}
+
+    def _one(kb_id: str):
+        if settings.query_planning_enabled or settings.topic_retrieval_enabled:
+            from app.core.retrieval_orchestrator import retrieve as orchestrated_retrieve
+
+            result = orchestrated_retrieve(kb_id, query, history)
+            return result.chunks, result.answer_outline
+        return retriever.retrieve(kb_id, query), ""
+
+    with ThreadPoolExecutor(max_workers=min(4, len(kb_ids)), thread_name_prefix="scope-retrieve") as pool:
+        futures = {pool.submit(_one, kb_id): kb_id for kb_id in kb_ids}
+        for future in as_completed(futures):
+            kb_id = futures[future]
+            try:
+                chunks, outline = future.result()
+                for chunk in chunks:
+                    chunk.metadata = {**chunk.metadata, "knowledge_base_id": kb_id}
+                per_kb[kb_id] = chunks
+                if outline:
+                    answer_outline = outline
+            except Exception:
+                logger.exception("知识库检索失败，跳过：kb=%s", kb_id)
+
+    # 每库排序表均参与 RRF，不比较不同库的原始相似度/BM25 分数。
+    scores: dict[str, float] = {}
+    chunks_by_id: dict[str, retriever.RetrievedChunk] = {}
+    for chunks in per_kb.values():
+        for rank, chunk in enumerate(chunks):
+            scores[chunk.chunk_id] = scores.get(chunk.chunk_id, 0.0) + 1.0 / (60 + rank)
+            chunks_by_id[chunk.chunk_id] = chunk
+    merged = sorted(chunks_by_id.values(), key=lambda chunk: scores[chunk.chunk_id], reverse=True)
+    for chunk in merged:
+        chunk.score = scores[chunk.chunk_id]
+    if settings.rerank_enabled and len(merged) > 1:
+        try:
+            from app.core.reranker import rerank
+
+            merged = rerank(query, merged)
+        except Exception:
+            logger.exception("跨库重排失败，保留跨库 RRF 顺序")
+    final = retriever.truncate_to_budget(merged[: settings.retrieval_top_k], settings.max_context_tokens)
+    logger.info("自动范围检索：可读库=%d 命中=%d", len(kb_ids), len(final))
+    return final, answer_outline
+
+
 def _prepare(
-    query: str, kb_id: str, history: str = "", user_id: str | None = None
+    query: str, kb_id: str | list[str], history: str = "", user_id: str | None = None
 ) -> tuple[list[retriever.RetrievedChunk], list[dict]]:
     """检索 + 场景分支 + 长期记忆召回（answer 与 answer_stream 共享）。
 
@@ -77,8 +133,10 @@ def _prepare(
     """
     answer_outline = ""
     try:
+        if isinstance(kb_id, list):
+            chunks, answer_outline = _retrieve_scope(kb_id, query, history)
         # 新编排仅在显式开启时接管；默认继续走原 retriever，保证当前稳定链路与测试契约不变。
-        if settings.query_planning_enabled or settings.topic_retrieval_enabled:
+        elif settings.query_planning_enabled or settings.topic_retrieval_enabled:
             from app.core.retrieval_orchestrator import retrieve as orchestrated_retrieve
 
             result = orchestrated_retrieve(kb_id, query, history)
@@ -222,7 +280,7 @@ def _finalize(
 
 def answer(
     query: str,
-    kb_id: str = KB_DEFAULT,
+    kb_id: str | list[str] = KB_DEFAULT,
     session_id: str | None = None,
     user_id: str | None = None,
     **flags,
@@ -239,7 +297,7 @@ def answer(
 
 def answer_stream(
     query: str,
-    kb_id: str = KB_DEFAULT,
+    kb_id: str | list[str] = KB_DEFAULT,
     session_id: str | None = None,
     user_id: str | None = None,
     **flags,

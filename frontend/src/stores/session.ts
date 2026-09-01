@@ -10,7 +10,6 @@ import {
   getSession,
   listSessions,
 } from "../api/sessions";
-import { useKnowledgeBasesStore } from "./knowledgeBases";
 import type { MessageItem, SessionItem, Source } from "../types";
 
 export interface ChatMessage {
@@ -42,9 +41,6 @@ export const useSessionStore = defineStore("session", {
 
   actions: {
     async init() {
-      const kbStore = useKnowledgeBasesStore();
-      await kbStore.load();
-      kbStore.restoreSelection();
       await this.loadSessions();
       const savedId = localStorage.getItem(STORAGE_KEY);
       if (savedId && this.sessions.some((s) => s.id === savedId)) {
@@ -62,8 +58,7 @@ export const useSessionStore = defineStore("session", {
     },
 
     async createSession() {
-      const kbId = useKnowledgeBasesStore().kbId;
-      const session = await apiCreateSession(kbId || undefined);
+      const session = await apiCreateSession();
       this.sessions.unshift(session);
       await this.switchSession(session.id);
       return session;
@@ -155,7 +150,6 @@ export const useSessionStore = defineStore("session", {
         for await (const evt of chatStream(
           {
             session_id: this.currentSessionId,
-            knowledge_base_id: useKnowledgeBasesStore().kbId,
             message: trimmed,
             stream: true,
           },

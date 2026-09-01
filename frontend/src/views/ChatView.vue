@@ -74,16 +74,8 @@
     </el-aside>
 
     <el-container>
-      <!-- 顶部：知识库选择器 -->
+      <!-- 顶部：身份信息 -->
       <el-header class="header">
-        <el-select v-model="kbStore.kbId" placeholder="选择知识库" style="width: 220px" @change="kbStore.selectKb">
-          <el-option
-            v-for="kb in kbStore.knowledgeBases"
-            :key="kb.id"
-            :label="`${kb.name}（${kb.document_count} 文档）`"
-            :value="kb.id"
-          />
-        </el-select>
         <div class="user-actions">
           <template v-if="auth.user">
             <el-button link @click="$router.push('/profile')">{{ auth.user.nickname }}</el-button>
@@ -114,7 +106,7 @@
           />
         </el-scrollbar>
         <MessageInput
-          :disabled="!kbStore.kbId"
+          :disabled="false"
           :streaming="store.streaming"
           @send="store.sendMessage"
           @stop="store.stopStreaming"
@@ -131,12 +123,10 @@ import ChatMessage from "../components/ChatMessage.vue";
 import MessageInput from "../components/MessageInput.vue";
 import { renameSession as apiRenameSession } from "../api/sessions";
 import { useSessionStore } from "../stores/session";
-import { useKnowledgeBasesStore } from "../stores/knowledgeBases";
 import { useAuthStore } from "../stores/auth";
 import type { SessionItem } from "../types";
 
 const store = useSessionStore();
-const kbStore = useKnowledgeBasesStore();
 const auth = useAuthStore();
 const scrollbarRef = ref();
 const showAllSessions = ref(false);
@@ -244,7 +234,6 @@ async function signOut() {
   try {
     await auth.logout();
     await store.loadSessions();
-    await kbStore.load();
     ElMessage.success("已退出登录");
   } catch (err) {
     ElMessage.error((err as Error).message);

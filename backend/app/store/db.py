@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
-from app.models.database import Base, KnowledgeBase, Role
+from app.auth.password import hash_password
+from app.models.database import Base, KnowledgeBase, Role, User, UserRole
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,41 @@ def _seed_roles() -> None:
             if db.scalar(text("SELECT id FROM roles WHERE code=:code"), {"code": code}):
                 continue
             db.add(Role(id=f"role_{code}", code=code, name=name, description=description))
+        db.commit()
+
+
+def _seed_initial_admin() -> None:
+    """创建部署机指定的总管理员。
+
+    密码只允许来自未提交的 .env；为空时明确跳过，避免意外创建弱口令账号。
+    账号已存在时只补 admin 角色，不覆盖用户自行修改过的密码、昵称或状态。
+    """
+    username = settings.initial_admin_username.strip().lower()
+    password = settings.initial_admin_password
+    if not username or not password:
+        logger.warning("未配置 INITIAL_ADMIN_PASSWORD，跳过总管理员初始化")
+        return
+    with SessionLocal() as db:
+        admin_role = db.scalar(text("SELECT id FROM roles WHERE code='admin'"))
+        if admin_role is None:
+            logger.error("admin 角色未初始化，无法创建总管理员")
+            return
+        user = db.scalar(select(User).where(User.username == username))
+        if user is None:
+            user = User(
+                id=f"user_{__import__('uuid').uuid4().hex[:12]}",
+                username=username,
+                password_hash=hash_password(password),
+                nickname=settings.initial_admin_nickname.strip() or "总管理员",
+            )
+            db.add(user)
+            db.flush()
+            logger.info("已创建总管理员账号：%s", username)
+        exists = db.scalar(
+            select(UserRole).where(UserRole.user_id == user.id, UserRole.role_id == admin_role)
+        )
+        if exists is None:
+            db.add(UserRole(user_id=user.id, role_id=admin_role))
         db.commit()
 
 
@@ -194,13 +230,30 @@ def _migrate_multi_user_columns() -> None:
     _add_column_if_missing("sessions", "summary", "TEXT NULL")
     _add_column_if_missing("sessions", "name_source", "VARCHAR(16) NOT NULL DEFAULT 'ai'")
     _add_column_if_missing("knowledge_bases", "visibility", "VARCHAR(16) NOT NULL DEFAULT 'public'")
+    _add_column_if_missing("knowledge_bases", "access_level", "VARCHAR(16) NOT NULL DEFAULT 'guest'")
     _add_column_if_missing("knowledge_bases", "owner_id", "VARCHAR(64) NULL")
     _add_column_if_missing("knowledge_bases", "status", "VARCHAR(16) NOT NULL DEFAULT 'active'")
     _add_column_if_missing("knowledge_bases", "updated_at", "DATETIME NULL")
     with SessionLocal() as db:
         db.execute(text("UPDATE knowledge_bases SET visibility='public' WHERE visibility IS NULL OR visibility=''"))
+        # 旧可见范围的一次性映射：public→guest，authenticated→student，restricted→editor。
+        db.execute(text("UPDATE knowledge_bases SET access_level=CASE visibility "
+                        "WHEN 'authenticated' THEN 'student' WHEN 'restricted' THEN 'editor' "
+                        "ELSE 'guest' END "
+                        "WHERE access_level IS NULL OR access_level='' OR access_level='guest'"))
         db.execute(text("UPDATE knowledge_bases SET status='active' WHERE status IS NULL OR status=''"))
         db.execute(text("UPDATE knowledge_bases SET updated_at=created_at WHERE updated_at IS NULL"))
+        db.commit()
+
+
+def _migrate_document_topic_review() -> None:
+    """主题审核字段增量迁移：旧人工标签默认视为已审核。"""
+    _add_column_if_missing("document_topics", "review_status", "VARCHAR(16) NOT NULL DEFAULT 'approved'")
+    _add_column_if_missing("document_topics", "reviewed_by", "VARCHAR(64) NULL")
+    _add_column_if_missing("document_topics", "reviewed_at", "DATETIME NULL")
+    with SessionLocal() as db:
+        db.execute(text("UPDATE document_topics SET review_status='approved' "
+                        "WHERE review_status IS NULL OR review_status=''"))
         db.commit()
 
 
@@ -211,7 +264,9 @@ def init_db() -> None:
     _migrate_add_chunk_updated_at()
     _migrate_add_deleted_at()
     _migrate_multi_user_columns()
+    _migrate_document_topic_review()
     _seed_roles()
+    _seed_initial_admin()
     _seed_default_knowledge_base()
     _migrate_and_cleanup()
 

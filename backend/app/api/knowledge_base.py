@@ -18,8 +18,8 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.api.errors import BadRequestError, ConflictError, NotFoundError
-from app.auth.dependencies import get_optional_current_user, require_roles
-from app.authorization.permissions import list_readable_kbs, require_kb_permission
+from app.auth.dependencies import get_optional_current_user
+from app.authorization.permissions import can_create_kb, list_operable_kbs, list_readable_kbs, require_kb_permission
 from app.config import settings
 from app.core.reindex import reindex_manager
 from app.models.database import (
@@ -68,7 +68,7 @@ def _kb_out(db: Session, kb: KnowledgeBase) -> KnowledgeBaseOut:
         name=kb.name,
         description=kb.description,
         embedding_model=kb.embedding_model,
-        visibility=kb.visibility,
+        access_level=kb.access_level,
         document_count=doc_count,
         chunk_count=chunk_count,
         created_at=kb.created_at,
@@ -79,7 +79,7 @@ def _kb_out(db: Session, kb: KnowledgeBase) -> KnowledgeBaseOut:
 def create_knowledge_base(
     body: KnowledgeBaseCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("admin")),
+    user: User | None = Depends(get_optional_current_user),
 ) -> KnowledgeBaseOut:
     if db.scalar(select(KnowledgeBase).where(KnowledgeBase.name == body.name)):
         raise ConflictError("duplicate_name", f"知识库名称已存在：{body.name}")
@@ -89,12 +89,16 @@ def create_knowledge_base(
             "unsupported_embedding_model",
             f"当前仅支持全局 embedding 模型：{settings.embedding_model}",
         )
+    if not can_create_kb(user, body.access_level):
+        raise BadRequestError("insufficient_role_level", "只能创建低于自己角色等级的知识库")
     kb = KnowledgeBase(
         id=_new_kb_id(),
         name=body.name,
         description=body.description,
-        visibility=body.visibility,
-        owner_id=user.id,
+        access_level=body.access_level,
+        # 旧字段同步一个粗略映射，兼容尚未升级的外部消费者。
+        visibility={"guest": "public", "student": "authenticated", "editor": "restricted", "admin": "restricted"}[body.access_level],
+        owner_id=user.id if user else None,
         embedding_model=body.embedding_model or settings.embedding_model,
     )
     db.add(kb)
@@ -107,7 +111,8 @@ def create_knowledge_base(
 def list_knowledge_bases(
     db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
 ) -> list[KnowledgeBaseOut]:
-    return [_kb_out(db, kb) for kb in list_readable_kbs(db, user)]
+    # 管理页只返回可操作的库；聊天端不会再调用此接口来选择知识库。
+    return [_kb_out(db, kb) for kb in list_operable_kbs(db, user)]
 
 
 @router.get("/knowledge-bases/{kb_id}", response_model=KnowledgeBaseDetailOut)
@@ -121,13 +126,23 @@ def get_knowledge_base(
     )
     docs = list(docs)
     topic_rows = db.execute(
-        select(DocumentTopic.doc_id, DocumentTopic.topic_code).where(
+        select(
+            DocumentTopic.doc_id, DocumentTopic.topic_code, DocumentTopic.source,
+            DocumentTopic.confidence, DocumentTopic.review_status,
+        ).where(
             DocumentTopic.doc_id.in_([doc.id for doc in docs])
         )
     ).all() if docs else []
-    topics: dict[str, list[str]] = {doc.id: [] for doc in docs}
-    for doc_id, topic_code in topic_rows:
-        topics.setdefault(doc_id, []).append(topic_code)
+    topics: dict[str, dict[str, list]] = {doc.id: {"approved": [], "suggestions": []} for doc in docs}
+    for doc_id, topic_code, source, confidence, review_status in topic_rows:
+        entry = topics.setdefault(doc_id, {"approved": [], "suggestions": []})
+        if review_status == "approved":
+            entry["approved"].append(topic_code)
+        else:
+            entry["suggestions"].append({
+                "topic_code": topic_code, "source": source,
+                "confidence": confidence, "review_status": review_status,
+            })
     return KnowledgeBaseDetailOut(
         **out.model_dump(),
         documents=[
@@ -135,7 +150,8 @@ def get_knowledge_base(
                 doc_id=d.id, filename=d.filename, file_size=d.file_size,
                 status=d.status, error_message=d.error_message,
                 chunk_count=d.chunk_count, created_at=d.created_at,
-                topics=topics.get(d.id, []),
+                topics=topics.get(d.id, {}).get("approved", []),
+                topic_suggestions=topics.get(d.id, {}).get("suggestions", []),
             )
             for d in docs
         ],

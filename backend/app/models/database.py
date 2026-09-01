@@ -119,6 +119,9 @@ class KnowledgeBase(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)  # kb_ 前缀 UUID
     name: Mapped[str] = mapped_column(String(255), unique=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # access_level 是当前授权主规则：guest / student / editor / admin。
+    # visibility 与 ACL 表仅为历史数据兼容保留，不再参与新的访问判定。
+    access_level: Mapped[str] = mapped_column(String(16), default="guest", index=True)
     visibility: Mapped[str] = mapped_column(String(16), default="public", index=True)
     owner_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(16), default="active", index=True)
@@ -178,7 +181,7 @@ class Document(Base):
 
 
 class DocumentTopic(Base):
-    """文档主题：人工标注优先，用于意图定向检索；未标注文档仍走全局检索。"""
+    """文档主题：AI 初标进入 pending，管理员审核为 approved 后才参与定向检索。"""
 
     __tablename__ = "document_topics"
     __table_args__ = (UniqueConstraint("doc_id", "topic_code", name="uq_document_topics_doc_topic"),)
@@ -188,6 +191,9 @@ class DocumentTopic(Base):
     topic_code: Mapped[str] = mapped_column(String(64), index=True)
     source: Mapped[str] = mapped_column(String(32), default="manual")  # manual / filename_rule / llm_suggested
     confidence: Mapped[float | None] = mapped_column(nullable=True)
+    review_status: Mapped[str] = mapped_column(String(16), default="approved", index=True)  # pending / approved / rejected
+    reviewed_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     document: Mapped[Document] = relationship(back_populates="topics")

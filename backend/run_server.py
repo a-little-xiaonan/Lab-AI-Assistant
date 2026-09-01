@@ -6,13 +6,14 @@
 import uvicorn
 
 from app.config import settings
-from app.main import app
 
 if __name__ == "__main__":
     uvicorn.run(
-        app,
+        # reload 模式必须传导入字符串，不能传已经创建好的 app 对象。
+        "app.main:app",
         host=settings.app_host,
         port=settings.app_port,
-        # 开发时改为 True 可改代码自动重启（需要 uvloop/watchfiles，venv 里已装）
-        reload=False,
+        # 开发环境自动重载：修改 backend/app 下的代码后无需手动重启。
+        reload=True,
+        reload_dirs=["app"],
     )
