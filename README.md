@@ -5,7 +5,7 @@
 - 后端：FastAPI + 通义千问（DashScope qwen-plus / text-embedding-v3）+ ChromaDB + MySQL/SQLite
 - 前端：Vite + Vue 3 + TypeScript + Element Plus（聊天界面）
 - 技术设计文档：`docs/RAG-AI-Assistant-技术设计文档.md`；分阶段开发文档：`docs/development/`
-- 当前进度：**Phase 3 全部完成**（混合检索 / 查询改写 / 重排 / 重新索引 / 长期记忆 / 前端知识库管理界面），Phase 4 生产化按路线图推进
+- 当前进度：**Phase 3 全部完成**；并已完成多用户基础能力：登录认证、角色权限、知识库授权、会话归属与用户级记忆隔离。
 
 ## 快速开始
 
@@ -26,6 +26,9 @@ uv pip install -r requirements.txt
 cd ..
 cp .env.example .env
 #    然后编辑 .env，填入 DASHSCOPE_API_KEY=sk-xxxx
+#    多用户功能还必须设置 JWT_SECRET（至少 32 个字符）：
+#    .venv/bin/python -c "import secrets; print(secrets.token_urlsafe(48))"
+#    把输出粘到 .env：JWT_SECRET=...
 
 # 5. 启动后端（MySQL 需先启动容器；默认端口 8100，因为本机 8000 被 Docker 里的 chromadb 容器占用）
 docker start mysql
@@ -47,6 +50,37 @@ npm run build    # 类型检查 + 生产构建
 ```
 
 功能：知识库选择、会话管理（新建/切换/删除）、SSE 流式打字机输出（可停止）、来源折叠面板、Markdown + 代码高亮。
+
+### 多用户首次使用
+
+1. 启动服务后，在前端点击“登录 / 注册”创建第一个账号。
+2. 在本机终端把该账号提升为管理员：
+
+```bash
+cd backend
+../.venv/bin/python scripts/promote_admin.py <你的用户名>
+```
+
+3. 重新登录后，侧栏会出现“用户与角色”和“知识库管理”。管理员可分配 `student`、`editor`、`admin` 角色，并为知识库授予角色读取、编辑或管理权限。
+
+访客只可访问公开知识库；登录用户的会话和长期记忆按 `user_id` 严格隔离，可在“我的资料与记忆”中查看、编辑或删除自己的长期记忆。
+
+### 复杂问题拆解与主题定向检索
+
+该能力已实现但默认关闭，避免未标注资料时影响现有检索。管理员先在“知识库管理 → 管理文档 → 主题”中为核心资料标注主题；主题词表默认读取 [retrieval_topics.example.json](retrieval_topics.example.json)，若要自定义可复制一份：
+
+```bash
+cp retrieval_topics.example.json data/retrieval_topics.json
+```
+
+确认标注质量后，在 `.env` 打开：
+
+```env
+QUERY_PLANNING_ENABLED=true
+TOPIC_RETRIEVAL_ENABLED=true
+```
+
+重启后，复杂问题会拆分为最多 3 个子问题；每题同时走主题定向与全局混合检索。主题配置、拆分或定向检索失败时，自动回退到原有混合检索链路。
 
 ## 验证
 

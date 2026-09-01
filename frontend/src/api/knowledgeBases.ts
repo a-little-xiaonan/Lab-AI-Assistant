@@ -4,9 +4,12 @@ import type {
   DocumentItem,
   KnowledgeBase,
   KnowledgeBaseDetail,
+  KnowledgeBasePermissions,
   ReindexStatus,
+  RetrievalTopic,
   Stats,
 } from "../types";
+import { apiFetch } from "./client";
 
 async function parseError(resp: Response): Promise<Error> {
   try {
@@ -22,28 +25,56 @@ async function parseError(resp: Response): Promise<Error> {
 }
 
 export async function listKnowledgeBases(): Promise<KnowledgeBase[]> {
-  const resp = await fetch("/api/knowledge-bases");
+  const resp = await apiFetch("/api/knowledge-bases");
   if (!resp.ok) throw await parseError(resp);
   return resp.json();
 }
 
-export async function createKnowledgeBase(name: string, description?: string): Promise<KnowledgeBase> {
-  const resp = await fetch("/api/knowledge-bases", {
+export async function createKnowledgeBase(
+  name: string,
+  description?: string,
+  visibility: "public" | "authenticated" | "restricted" = "public",
+): Promise<KnowledgeBase> {
+  const resp = await apiFetch("/api/knowledge-bases", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, description: description || null }),
+    body: JSON.stringify({ name, description: description || null, visibility }),
   });
   if (!resp.ok) throw await parseError(resp);
   return resp.json();
 }
 
+export async function getKnowledgeBasePermissions(kbId: string): Promise<KnowledgeBasePermissions> {
+  const resp = await apiFetch(`/api/knowledge-bases/${kbId}/permissions`);
+  if (!resp.ok) throw await parseError(resp);
+  return resp.json();
+}
+
+export async function grantKnowledgeBaseRolePermission(
+  kbId: string,
+  roleCode: string,
+  permission: "read" | "write" | "manage",
+): Promise<void> {
+  const resp = await apiFetch(`/api/knowledge-bases/${kbId}/permissions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ role_code: roleCode, permission }),
+  });
+  if (!resp.ok) throw await parseError(resp);
+}
+
+export async function revokeKnowledgeBaseRolePermission(kbId: string, permissionId: number): Promise<void> {
+  const resp = await apiFetch(`/api/knowledge-bases/${kbId}/role-permissions/${permissionId}`, { method: "DELETE" });
+  if (!resp.ok) throw await parseError(resp);
+}
+
 export async function deleteKnowledgeBase(kbId: string): Promise<void> {
-  const resp = await fetch(`/api/knowledge-bases/${kbId}`, { method: "DELETE" });
+  const resp = await apiFetch(`/api/knowledge-bases/${kbId}`, { method: "DELETE" });
   if (!resp.ok) throw await parseError(resp);
 }
 
 export async function getKnowledgeBaseDetail(kbId: string): Promise<KnowledgeBaseDetail> {
-  const resp = await fetch(`/api/knowledge-bases/${kbId}`);
+  const resp = await apiFetch(`/api/knowledge-bases/${kbId}`);
   if (!resp.ok) throw await parseError(resp);
   return resp.json();
 }
@@ -59,7 +90,7 @@ export interface UploadResult {
 export async function uploadDocument(kbId: string, file: File): Promise<UploadResult> {
   const form = new FormData();
   form.append("file", file);
-  const resp = await fetch(`/api/knowledge-bases/${kbId}/documents`, {
+  const resp = await apiFetch(`/api/knowledge-bases/${kbId}/documents`, {
     method: "POST",
     body: form,
   });
@@ -68,14 +99,14 @@ export async function uploadDocument(kbId: string, file: File): Promise<UploadRe
 }
 
 export async function deleteDocument(kbId: string, docId: string): Promise<void> {
-  const resp = await fetch(`/api/knowledge-bases/${kbId}/documents/${docId}`, {
+  const resp = await apiFetch(`/api/knowledge-bases/${kbId}/documents/${docId}`, {
     method: "DELETE",
   });
   if (!resp.ok) throw await parseError(resp);
 }
 
 export async function reindex(kbId: string, docId?: string): Promise<ReindexStatus> {
-  const resp = await fetch(`/api/knowledge-bases/${kbId}/reindex`, {
+  const resp = await apiFetch(`/api/knowledge-bases/${kbId}/reindex`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(docId ? { doc_id: docId } : {}),
@@ -85,20 +116,37 @@ export async function reindex(kbId: string, docId?: string): Promise<ReindexStat
 }
 
 export async function reindexStatus(kbId: string): Promise<ReindexStatus> {
-  const resp = await fetch(`/api/knowledge-bases/${kbId}/reindex/status`);
+  const resp = await apiFetch(`/api/knowledge-bases/${kbId}/reindex/status`);
   if (!resp.ok) throw await parseError(resp);
   return resp.json();
 }
 
 export async function getStats(): Promise<Stats> {
-  const resp = await fetch("/api/stats");
+  const resp = await apiFetch("/api/stats");
   if (!resp.ok) throw await parseError(resp);
   return resp.json();
 }
 
+export async function listRetrievalTopics(): Promise<RetrievalTopic[]> {
+  const resp = await apiFetch("/api/retrieval-topics");
+  if (!resp.ok) throw await parseError(resp);
+  return resp.json();
+}
+
+export async function updateDocumentTopics(kbId: string, docId: string, topicCodes: string[]): Promise<string[]> {
+  const resp = await apiFetch(`/api/knowledge-bases/${kbId}/documents/${docId}/topics`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ topic_codes: topicCodes }),
+  });
+  if (!resp.ok) throw await parseError(resp);
+  const data = await resp.json();
+  return data.topic_codes;
+}
+
 /** 文档 chunk 明细（内容/大小/位置元数据，复用后端 Phase 1 接口） */
 export async function getDocChunks(docId: string, limit = 200): Promise<ChunkList> {
-  const resp = await fetch(`/api/documents/${docId}/chunks?limit=${limit}`);
+  const resp = await apiFetch(`/api/documents/${docId}/chunks?limit=${limit}`);
   if (!resp.ok) throw await parseError(resp);
   return resp.json();
 }

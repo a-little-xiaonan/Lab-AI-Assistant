@@ -99,6 +99,8 @@ def retrieve(
     query_text: str,
     top_k: int | None = None,
     max_tokens: int | None = None,
+    apply_rerank: bool = True,
+    max_queries: int | None = None,
 ) -> list[RetrievedChunk]:
     """混合检索入口（由 retriever.retrieve dispatcher 转发）。
 
@@ -116,6 +118,8 @@ def retrieve(
         except Exception:
             logger.exception("查询改写失败，降级为单查询")
             queries = [query_text]
+    if max_queries is not None:
+        queries = queries[:max(1, max_queries)]
 
     # 向量侧（多查询并发合并）
     vector_list = _merge_query_results(kb_id, queries, vector_top_k)
@@ -163,7 +167,7 @@ def retrieve(
     )
 
     # 重排（Phase 3-02 接入）：RRF 候选 → 精排 → 取 top-n
-    if settings.rerank_enabled:
+    if settings.rerank_enabled and apply_rerank:
         from app.core.reranker import rerank  # 函数内导入：02 前文件不存在
 
         chunks = rerank(query_text, chunks)

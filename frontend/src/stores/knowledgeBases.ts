@@ -50,8 +50,12 @@ export const useKnowledgeBasesStore = defineStore("knowledgeBases", {
       }
     },
 
-    async createKb(name: string, description?: string) {
-      await apiCreateKb(name, description);
+    async createKb(
+      name: string,
+      description?: string,
+      visibility: "public" | "authenticated" | "restricted" = "public",
+    ) {
+      await apiCreateKb(name, description, visibility);
       await this.load();
     },
 

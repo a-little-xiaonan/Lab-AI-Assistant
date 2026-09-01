@@ -180,5 +180,59 @@ class VectorStore:
             coll.delete(ids=ids)
         return len(ids)
 
+    # ----- 用户级长期记忆（Phase 4-02；与旧 kb memory 分离）-----
+
+    def _get_user_memory_collection(self):
+        with self._lock:
+            coll = self._collections.get("user_memories")
+            if coll is None:
+                coll = self._client.get_or_create_collection(
+                    name="user_memories", metadata={"hnsw:space": "cosine"}
+                )
+                self._collections["user_memories"] = coll
+            return coll
+
+    def add_user_memories(self, entries: list[dict]) -> None:
+        """写用户记忆。entries 元数据必须含 user_id；缺失时拒绝写入。"""
+        if not entries:
+            return
+        if any(not e["metadata"].get("user_id") for e in entries):
+            raise ValueError("用户记忆缺少 user_id，拒绝写入")
+        with self._lock:
+            coll = self._get_user_memory_collection()
+            coll.upsert(
+                ids=[e["id"] for e in entries],
+                documents=[e["content"] for e in entries],
+                embeddings=[e["embedding"] for e in entries],
+                metadatas=[e["metadata"] for e in entries],
+            )
+
+    def query_user_memories(
+        self, user_id: str, query_embedding: list[float], top_k: int
+    ) -> list[tuple[str, dict, float]]:
+        """强制 user_id 过滤，业务层不可绕过此方法查询个人记忆。"""
+        coll = self._get_user_memory_collection()
+        if coll.count() == 0:
+            return []
+        res = coll.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k,
+            where={"$and": [{"user_id": {"$eq": user_id}}, {"status": {"$eq": "active"}}]},
+        )
+        return list(zip(res["documents"][0], res["metadatas"][0], res["distances"][0]))
+
+    def delete_user_memory(self, memory_id: str) -> None:
+        with self._lock:
+            self._get_user_memory_collection().delete(ids=[memory_id])
+
+    def delete_user_memories(self, user_id: str) -> int:
+        with self._lock:
+            coll = self._get_user_memory_collection()
+            rows = coll.get(where={"user_id": user_id})
+            ids = rows["ids"]
+            if ids:
+                coll.delete(ids=ids)
+            return len(ids)
+
 
 vector_store = VectorStore()

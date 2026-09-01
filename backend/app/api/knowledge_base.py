@@ -18,14 +18,26 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.api.errors import BadRequestError, ConflictError, NotFoundError
+from app.auth.dependencies import get_optional_current_user, require_roles
+from app.authorization.permissions import list_readable_kbs, require_kb_permission
 from app.config import settings
 from app.core.reindex import reindex_manager
-from app.models.database import ChunkRecord, Document, KnowledgeBase
+from app.models.database import (
+    ChunkRecord,
+    Document,
+    DocumentTopic,
+    KnowledgeBase,
+    KnowledgeBaseRolePermission,
+    KnowledgeBaseUserPermission,
+    Role,
+    User,
+)
 from app.models.schemas import (
     DocumentOut,
     KnowledgeBaseCreate,
     KnowledgeBaseDetailOut,
     KnowledgeBaseOut,
+    KnowledgeBasePermissionGrant,
     ReindexRequest,
     ReindexStatusOut,
 )
@@ -56,6 +68,7 @@ def _kb_out(db: Session, kb: KnowledgeBase) -> KnowledgeBaseOut:
         name=kb.name,
         description=kb.description,
         embedding_model=kb.embedding_model,
+        visibility=kb.visibility,
         document_count=doc_count,
         chunk_count=chunk_count,
         created_at=kb.created_at,
@@ -64,7 +77,9 @@ def _kb_out(db: Session, kb: KnowledgeBase) -> KnowledgeBaseOut:
 
 @router.post("/knowledge-bases", response_model=KnowledgeBaseOut, status_code=201)
 def create_knowledge_base(
-    body: KnowledgeBaseCreate, db: Session = Depends(get_db)
+    body: KnowledgeBaseCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin")),
 ) -> KnowledgeBaseOut:
     if db.scalar(select(KnowledgeBase).where(KnowledgeBase.name == body.name)):
         raise ConflictError("duplicate_name", f"知识库名称已存在：{body.name}")
@@ -78,6 +93,8 @@ def create_knowledge_base(
         id=_new_kb_id(),
         name=body.name,
         description=body.description,
+        visibility=body.visibility,
+        owner_id=user.id,
         embedding_model=body.embedding_model or settings.embedding_model,
     )
     db.add(kb)
@@ -87,19 +104,30 @@ def create_knowledge_base(
 
 
 @router.get("/knowledge-bases", response_model=list[KnowledgeBaseOut])
-def list_knowledge_bases(db: Session = Depends(get_db)) -> list[KnowledgeBaseOut]:
-    return [_kb_out(db, kb) for kb in db.scalars(select(KnowledgeBase).order_by(KnowledgeBase.created_at))]
+def list_knowledge_bases(
+    db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+) -> list[KnowledgeBaseOut]:
+    return [_kb_out(db, kb) for kb in list_readable_kbs(db, user)]
 
 
 @router.get("/knowledge-bases/{kb_id}", response_model=KnowledgeBaseDetailOut)
-def get_knowledge_base(kb_id: str, db: Session = Depends(get_db)) -> KnowledgeBaseDetailOut:
-    kb = db.get(KnowledgeBase, kb_id)
-    if kb is None:
-        raise NotFoundError("knowledge_base_not_found", f"知识库不存在：{kb_id}")
+def get_knowledge_base(
+    kb_id: str, db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+) -> KnowledgeBaseDetailOut:
+    kb = require_kb_permission(db, kb_id, user, "read")
     out = _kb_out(db, kb)
     docs = db.scalars(
         select(Document).where(Document.kb_id == kb_id).order_by(Document.created_at.desc())
     )
+    docs = list(docs)
+    topic_rows = db.execute(
+        select(DocumentTopic.doc_id, DocumentTopic.topic_code).where(
+            DocumentTopic.doc_id.in_([doc.id for doc in docs])
+        )
+    ).all() if docs else []
+    topics: dict[str, list[str]] = {doc.id: [] for doc in docs}
+    for doc_id, topic_code in topic_rows:
+        topics.setdefault(doc_id, []).append(topic_code)
     return KnowledgeBaseDetailOut(
         **out.model_dump(),
         documents=[
@@ -107,6 +135,7 @@ def get_knowledge_base(kb_id: str, db: Session = Depends(get_db)) -> KnowledgeBa
                 doc_id=d.id, filename=d.filename, file_size=d.file_size,
                 status=d.status, error_message=d.error_message,
                 chunk_count=d.chunk_count, created_at=d.created_at,
+                topics=topics.get(d.id, []),
             )
             for d in docs
         ],
@@ -114,15 +143,15 @@ def get_knowledge_base(kb_id: str, db: Session = Depends(get_db)) -> KnowledgeBa
 
 
 @router.delete("/knowledge-bases/{kb_id}")
-def delete_knowledge_base(kb_id: str, db: Session = Depends(get_db)) -> dict:
+def delete_knowledge_base(
+    kb_id: str, db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+) -> dict:
     """删除知识库：①SQLite 记录（事务面）→ ②Chroma collection → ③uploads 目录。
 
     documents.kb_id 无数据库外键（既有表无迁移框架），级联由本层显式执行：
     chunks → documents → knowledge_bases 同一事务删除。
     """
-    kb = db.get(KnowledgeBase, kb_id)
-    if kb is None:
-        raise NotFoundError("knowledge_base_not_found", f"知识库不存在：{kb_id}")
+    kb = require_kb_permission(db, kb_id, user, "manage")
     if kb_id == KB_DEFAULT:
         raise BadRequestError("default_kb_protected", "默认知识库不可删除")
 
@@ -132,6 +161,11 @@ def delete_knowledge_base(kb_id: str, db: Session = Depends(get_db)) -> dict:
     ]
     # ① SQLite：显式级联（chunks → documents → kb 同一事务）
     db.execute(delete(ChunkRecord).where(ChunkRecord.kb_id == kb_id))
+    db.execute(
+        delete(DocumentTopic).where(
+            DocumentTopic.doc_id.in_(select(Document.id).where(Document.kb_id == kb_id))
+        )
+    )
     db.execute(delete(Document).where(Document.kb_id == kb_id))
     db.delete(kb)
     db.commit()
@@ -153,6 +187,119 @@ def delete_knowledge_base(kb_id: str, db: Session = Depends(get_db)) -> dict:
         logger.exception("关键词索引同步失败（kb=%s）", kb_id)
 
     return {"deleted": kb_id}
+
+
+@router.post("/knowledge-bases/{kb_id}/permissions")
+def grant_knowledge_base_permission(
+    kb_id: str,
+    body: KnowledgeBasePermissionGrant,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
+) -> dict:
+    """授予角色或单个用户权限；两者必须且只能提供一个。"""
+    require_kb_permission(db, kb_id, user, "manage")
+    if bool(body.role_code) == bool(body.user_id):
+        raise BadRequestError("invalid_permission_subject", "必须指定角色或用户中的一个")
+    if body.role_code:
+        role = db.scalar(select(Role).where(Role.code == body.role_code))
+        if role is None:
+            raise NotFoundError("role_not_found", "角色不存在")
+        exists = db.scalar(select(KnowledgeBaseRolePermission).where(
+            KnowledgeBaseRolePermission.kb_id == kb_id,
+            KnowledgeBaseRolePermission.role_id == role.id,
+            KnowledgeBaseRolePermission.permission == body.permission,
+        ))
+        if exists is None:
+            db.add(KnowledgeBaseRolePermission(kb_id=kb_id, role_id=role.id, permission=body.permission))
+            db.commit()
+        return {"subject_type": "role", "subject": role.code, "permission": body.permission}
+    target = db.get(User, body.user_id)
+    if target is None:
+        raise NotFoundError("user_not_found", "用户不存在")
+    exists = db.scalar(select(KnowledgeBaseUserPermission).where(
+        KnowledgeBaseUserPermission.kb_id == kb_id,
+        KnowledgeBaseUserPermission.user_id == target.id,
+        KnowledgeBaseUserPermission.permission == body.permission,
+    ))
+    if exists is None:
+        db.add(KnowledgeBaseUserPermission(kb_id=kb_id, user_id=target.id, permission=body.permission))
+        db.commit()
+    return {"subject_type": "user", "subject": target.id, "permission": body.permission}
+
+
+@router.get("/knowledge-bases/{kb_id}/permissions")
+def list_knowledge_base_permissions(
+    kb_id: str,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
+) -> dict:
+    """查看授权清单：仅知识库管理员可见，避免泄露成员信息。"""
+    require_kb_permission(db, kb_id, user, "manage")
+    role_rows = db.execute(
+        select(KnowledgeBaseRolePermission, Role.code, Role.name)
+        .join(Role, Role.id == KnowledgeBaseRolePermission.role_id)
+        .where(KnowledgeBaseRolePermission.kb_id == kb_id)
+        .order_by(Role.code, KnowledgeBaseRolePermission.permission)
+    ).all()
+    user_rows = db.execute(
+        select(KnowledgeBaseUserPermission, User.id, User.username, User.nickname)
+        .join(User, User.id == KnowledgeBaseUserPermission.user_id)
+        .where(KnowledgeBaseUserPermission.kb_id == kb_id)
+        .order_by(User.username, KnowledgeBaseUserPermission.permission)
+    ).all()
+    return {
+        "role_permissions": [
+            {
+                "id": permission.id,
+                "role_code": role_code,
+                "role_name": role_name,
+                "permission": permission.permission,
+            }
+            for permission, role_code, role_name in role_rows
+        ],
+        "user_permissions": [
+            {
+                "id": permission.id,
+                "user_id": user_id,
+                "username": username,
+                "nickname": nickname,
+                "permission": permission.permission,
+            }
+            for permission, user_id, username, nickname in user_rows
+        ],
+    }
+
+
+@router.delete("/knowledge-bases/{kb_id}/role-permissions/{permission_id}")
+def revoke_role_permission(
+    kb_id: str,
+    permission_id: int,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
+) -> dict:
+    require_kb_permission(db, kb_id, user, "manage")
+    row = db.get(KnowledgeBaseRolePermission, permission_id)
+    if row is None or row.kb_id != kb_id:
+        raise NotFoundError("permission_not_found", "角色授权记录不存在")
+    db.delete(row)
+    db.commit()
+    return {"deleted": permission_id}
+
+
+@router.delete("/knowledge-bases/{kb_id}/user-permissions/{permission_id}")
+def revoke_user_permission(
+    kb_id: str,
+    permission_id: int,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
+) -> dict:
+    require_kb_permission(db, kb_id, user, "manage")
+    row = db.get(KnowledgeBaseUserPermission, permission_id)
+    if row is None or row.kb_id != kb_id:
+        raise NotFoundError("permission_not_found", "用户授权记录不存在")
+    db.delete(row)
+    db.commit()
+    return {"deleted": permission_id}
 
 
 # ===== 重新索引（Phase 3-05）=====
@@ -179,13 +326,13 @@ def reindex_knowledge_base(
     background_tasks: BackgroundTasks,
     body: ReindexRequest | None = None,
     db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
 ) -> ReindexStatusOut:
     """重建索引：单文档（body.doc_id）或全库（缺省）。重建期间检索不中断（双 buffer）。
 
     重复触发（同一 kb 任务运行中）→ 409 reindex_in_progress。
     """
-    if db.get(KnowledgeBase, kb_id) is None:
-        raise NotFoundError("knowledge_base_not_found", f"知识库不存在：{kb_id}")
+    require_kb_permission(db, kb_id, user, "write")
     if reindex_manager.is_running(kb_id):
         raise ConflictError("reindex_in_progress", "该知识库正在重建索引，请稍后再试")
     task = reindex_manager.start(kb_id, body.doc_id if body else None)
@@ -194,10 +341,11 @@ def reindex_knowledge_base(
 
 
 @router.get("/knowledge-bases/{kb_id}/reindex/status", response_model=ReindexStatusOut)
-def reindex_status(kb_id: str, db: Session = Depends(get_db)) -> ReindexStatusOut:
+def reindex_status(
+    kb_id: str, db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+) -> ReindexStatusOut:
     """重建进度（无任务 → status=idle）。"""
-    if db.get(KnowledgeBase, kb_id) is None:
-        raise NotFoundError("knowledge_base_not_found", f"知识库不存在：{kb_id}")
+    require_kb_permission(db, kb_id, user, "read")
     task = reindex_manager.get(kb_id)
     if task is None:
         return ReindexStatusOut(kb_id=kb_id, status="idle")

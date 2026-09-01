@@ -22,6 +22,7 @@
               <div class="kb-card-header">
                 <span class="kb-name">{{ kb.name }}</span>
                 <el-tag v-if="kb.id === 'kb_default'" size="small" type="info">默认</el-tag>
+                <el-tag size="small" effect="plain">{{ visibilityLabel(kb.visibility) }}</el-tag>
               </div>
             </template>
             <p class="kb-desc">{{ kb.description || "（无描述）" }}</p>
@@ -30,6 +31,7 @@
             </div>
             <div class="kb-actions">
               <el-button size="small" @click="openDetail(kb.id)">管理文档</el-button>
+              <el-button size="small" @click="openPermissions(kb)">授权</el-button>
               <el-button size="small" type="warning" :loading="reindexingId === kb.id" @click="confirmReindex(kb)">重新索引</el-button>
               <el-button size="small" type="danger" :disabled="kb.id === 'kb_default'" @click="confirmDeleteKb(kb)">删除</el-button>
             </div>
@@ -47,11 +49,46 @@
         <el-form-item label="描述">
           <el-input v-model="createDesc" type="textarea" :rows="2" placeholder="可选" />
         </el-form-item>
+        <el-form-item label="可见范围">
+          <el-select v-model="createVisibility" style="width: 100%">
+            <el-option label="公开：访客可问" value="public" />
+            <el-option label="登录可见" value="authenticated" />
+            <el-option label="受限：仅授权成员" value="restricted" />
+          </el-select>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="showCreate = false">取消</el-button>
         <el-button type="primary" :disabled="!createName.trim()" @click="doCreate">创建</el-button>
       </template>
+    </el-dialog>
+
+    <el-dialog v-model="showPermissions" :title="`${permissionKb?.name ?? ''} · 授权管理`" width="560px">
+      <el-alert type="info" :closable="false" show-icon style="margin-bottom: 14px">
+        角色授权会影响所有具有该角色的用户；“受限”知识库需至少授予读取权限。
+      </el-alert>
+      <div class="permission-add">
+        <el-select v-model="grantRole" style="width: 180px">
+          <el-option label="学生" value="student" />
+          <el-option label="内容编辑" value="editor" />
+          <el-option label="系统管理员" value="admin" />
+        </el-select>
+        <el-select v-model="grantLevel" style="width: 130px">
+          <el-option label="只读" value="read" />
+          <el-option label="可编辑" value="write" />
+          <el-option label="可管理" value="manage" />
+        </el-select>
+        <el-button type="primary" @click="grantRolePermission">添加</el-button>
+      </div>
+      <el-table :data="rolePermissions" size="small" empty-text="暂无角色授权">
+        <el-table-column prop="role_name" label="角色" />
+        <el-table-column prop="permission" label="权限">
+          <template #default="{ row }">{{ permissionLabel(row.permission) }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="80">
+          <template #default="{ row }"><el-button link type="danger" @click="revokeRolePermission(row.id)">撤销</el-button></template>
+        </el-table-column>
+      </el-table>
     </el-dialog>
 
     <!-- 库详情抽屉：文档列表 -->
@@ -60,6 +97,9 @@
       <el-table :data="detailDocs" size="small" style="margin-top: 12px">
         <el-table-column prop="filename" label="文件名" min-width="140" show-overflow-tooltip />
         <el-table-column prop="chunk_count" label="chunks" width="70" />
+        <el-table-column label="主题" min-width="110" show-overflow-tooltip>
+          <template #default="{ row }">{{ topicNames(row.topics).join("、") || "未标注" }}</template>
+        </el-table-column>
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
             <el-tag v-if="row.status === 'ready'" type="success" size="small">ready</el-tag>
@@ -72,6 +112,7 @@
         <el-table-column label="操作" width="160">
           <template #default="{ row }">
             <el-button link size="small" @click="openChunks(row)">查看</el-button>
+            <el-button link size="small" @click="openTopics(row)">主题</el-button>
             <el-button link size="small" :loading="reindexingId === row.doc_id" @click="reindexDoc(row.doc_id)">重建</el-button>
             <el-button link size="small" type="danger" @click="confirmDeleteDoc(row)">删除</el-button>
           </template>
@@ -85,6 +126,22 @@
         style="margin-top: 8px"
       />
     </el-drawer>
+
+    <el-dialog v-model="showTopics" :title="`${topicDocument?.filename ?? ''} · 资料主题`" width="520px">
+      <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
+        主题只用于定向检索加分，未标注文档仍会进入全局检索。
+      </el-alert>
+      <el-checkbox-group v-model="selectedTopicCodes">
+        <div v-for="topic in availableTopics" :key="topic.code" class="topic-option">
+          <el-checkbox :label="topic.code">{{ topic.name }}</el-checkbox>
+          <span>{{ topic.aliases.slice(0, 3).join("、") }}</span>
+        </div>
+      </el-checkbox-group>
+      <template #footer>
+        <el-button @click="showTopics = false">取消</el-button>
+        <el-button type="primary" @click="saveTopics">保存主题</el-button>
+      </template>
+    </el-dialog>
 
     <!-- chunk 明细：大抽屉 + 左导航右详情 -->
     <el-drawer v-model="showChunks" :title="chunksTitle" size="75%">
@@ -140,11 +197,16 @@ import {
   deleteDocument as apiDeleteDocument,
   getDocChunks,
   getKnowledgeBaseDetail,
+  getKnowledgeBasePermissions,
+  grantKnowledgeBaseRolePermission,
   getStats,
+  listRetrievalTopics,
   reindex as apiReindex,
   reindexStatus,
+  revokeKnowledgeBaseRolePermission,
+  updateDocumentTopics,
 } from "../api/knowledgeBases";
-import type { ChunkItem, DocumentItem, KnowledgeBase, Stats } from "../types";
+import type { ChunkItem, DocumentItem, KnowledgeBase, KnowledgeBaseRolePermission, RetrievalTopic, Stats } from "../types";
 
 const kbStore = useKnowledgeBasesStore();
 const stats = ref<Stats>({ document_count: 0, chunk_count: 0, storage_size: 0, knowledge_base_count: 0, vector_dim: 1024, knowledge_bases: [] });
@@ -152,6 +214,13 @@ const stats = ref<Stats>({ document_count: 0, chunk_count: 0, storage_size: 0, k
 const showCreate = ref(false);
 const createName = ref("");
 const createDesc = ref("");
+const createVisibility = ref<"public" | "authenticated" | "restricted">("public");
+
+const showPermissions = ref(false);
+const permissionKb = ref<KnowledgeBase | null>(null);
+const rolePermissions = ref<KnowledgeBaseRolePermission[]>([]);
+const grantRole = ref("student");
+const grantLevel = ref<"read" | "write" | "manage">("read");
 
 const showDetail = ref(false);
 const detailKbId = ref("");
@@ -168,10 +237,43 @@ const chunksTitle = ref("");
 const chunksLoading = ref(false);
 const selectedChunk = ref<ChunkItem | null>(null);
 const selectedDocId = ref("");
+const showTopics = ref(false);
+const topicDocument = ref<DocumentItem | null>(null);
+const availableTopics = ref<RetrievalTopic[]>([]);
+const selectedTopicCodes = ref<string[]>([]);
 
 function formatTime(t: string | undefined | null): string {
   if (!t) return "—";
   return new Date(t).toLocaleString("zh-CN", { hour12: false });
+}
+
+function topicNames(codes: string[] = []): string[] {
+  const names = new Map(availableTopics.value.map((topic) => [topic.code, topic.name]));
+  return codes.map((code) => names.get(code) || code);
+}
+
+async function openTopics(row: DocumentItem) {
+  topicDocument.value = row;
+  selectedTopicCodes.value = [...(row.topics || [])];
+  showTopics.value = true;
+  try {
+    if (!availableTopics.value.length) availableTopics.value = await listRetrievalTopics();
+  } catch (error) {
+    ElMessage.error((error as Error).message);
+  }
+}
+
+async function saveTopics() {
+  if (!topicDocument.value) return;
+  try {
+    const topics = await updateDocumentTopics(detailKbId.value, topicDocument.value.doc_id, selectedTopicCodes.value);
+    topicDocument.value.topics = topics;
+    await refreshDetail();
+    ElMessage.success("文档主题已保存");
+    showTopics.value = false;
+  } catch (error) {
+    ElMessage.error((error as Error).message);
+  }
 }
 
 async function openChunks(row: DocumentItem) {
@@ -199,12 +301,52 @@ async function refreshStats() {
 
 async function doCreate() {
   try {
-    await kbStore.createKb(createName.value.trim(), createDesc.value.trim() || undefined);
+    await kbStore.createKb(createName.value.trim(), createDesc.value.trim() || undefined, createVisibility.value);
     ElMessage.success("知识库已创建");
     showCreate.value = false;
     createName.value = "";
     createDesc.value = "";
+    createVisibility.value = "public";
     await refreshStats();
+  } catch (e) {
+    ElMessage.error((e as Error).message);
+  }
+}
+
+function visibilityLabel(visibility: KnowledgeBase["visibility"]): string {
+  return { public: "公开", authenticated: "登录可见", restricted: "受限" }[visibility];
+}
+
+function permissionLabel(permission: string): string {
+  return { read: "只读", write: "可编辑", manage: "可管理" }[permission] ?? permission;
+}
+
+async function openPermissions(kb: KnowledgeBase) {
+  permissionKb.value = kb;
+  showPermissions.value = true;
+  try {
+    rolePermissions.value = (await getKnowledgeBasePermissions(kb.id)).role_permissions;
+  } catch (e) {
+    ElMessage.error((e as Error).message);
+  }
+}
+
+async function grantRolePermission() {
+  if (!permissionKb.value) return;
+  try {
+    await grantKnowledgeBaseRolePermission(permissionKb.value.id, grantRole.value, grantLevel.value);
+    rolePermissions.value = (await getKnowledgeBasePermissions(permissionKb.value.id)).role_permissions;
+    ElMessage.success("角色权限已添加");
+  } catch (e) {
+    ElMessage.error((e as Error).message);
+  }
+}
+
+async function revokeRolePermission(permissionId: number) {
+  if (!permissionKb.value) return;
+  try {
+    await revokeKnowledgeBaseRolePermission(permissionKb.value.id, permissionId);
+    rolePermissions.value = (await getKnowledgeBasePermissions(permissionKb.value.id)).role_permissions;
   } catch (e) {
     ElMessage.error((e as Error).message);
   }
@@ -240,7 +382,7 @@ async function refreshDetail() {
   if (!detailKbId.value) return;
   try {
     const detail = await getKnowledgeBaseDetail(detailKbId.value);
-    detailKb.value = { id: detail.id, name: detail.name, description: detail.description, embedding_model: detail.embedding_model, document_count: detail.document_count, chunk_count: detail.chunk_count, created_at: detail.created_at };
+    detailKb.value = { id: detail.id, name: detail.name, description: detail.description, embedding_model: detail.embedding_model, visibility: detail.visibility, document_count: detail.document_count, chunk_count: detail.chunk_count, created_at: detail.created_at };
     detailDocs.value = detail.documents;
     detailError.value = "";
   } catch (e) {
@@ -309,7 +451,7 @@ function pollReindex(kbId: string) {
 }
 
 onMounted(async () => {
-  await Promise.all([kbStore.load(), refreshStats()]);
+  await Promise.all([kbStore.load(), refreshStats(), listRetrievalTopics().then((items) => { availableTopics.value = items; })]);
 });
 
 onBeforeUnmount(() => timers.forEach((t) => window.clearInterval(t)));
@@ -362,6 +504,22 @@ onBeforeUnmount(() => timers.forEach((t) => window.clearInterval(t)));
 .kb-actions {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+}
+.permission-add {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.topic-option {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 34px;
+}
+.topic-option span {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
 }
 .chunks-loading {
   text-align: center;

@@ -13,6 +13,67 @@ class ChatRequest(BaseModel):
     stream: bool = False               # Phase 2-01 支持流式，MVP 传 true 返回 400
 
 
+# ----- 认证与用户（Phase 4-02）-----
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    password: str = Field(min_length=8, max_length=128)
+    nickname: str = Field(min_length=1, max_length=64)
+    email: str | None = None
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class UserOut(BaseModel):
+    id: str
+    username: str
+    nickname: str
+    email: str | None = None
+    roles: list[str] = []
+    status: str
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut
+
+
+class UserMemoryOut(BaseModel):
+    id: str
+    memory_type: str
+    content: str
+    confidence: float
+    source_session_id: str | None = None
+    scope_kb_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserMemoryUpdate(BaseModel):
+    content: str = Field(min_length=1, max_length=500)
+
+
+class UserStatusUpdate(BaseModel):
+    status: str = Field(pattern="^(active|disabled)$")
+
+
+class UserRolesUpdate(BaseModel):
+    roles: list[str] = Field(min_length=1)
+
+
+class KnowledgeBasePermissionGrant(BaseModel):
+    permission: str = Field(pattern="^(read|write|manage)$")
+    role_code: str | None = None
+    user_id: str | None = None
+
+
 class SourceOut(BaseModel):
     source_file: str
     page: int | None = None
@@ -64,6 +125,7 @@ class KnowledgeBaseCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     description: str | None = None
     embedding_model: str | None = None  # 不传默认全局模型；与全局不同 → 400（每库模型选择后置）
+    visibility: str = Field(default="public", pattern="^(public|authenticated|restricted)$")
 
 
 class KnowledgeBaseOut(BaseModel):
@@ -71,6 +133,7 @@ class KnowledgeBaseOut(BaseModel):
     name: str
     description: str | None = None
     embedding_model: str
+    visibility: str = "public"
     document_count: int = 0
     chunk_count: int = 0
     created_at: datetime
@@ -84,8 +147,15 @@ class DocumentOut(BaseModel):
     status: str  # processing / ready / failed
     error_message: str | None = None
     chunk_count: int
+    topics: list[str] = []
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
+
+
+class DocumentTopicsUpdate(BaseModel):
+    """管理员手动主题标注；主题 code 必须来自 retrieval_topics 配置。"""
+
+    topic_codes: list[str] = Field(default_factory=list, max_length=8)
 
 
 class KnowledgeBaseDetailOut(KnowledgeBaseOut):

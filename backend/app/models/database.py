@@ -16,6 +16,57 @@ class Base(DeclarativeBase):
     pass
 
 
+class User(Base):
+    """登录用户：密码仅保存 Argon2 hash；角色由 user_roles 多对多维护。"""
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # user_ 前缀 UUID
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    nickname: Mapped[str] = mapped_column(String(64))
+    email: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    roles: Mapped[list["Role"]] = relationship(secondary="user_roles", back_populates="users")
+
+
+class Role(Base):
+    __tablename__ = "roles"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    users: Mapped[list[User]] = relationship(secondary="user_roles", back_populates="roles")
+
+
+class UserRole(Base):
+    __tablename__ = "user_roles"
+    __table_args__ = (UniqueConstraint("user_id", "role_id", name="uq_user_roles_user_role"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    role_id: Mapped[str] = mapped_column(ForeignKey("roles.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class ChatSession(Base):
     """对话会话：MVP 单知识库，knowledge_base_id 固定 kb_default（Phase 2-02 放开）。
 
@@ -27,8 +78,12 @@ class ChatSession(Base):
     __tablename__ = "sessions"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)  # sess_ 前缀 UUID
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    anonymous_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     knowledge_base_id: Mapped[str] = mapped_column(String(64), default="kb_default")
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    name_source: Mapped[str] = mapped_column(String(16), default="ai")  # ai / user / system
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
@@ -64,7 +119,33 @@ class KnowledgeBase(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)  # kb_ 前缀 UUID
     name: Mapped[str] = mapped_column(String(255), unique=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    visibility: Mapped[str] = mapped_column(String(16), default="public", index=True)
+    owner_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
     embedding_model: Mapped[str] = mapped_column(String(64), default="text-embedding-v3")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class KnowledgeBaseRolePermission(Base):
+    __tablename__ = "knowledge_base_role_permissions"
+    __table_args__ = (UniqueConstraint("kb_id", "role_id", "permission", name="uq_kb_role_permission"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kb_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
+    role_id: Mapped[str] = mapped_column(ForeignKey("roles.id"), index=True)
+    permission: Mapped[str] = mapped_column(String(16))  # read / write / manage
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class KnowledgeBaseUserPermission(Base):
+    __tablename__ = "knowledge_base_user_permissions"
+    __table_args__ = (UniqueConstraint("kb_id", "user_id", "permission", name="uq_kb_user_permission"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kb_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    permission: Mapped[str] = mapped_column(String(16))  # read / write / manage
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -91,6 +172,25 @@ class Document(Base):
     chunks: Mapped[list["ChunkRecord"]] = relationship(
         back_populates="document", cascade="all, delete-orphan"
     )
+    topics: Mapped[list["DocumentTopic"]] = relationship(
+        back_populates="document", cascade="all, delete-orphan"
+    )
+
+
+class DocumentTopic(Base):
+    """文档主题：人工标注优先，用于意图定向检索；未标注文档仍走全局检索。"""
+
+    __tablename__ = "document_topics"
+    __table_args__ = (UniqueConstraint("doc_id", "topic_code", name="uq_document_topics_doc_topic"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    doc_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
+    topic_code: Mapped[str] = mapped_column(String(64), index=True)
+    source: Mapped[str] = mapped_column(String(32), default="manual")  # manual / filename_rule / llm_suggested
+    confidence: Mapped[float | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    document: Mapped[Document] = relationship(back_populates="topics")
 
 
 class ChunkRecord(Base):
@@ -118,3 +218,35 @@ class ChunkRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)  # 重索引/重传时更新
 
     document: Mapped[Document] = relationship(back_populates="chunks")
+
+
+class UserMemory(Base):
+    """用户级长期记忆的可管理副本；向量保存在 ChromaDB user_memories 集合。"""
+
+    __tablename__ = "user_memories"
+    __table_args__ = (UniqueConstraint("user_id", "content_hash", name="uq_user_memory_content"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    memory_type: Mapped[str] = mapped_column(String(32))
+    content: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(40), index=True)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    source_session_id: Mapped[str | None] = mapped_column(ForeignKey("sessions.id"), nullable=True)
+    scope_kb_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    resource_type: Mapped[str] = mapped_column(String(64))
+    resource_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    detail_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

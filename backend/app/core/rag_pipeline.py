@@ -66,22 +66,37 @@ def _dedup_sources(chunks: list[retriever.RetrievedChunk]) -> list[dict]:
     return out
 
 
-def _prepare(query: str, kb_id: str, history: str = "") -> tuple[list[retriever.RetrievedChunk], list[dict]]:
+def _prepare(
+    query: str, kb_id: str, history: str = "", user_id: str | None = None
+) -> tuple[list[retriever.RetrievedChunk], list[dict]]:
     """检索 + 场景分支 + 长期记忆召回（answer 与 answer_stream 共享）。
 
     检索为空/全部低于阈值 → no_context 模板（无参考资料段，明确告知未找到）；
     检索失败降级纯 LLM（日志标记）。长期记忆（Phase 3-03）在两种场景都拼入，
     记忆召回失败返回空段，不阻断主链路。
     """
+    answer_outline = ""
     try:
-        chunks = retriever.retrieve(kb_id, query)
+        # 新编排仅在显式开启时接管；默认继续走原 retriever，保证当前稳定链路与测试契约不变。
+        if settings.query_planning_enabled or settings.topic_retrieval_enabled:
+            from app.core.retrieval_orchestrator import retrieve as orchestrated_retrieve
+
+            result = orchestrated_retrieve(kb_id, query, history)
+            chunks = result.chunks
+            answer_outline = result.answer_outline
+        else:
+            chunks = retriever.retrieve(kb_id, query)
     except Exception:
         logger.exception("检索失败，降级为纯 LLM 回答：kb=%s", kb_id)
         chunks = []
-    memories = format_memories(long_term_memory.recall(query, kb_id))
+    memories = format_memories(long_term_memory.recall(query, user_id)) if user_id else ""
     if chunks:
         messages = build_rag_answer_messages(
-            query, retrieved=format_retrieved_chunks(chunks), history=history, memories=memories
+            query,
+            retrieved=format_retrieved_chunks(chunks),
+            history=history,
+            memories=memories,
+            answer_outline=answer_outline,
         )
     else:
         messages = build_no_context_messages(query, history=history, memories=memories)
@@ -209,6 +224,7 @@ def answer(
     query: str,
     kb_id: str = KB_DEFAULT,
     session_id: str | None = None,
+    user_id: str | None = None,
     **flags,
 ) -> dict:
     """返回 {"answer": str, "sources": [{"source_file", "page", "snippet"}]}。
@@ -216,7 +232,7 @@ def answer(
     异常路径：检索失败 → 降级为纯 LLM 回答（日志标记）；LLM 失败 → 抛 LLMError，
     由 API 层转统一错误（不静默返回空）。
     """
-    chunks, messages = _prepare(query, kb_id, history=_get_history_context(session_id))
+    chunks, messages = _prepare(query, kb_id, history=_get_history_context(session_id), user_id=user_id)
     raw_answer = qwen.chat_completion(messages)
     return _finalize(raw_answer, chunks)
 
@@ -225,6 +241,7 @@ def answer_stream(
     query: str,
     kb_id: str = KB_DEFAULT,
     session_id: str | None = None,
+    user_id: str | None = None,
     **flags,
 ) -> Iterator[dict]:
     """流式回答生成器：依次 yield {"type": "delta", "text": 替换后增量}，
@@ -233,7 +250,7 @@ def answer_stream(
 
     LLM 流式失败 → 生成器向上抛 LLMError（由 API 层转 SSE error 帧）。
     """
-    chunks, messages = _prepare(query, kb_id, history=_get_history_context(session_id))
+    chunks, messages = _prepare(query, kb_id, history=_get_history_context(session_id), user_id=user_id)
     proc = CitationStreamProcessor(chunks)
     processed = []
     for delta in qwen.chat_completion_stream(messages):

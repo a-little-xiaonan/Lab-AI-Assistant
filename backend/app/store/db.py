@@ -12,7 +12,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
-from app.models.database import Base, KnowledgeBase
+from app.models.database import Base, KnowledgeBase, Role
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,37 @@ def _seed_default_knowledge_base() -> None:
             )
         )
         db.commit()
+
+
+def _seed_roles() -> None:
+    """幂等写入系统角色；guest 是未登录状态，不入表。"""
+    seed = {
+        "student": ("新生", "已注册用户：访问授权知识库、管理自己的会话与记忆"),
+        "editor": ("内容管理员", "维护被授权知识库的文档与索引"),
+        "admin": ("系统管理员", "管理用户、角色、知识库与授权"),
+    }
+    with SessionLocal() as db:
+        for code, (name, description) in seed.items():
+            if db.scalar(text("SELECT id FROM roles WHERE code=:code"), {"code": code}):
+                continue
+            db.add(Role(id=f"role_{code}", code=code, name=name, description=description))
+        db.commit()
+
+
+def _add_column_if_missing(table: str, column: str, definition: str) -> None:
+    """兼容 MySQL/SQLite 的轻量增量加列。复杂关联表由 create_all 创建。"""
+    from sqlalchemy import inspect as sa_inspect
+
+    insp = sa_inspect(engine)
+    if table not in insp.get_table_names():
+        return
+    columns = {c["name"] for c in insp.get_columns(table)}
+    if column in columns:
+        return
+    with SessionLocal() as db:
+        db.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
+        db.commit()
+    logger.info("迁移完成：%s 表新增 %s 列", table, column)
 
 
 def _migrate_add_session_name() -> None:
@@ -152,12 +183,35 @@ def _migrate_add_deleted_at() -> None:
     logger.info("迁移完成：sessions 表新增 deleted_at 列（逻辑删除）")
 
 
+def _migrate_multi_user_columns() -> None:
+    """Phase 4-02：扩展既有 sessions / knowledge_bases。
+
+    旧表不强加外键，以避免 SQLite/MySQL 已有数据迁移失败；新建表自身有 FK。
+    历史会话 user_id 均为空，默认作为未认领 legacy 数据，不会在认证后暴露给新用户。
+    """
+    _add_column_if_missing("sessions", "user_id", "VARCHAR(64) NULL")
+    _add_column_if_missing("sessions", "anonymous_id", "VARCHAR(64) NULL")
+    _add_column_if_missing("sessions", "summary", "TEXT NULL")
+    _add_column_if_missing("sessions", "name_source", "VARCHAR(16) NOT NULL DEFAULT 'ai'")
+    _add_column_if_missing("knowledge_bases", "visibility", "VARCHAR(16) NOT NULL DEFAULT 'public'")
+    _add_column_if_missing("knowledge_bases", "owner_id", "VARCHAR(64) NULL")
+    _add_column_if_missing("knowledge_bases", "status", "VARCHAR(16) NOT NULL DEFAULT 'active'")
+    _add_column_if_missing("knowledge_bases", "updated_at", "DATETIME NULL")
+    with SessionLocal() as db:
+        db.execute(text("UPDATE knowledge_bases SET visibility='public' WHERE visibility IS NULL OR visibility=''"))
+        db.execute(text("UPDATE knowledge_bases SET status='active' WHERE status IS NULL OR status=''"))
+        db.execute(text("UPDATE knowledge_bases SET updated_at=created_at WHERE updated_at IS NULL"))
+        db.commit()
+
+
 def init_db() -> None:
     _ensure_mysql_database()
     Base.metadata.create_all(engine)
     _migrate_add_session_name()
     _migrate_add_chunk_updated_at()
     _migrate_add_deleted_at()
+    _migrate_multi_user_columns()
+    _seed_roles()
     _seed_default_knowledge_base()
     _migrate_and_cleanup()
 

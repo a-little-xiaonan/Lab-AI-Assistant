@@ -23,3 +23,9 @@ pymysql
 pytest
 jieba==0.42.1          # 混合检索关键词分词（Phase 3-06）
 rank-bm25==0.2.2       # 混合检索 BM25（Phase 3-06）
+
+# 用户认证与数据库迁移（Phase 4-02）
+pwdlib[argon2]
+PyJWT[crypto]
+email-validator
+alembic

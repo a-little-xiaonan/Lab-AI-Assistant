@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8000
 
+    # ----- 认证与权限（Phase 4-02）-----
+    jwt_secret: str = ""  # 必填：至少 32 位随机字符串；不得提交到 Git
+    jwt_access_token_minutes: int = 15
+    jwt_refresh_token_days: int = 7
+    auth_cookie_secure: bool = False  # 本地 HTTP 开发 false；HTTPS 部署必须 true
+    auth_cookie_samesite: str = "lax"
+
     # ----- 存储（相对路径统一锚定项目根目录，与运行目录无关）-----
     chroma_persist_dir: str = "./data/chroma"
     database_url: str = "sqlite:///./data/app.db"
@@ -70,6 +77,16 @@ class Settings(BaseSettings):
     rewrite_enabled: bool = True
     rewrite_query_count: int = 3            # 改写总数上限（含原查询）
     rewrite_model: str = ""                 # 改写用模型；空 → llm_model（可用独立模型验证降级）
+
+    # ----- 复杂问题拆解与意图定向检索（默认关闭，评估后灰度开启）-----
+    query_planning_enabled: bool = False
+    query_plan_max_sub_queries: int = 3
+    query_plan_trigger_topics: int = 2
+    max_retrieval_queries: int = 6
+    topic_retrieval_enabled: bool = False
+    topic_retrieval_top_k: int = 10
+    topic_coverage_per_sub_query: int = 1
+    retrieval_topics_file: str = "./data/retrieval_topics.json"
 
     # ----- 术语归一化（Phase 3-01 补强：规则兜底）-----
     term_aliases_enabled: bool = True       # 口语别名 → 标准术语（喂关键词侧；false 时关键词侧只用原问题）

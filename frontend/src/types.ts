@@ -5,9 +5,30 @@ export interface KnowledgeBase {
   name: string;
   description: string | null;
   embedding_model: string;
+  visibility: "public" | "authenticated" | "restricted";
   document_count: number;
   chunk_count: number;
   created_at: string;
+}
+
+export interface KnowledgeBaseRolePermission {
+  id: number;
+  role_code: string;
+  role_name: string;
+  permission: "read" | "write" | "manage";
+}
+
+export interface KnowledgeBaseUserPermission {
+  id: number;
+  user_id: string;
+  username: string;
+  nickname: string;
+  permission: "read" | "write" | "manage";
+}
+
+export interface KnowledgeBasePermissions {
+  role_permissions: KnowledgeBaseRolePermission[];
+  user_permissions: KnowledgeBaseUserPermission[];
 }
 
 export interface Source {
@@ -48,6 +69,27 @@ export interface ChatPayload {
   stream: boolean;
 }
 
+export interface AuthUser {
+  id: string;
+  username: string;
+  nickname: string;
+  email: string | null;
+  roles: string[];
+  status: string;
+  created_at: string;
+}
+
+export interface UserMemory {
+  id: string;
+  memory_type: string;
+  content: string;
+  confidence: number;
+  source_session_id: string | null;
+  scope_kb_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 // ---- Phase 3-04 知识库管理 ----
 
 export interface DocumentItem {
@@ -57,7 +99,14 @@ export interface DocumentItem {
   status: string; // processing / ready / failed / reindexing
   error_message: string | null;
   chunk_count: number;
+  topics: string[];
   created_at: string;
+}
+
+export interface RetrievalTopic {
+  code: string;
+  name: string;
+  aliases: string[];
 }
 
 export interface KnowledgeBaseDetail extends KnowledgeBase {

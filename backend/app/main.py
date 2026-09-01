@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 logging.getLogger().setLevel(logging.INFO)
 
-from app.api import chat, documents, health, knowledge_base, memory, stats
+from app.api import admin, auth, chat, documents, health, knowledge_base, memory, stats
 from app.api.errors import ApiError
 from app.config import ensure_data_dirs, settings
 from app.core.session_cleanup import cleanup_expired_sessions
@@ -59,7 +59,7 @@ def create_app() -> FastAPI:
     )
 
     # 路由统一 /api 前缀
-    for router in (health.router, stats.router, documents.router, chat.router,
+    for router in (health.router, stats.router, auth.router, admin.router, documents.router, chat.router,
                    knowledge_base.router, memory.router):
         app.include_router(router, prefix="/api")
 

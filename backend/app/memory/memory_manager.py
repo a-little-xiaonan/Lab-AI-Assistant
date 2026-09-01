@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.memory.short_term import ShortTermMemory
-from app.models.database import Message
+from app.models.database import ChatSession, Message
 from app.store.db import SessionLocal
 
 logger = logging.getLogger(__name__)
@@ -65,20 +65,40 @@ class MemoryManager:
         """从 messages 表重建窗口（会话重启不丢）；自建会话，不依赖调用方。"""
         db = SessionLocal()
         try:
+            session = db.get(ChatSession, session_id)
             rows = db.scalars(
                 select(Message)
                 .where(Message.session_id == session_id)
                 .order_by(Message.id)  # id 递增即时间序
             ).all()
             pairs = [(m.role, m.content) for m in rows]
+            persisted_summary = session.summary if session is not None else None
         finally:
             db.close()
         # 剔除末尾无回应的 user（当前轮或错误孤儿，均不该进上文）
         while pairs and pairs[-1][0] == "user":
             pairs.pop()
         mem = ShortTermMemory(session_id, max_turns=settings.history_max_turns)
-        mem._rebuild(pairs)
+        if persisted_summary:
+            # 摘要已持久化时只恢复窗口消息，不再为旧历史重复调用 LLM。
+            mem.summary = persisted_summary
+            mem.messages = pairs[-settings.history_max_turns * 2 :]
+        else:
+            mem._rebuild(pairs)
         return mem
+
+    def persist_summary(self, session_id: str, summary: str | None) -> None:
+        """摘要只在压缩后写库；服务重启可直接恢复。"""
+        if not summary:
+            return
+        db = SessionLocal()
+        try:
+            session = db.get(ChatSession, session_id)
+            if session is not None and session.summary != summary:
+                session.summary = summary
+                db.commit()
+        finally:
+            db.close()
 
 
 memory_manager = MemoryManager()  # 模块级单例

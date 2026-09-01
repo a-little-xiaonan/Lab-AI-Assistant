@@ -16,7 +16,6 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 
 from app.config import settings
-from app.memory.long_term import long_term_memory
 from app.models.database import ChatSession
 from app.store.db import SessionLocal
 
@@ -51,7 +50,7 @@ def cleanup_expired_sessions() -> int:
             )
         ).all()
         for s in purged:
-            long_term_memory.clear_session(s.id, s.knowledge_base_id)
+            # 用户长期记忆不随会话物理清理而删除：它归用户所有，可在“我的记忆”中单独管理。
             db.delete(s)
         db.commit()
         if purged:

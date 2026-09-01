@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.main import app
-from app.models.database import Base
+from app.models.database import Base, KnowledgeBase
 from app.store.db import get_db
 
 TEST_ENGINE = create_engine(
@@ -68,6 +68,22 @@ def _fake_long_term_memory(monkeypatch):
 def client(monkeypatch):
     """TestClient：内存库会话、跳过真实数据库初始化与过期会话清理。"""
     Base.metadata.create_all(TEST_ENGINE)
+    # 生产启动会幂等创建默认公共知识库；测试跳过 init_db 时也保持这一前提。
+    db = TestSessionLocal()
+    try:
+        if db.get(KnowledgeBase, "kb_default") is None:
+            db.add(
+                KnowledgeBase(
+                    id="kb_default",
+                    name="默认知识库",
+                    description="测试默认知识库",
+                    visibility="public",
+                    status="active",
+                )
+            )
+            db.commit()
+    finally:
+        db.close()
     monkeypatch.setattr("app.main.init_db", lambda: None)  # 不连真实 MySQL
     monkeypatch.setattr("app.main.cleanup_expired_sessions", lambda: 0)  # 清理不碰真实库
     app.dependency_overrides[get_db] = _override_get_db

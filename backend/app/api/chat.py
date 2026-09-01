@@ -23,18 +23,22 @@ import threading
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.errors import ApiError, BadRequestError, NotFoundError
+from app.auth.dependencies import get_optional_current_user
+from app.authorization.permissions import require_kb_permission
+from app.authorization.session_access import require_session_owner
 from app.core.rag_pipeline import answer, answer_stream
+from app.config import settings
 from app.llm import qwen
 from app.llm.errors import LLMError
 from app.llm.prompt_templates import build_session_name_messages
 from app.memory.long_term import long_term_memory
 from app.memory.memory_manager import memory_manager
-from app.models.database import ChatSession, Message, utcnow
+from app.models.database import ChatSession, Message, User, utcnow
 from app.models.schemas import (
     ChatRequest,
     SessionBatchDelete,
@@ -48,37 +52,63 @@ from app.store.db import SessionLocal, get_db
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["chat"])
+ANONYMOUS_COOKIE = "rag_anonymous_id"
 
 
 def _new_session_id() -> str:
     return f"sess_{uuid4().hex[:12]}"
 
 
-def _get_or_create_session(db: Session, session_id: str | None, kb_id: str) -> ChatSession:
+def _session_matches(session: ChatSession, user: User | None, anonymous_id: str) -> bool:
+    if user is not None:
+        return session.user_id == user.id
+    return session.user_id is None and session.anonymous_id == anonymous_id
+
+
+def _get_or_create_session(
+    db: Session,
+    session_id: str | None,
+    kb_id: str,
+    user: User | None,
+    anonymous_id: str,
+) -> ChatSession:
+    """带 session_id 只允许访问本人会话；不传才创建新会话。
+
+    这替代了单用户时期“未知 id 自动创建、已删 id 自动复活”的行为，避免 ID 猜测越权。
+    """
     if session_id:
-        session = db.scalar(
-            select(ChatSession).where(
-                ChatSession.id == session_id, ChatSession.deleted_at.is_(None)
-            )
-        )
-        if session is not None:
+        session = db.get(ChatSession, session_id)
+        if session is not None and session.deleted_at is None and _session_matches(session, user, anonymous_id):
             return session
-        # 已逻辑删除的会话 id 传入 → 复活（误删可恢复，记忆/消息都还在）
-        deleted = db.get(ChatSession, session_id)
-        if deleted is not None:
-            deleted.deleted_at = None
-            db.commit()
-            db.refresh(deleted)
-            logger.info("复活已删除会话：%s", session_id)
-            return deleted
-        # 未知 session_id：自动创建（记录在案的一致行为）
-        session = ChatSession(id=session_id, knowledge_base_id=kb_id)
-    else:
-        session = ChatSession(id=_new_session_id(), knowledge_base_id=kb_id)
+        raise NotFoundError("session_not_found", "会话不存在")
+    session = ChatSession(
+        id=_new_session_id(),
+        knowledge_base_id=kb_id,
+        user_id=user.id if user else None,
+        anonymous_id=None if user else anonymous_id,
+        name_source="ai",
+    )
     db.add(session)
     db.commit()
     db.refresh(session)
     return session
+
+
+def _get_anonymous_id(request: Request) -> tuple[str, bool]:
+    existing = request.cookies.get(ANONYMOUS_COOKIE)
+    return (existing, False) if existing else (f"anon_{uuid4().hex[:16]}", True)
+
+
+def _set_anonymous_cookie(response: Response, anonymous_id: str) -> None:
+    response.set_cookie(
+        ANONYMOUS_COOKIE,
+        anonymous_id,
+        max_age=7 * 24 * 3600,
+        httponly=True,
+        secure=settings.auth_cookie_secure,
+        samesite=settings.auth_cookie_samesite,
+        path="/api",
+    )
 
 
 def format_sse_event(event: str, data: dict) -> str:
@@ -87,7 +117,11 @@ def format_sse_event(event: str, data: dict) -> str:
 
 
 async def _sse_stream(
-    req: ChatRequest, request: Request, db: Session, session: ChatSession
+    req: ChatRequest,
+    request: Request,
+    db: Session,
+    session: ChatSession,
+    user_id: str | None = None,
 ) -> None:
     """SSE 生成器：meta → delta* → done（或 error，替代 done 后正常关闭）。
 
@@ -100,7 +134,9 @@ async def _sse_stream(
     db.commit()
     yield format_sse_event("meta", {"session_id": session.id})
 
-    sync_iter = answer_stream(req.message, req.knowledge_base_id, session_id=session.id)
+    sync_iter = answer_stream(
+        req.message, req.knowledge_base_id, session_id=session.id, user_id=user_id
+    )
     try:
         while True:
             if await request.is_disconnected():
@@ -117,7 +153,7 @@ async def _sse_stream(
                     )
                 )
                 db.commit()
-                _remember_turn(session.id, req.knowledge_base_id, req.message, item["full_text"])
+                _remember_turn(session.id, req.knowledge_base_id, req.message, item["full_text"], user_id)
                 yield format_sse_event(
                     "done",
                     {"full_text": item["full_text"], "sources": item["sources"]},
@@ -138,16 +174,18 @@ async def _sse_stream(
 
 
 def _remember_turn(
-    session_id: str, kb_id: str, user_content: str, assistant_content: str
+    session_id: str, kb_id: str, user_content: str, assistant_content: str, user_id: str | None
 ) -> None:
     """回合收尾：短期记忆窗口更新 + 长期记忆后台提取（都失败不影响主链路）。"""
     try:
         mem = memory_manager.get(session_id)
         mem.add_message("user", user_content)
         mem.add_message("assistant", assistant_content)
+        memory_manager.persist_summary(session_id, mem.summary)
     except Exception:
         logger.exception("短期记忆更新失败：session=%s", session_id)
-    _schedule_memory_extract(session_id, kb_id, user_content, assistant_content)
+    if user_id is not None:  # 访客不建立永久个人画像
+        _schedule_memory_extract(user_id, session_id, kb_id, user_content, assistant_content)
     _schedule_auto_name(session_id)  # 首轮后为未命名会话生成标题
 
 
@@ -161,13 +199,13 @@ def _schedule_background(fn) -> None:
 
 
 def _schedule_memory_extract(
-    session_id: str, kb_id: str, user_content: str, assistant_content: str
+    user_id: str, session_id: str, kb_id: str, user_content: str, assistant_content: str
 ) -> None:
     """长期记忆提取放后台线程（Fire-and-forget：每轮多一次 LLM 调用，不阻塞回答）。"""
 
     def _run() -> None:
         long_term_memory.extract_and_store(
-            session_id, kb_id, [("user", user_content), ("assistant", assistant_content)]
+            user_id, session_id, kb_id, [("user", user_content), ("assistant", assistant_content)]
         )
 
     _schedule_background(_run)
@@ -182,7 +220,7 @@ def _auto_name_session(session_id: str) -> None:
         db = SessionLocal()
         try:
             session = db.get(ChatSession, session_id)
-            if session is None or session.name:
+            if session is None or session.name or session.name_source == "user":
                 return
             first = db.scalar(
                 select(Message)
@@ -197,6 +235,7 @@ def _auto_name_session(session_id: str) -> None:
             if not title:
                 return
             session.name = title
+            session.name_source = "ai"
             db.commit()
             logger.info("AI 生成会话标题：%s → %s", session_id, title)
         finally:
@@ -214,21 +253,27 @@ async def chat(
     req: ChatRequest,
     request: Request,
     db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
 ) -> Response:
     if not req.message.strip():
         raise BadRequestError("empty_message", "消息不能为空")
 
-    session = _get_or_create_session(db, req.session_id, req.knowledge_base_id)
+    require_kb_permission(db, req.knowledge_base_id, user, "read")
+    anonymous_id, set_anonymous = _get_anonymous_id(request)
+    session = _get_or_create_session(db, req.session_id, req.knowledge_base_id, user, anonymous_id)
 
     if req.stream:
-        return StreamingResponse(
-            _sse_stream(req, request, db, session),
+        stream_response = StreamingResponse(
+            _sse_stream(req, request, db, session, user.id if user else None),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+        if set_anonymous and user is None:
+            _set_anonymous_cookie(stream_response, anonymous_id)
+        return stream_response
 
     # 非流式（Phase 1 行为不变，历史由 pipeline 从短期记忆取）
-    result = answer(req.message, req.knowledge_base_id, session_id=session.id)
+    result = answer(req.message, req.knowledge_base_id, session_id=session.id, user_id=user.id if user else None)
 
     # 消息落库（user + assistant 成对）+ 记忆窗口更新
     db.add_all(
@@ -238,81 +283,130 @@ async def chat(
         ]
     )
     db.commit()
-    _remember_turn(session.id, req.knowledge_base_id, req.message, result["answer"])
-    return {"answer": result["answer"], "sources": result["sources"]}
+    _remember_turn(session.id, req.knowledge_base_id, req.message, result["answer"], user.id if user else None)
+    response = JSONResponse({"answer": result["answer"], "sources": result["sources"]})
+    if set_anonymous and user is None:
+        _set_anonymous_cookie(response, anonymous_id)
+    return response
 
 
 @router.post("/chat/sessions", response_model=SessionOut)
-def create_session(body: SessionCreate | None = None, db: Session = Depends(get_db)) -> SessionOut:
-    session = ChatSession(
-        id=_new_session_id(),
-        knowledge_base_id=body.knowledge_base_id if body else "kb_default",
-        name=body.name if body else None,
-    )
-    db.add(session)
-    db.commit()
-    db.refresh(session)
+def create_session(
+    request: Request,
+    response: Response,
+    body: SessionCreate | None = None,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
+) -> SessionOut:
+    kb_id = body.knowledge_base_id if body else "kb_default"
+    require_kb_permission(db, kb_id, user, "read")
+    anonymous_id, set_anonymous = _get_anonymous_id(request)
+    session = _get_or_create_session(db, None, kb_id, user, anonymous_id)
+    if body and body.name:
+        session.name = body.name.strip()
+        session.name_source = "user"
+        db.commit()
+        db.refresh(session)
+    if set_anonymous and user is None:
+        _set_anonymous_cookie(response, anonymous_id)
     return session
 
 
 @router.put("/chat/sessions/{session_id}", response_model=SessionOut)
 def rename_session(
-    session_id: str, body: SessionRename, db: Session = Depends(get_db)
+    session_id: str,
+    body: SessionRename,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
 ) -> SessionOut:
     """用户改名（用户优先：AI 命名只在 name 为空时生成，不覆盖用户设置）。"""
-    session = db.get(ChatSession, session_id)
+    anonymous_id, _ = _get_anonymous_id(request)
+    session = require_session_owner(db, session_id, user, include_deleted=False) if user else db.scalar(
+        select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id.is_(None), ChatSession.anonymous_id == anonymous_id, ChatSession.deleted_at.is_(None))
+    )
     if session is None:
-        raise NotFoundError("session_not_found", f"会话不存在：{session_id}")
+        raise NotFoundError("session_not_found", "会话不存在")
     session.name = body.name.strip()
+    session.name_source = "user"
     db.commit()
     db.refresh(session)
     return session
 
 
 @router.get("/chat/sessions", response_model=list[SessionOut])
-def list_sessions(db: Session = Depends(get_db)) -> list[ChatSession]:
+def list_sessions(
+    request: Request, db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+) -> list[ChatSession]:
+    anonymous_id, _ = _get_anonymous_id(request)
+    owner_filter = ChatSession.user_id == user.id if user else (
+        ChatSession.user_id.is_(None) & (ChatSession.anonymous_id == anonymous_id)
+    )
     return list(
         db.scalars(
             select(ChatSession)
-            .where(ChatSession.deleted_at.is_(None))
+            .where(ChatSession.deleted_at.is_(None), owner_filter)
             .order_by(ChatSession.updated_at.desc())
         )
     )
 
 
 @router.get("/chat/sessions/{session_id}", response_model=SessionDetailOut)
-def get_session(session_id: str, db: Session = Depends(get_db)) -> ChatSession:
-    session = db.scalar(
-        select(ChatSession).where(
-            ChatSession.id == session_id, ChatSession.deleted_at.is_(None)
-        )
-    )
+def get_session(
+    session_id: str, request: Request, db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+) -> ChatSession:
+    anonymous_id, _ = _get_anonymous_id(request)
+    if user:
+        return require_session_owner(db, session_id, user)
+    session = db.scalar(select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id.is_(None), ChatSession.anonymous_id == anonymous_id, ChatSession.deleted_at.is_(None)))
     if session is None:
-        raise NotFoundError("session_not_found", f"会话不存在：{session_id}")
+        raise NotFoundError("session_not_found", "会话不存在")
     return session
 
 
 @router.delete("/chat/sessions/{session_id}")
-def delete_session(session_id: str, db: Session = Depends(get_db)) -> dict:
+def delete_session(
+    session_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
+) -> dict:
     """逻辑删除（软删）：标记 deleted_at，数据与记忆保留，可恢复（见 restore）。"""
-    session = db.scalar(
+    anonymous_id, _ = _get_anonymous_id(request)
+    session = require_session_owner(db, session_id, user) if user else db.scalar(
         select(ChatSession).where(
-            ChatSession.id == session_id, ChatSession.deleted_at.is_(None)
+            ChatSession.id == session_id,
+            ChatSession.user_id.is_(None),
+            ChatSession.anonymous_id == anonymous_id,
+            ChatSession.deleted_at.is_(None),
         )
     )
     if session is None:
-        raise NotFoundError("session_not_found", f"会话不存在：{session_id}")
+        raise NotFoundError("session_not_found", "会话不存在")
     session.deleted_at = utcnow()
     db.commit()
     return {"deleted": session_id}
 
 
 @router.put("/chat/sessions/{session_id}/restore")
-def restore_session(session_id: str, db: Session = Depends(get_db)) -> SessionOut:
+def restore_session(
+    session_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
+) -> SessionOut:
     """恢复已逻辑删除的会话（消息与长期记忆都保留）。"""
-    session = db.get(ChatSession, session_id)
+    anonymous_id, _ = _get_anonymous_id(request)
+    if user:
+        session = require_session_owner(db, session_id, user, include_deleted=True)
+    else:
+        session = db.scalar(select(ChatSession).where(
+            ChatSession.id == session_id,
+            ChatSession.user_id.is_(None),
+            ChatSession.anonymous_id == anonymous_id,
+        ))
     if session is None:
-        raise NotFoundError("session_not_found", f"会话不存在：{session_id}")
+        raise NotFoundError("session_not_found", "会话不存在")
     session.deleted_at = None
     db.commit()
     db.refresh(session)
@@ -321,12 +415,19 @@ def restore_session(session_id: str, db: Session = Depends(get_db)) -> SessionOu
 
 @router.delete("/chat/sessions")
 def batch_delete_sessions(
-    body: SessionBatchDelete, db: Session = Depends(get_db)
+    body: SessionBatchDelete,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
 ) -> dict:
     """批量逻辑删除（session_ids 指定；缺省或 all=true → 全部活跃会话）。"""
+    anonymous_id, _ = _get_anonymous_id(request)
+    owner_filter = ChatSession.user_id == user.id if user else (
+        ChatSession.user_id.is_(None) & (ChatSession.anonymous_id == anonymous_id)
+    )
     if body.all or not body.session_ids:
         targets = list(
-            db.scalars(select(ChatSession).where(ChatSession.deleted_at.is_(None)))
+            db.scalars(select(ChatSession).where(ChatSession.deleted_at.is_(None), owner_filter))
         )
     else:
         targets = [
@@ -334,7 +435,7 @@ def batch_delete_sessions(
             for t in (
                 db.scalar(
                     select(ChatSession).where(
-                        ChatSession.id == sid, ChatSession.deleted_at.is_(None)
+                        ChatSession.id == sid, ChatSession.deleted_at.is_(None), owner_filter
                     )
                 )
                 for sid in body.session_ids

@@ -1,5 +1,6 @@
 // 聊天 API：流式用 fetch + ReadableStream 解析 SSE（不用 EventSource——需要自定义 header 与中止）
 import type { ChatPayload, SSEEvent } from "../types";
+import { apiFetch } from "./client";
 
 async function parseError(resp: Response): Promise<Error> {
   try {
@@ -16,7 +17,7 @@ async function parseError(resp: Response): Promise<Error> {
 
 /** 非流式问答 */
 export async function chatOnce(payload: ChatPayload) {
-  const resp = await fetch("/api/chat", {
+  const resp = await apiFetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ...payload, stream: false }),
@@ -43,7 +44,7 @@ export async function* chatStream(
   payload: ChatPayload,
   signal?: AbortSignal,
 ): AsyncGenerator<SSEEvent> {
-  const resp = await fetch("/api/chat", {
+  const resp = await apiFetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ...payload, stream: true }),

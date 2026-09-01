@@ -6,8 +6,11 @@
         <el-button type="primary" size="small" style="width: 100%" @click="store.createSession()">
           ＋ 新建会话
         </el-button>
-        <el-button size="small" style="width: 100%; margin: 8px 0 0" @click="$router.push('/knowledge-bases')">
+        <el-button v-if="auth.user?.roles.some((r) => r === 'editor' || r === 'admin')" size="small" style="width: 100%; margin: 8px 0 0" @click="$router.push('/knowledge-bases')">
           📚 知识库管理
+        </el-button>
+        <el-button v-if="auth.isAdmin" size="small" style="width: 100%; margin: 8px 0 0" @click="$router.push('/admin/users')">
+          👥 用户与角色
         </el-button>
         <el-button
           size="small"
@@ -81,6 +84,13 @@
             :value="kb.id"
           />
         </el-select>
+        <div class="user-actions">
+          <template v-if="auth.user">
+            <el-button link @click="$router.push('/profile')">{{ auth.user.nickname }}</el-button>
+            <el-button link type="danger" @click="signOut">退出</el-button>
+          </template>
+          <el-button v-else link type="primary" @click="$router.push('/login')">登录 / 注册</el-button>
+        </div>
       </el-header>
 
       <el-main class="main">
@@ -122,10 +132,12 @@ import MessageInput from "../components/MessageInput.vue";
 import { renameSession as apiRenameSession } from "../api/sessions";
 import { useSessionStore } from "../stores/session";
 import { useKnowledgeBasesStore } from "../stores/knowledgeBases";
+import { useAuthStore } from "../stores/auth";
 import type { SessionItem } from "../types";
 
 const store = useSessionStore();
 const kbStore = useKnowledgeBasesStore();
+const auth = useAuthStore();
 const scrollbarRef = ref();
 const showAllSessions = ref(false);
 
@@ -228,6 +240,17 @@ async function confirmDelete(session: { id: string }) {
   }
 }
 
+async function signOut() {
+  try {
+    await auth.logout();
+    await store.loadSessions();
+    await kbStore.load();
+    ElMessage.success("已退出登录");
+  } catch (err) {
+    ElMessage.error((err as Error).message);
+  }
+}
+
 onMounted(async () => {
   try {
     await store.init();
@@ -319,6 +342,7 @@ watch(
   justify-content: space-between;
   border-bottom: 1px solid var(--el-border-color-light);
 }
+.user-actions { display: flex; align-items: center; gap: 8px; }
 .main {
   display: flex;
   flex-direction: column;

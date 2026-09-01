@@ -19,11 +19,13 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.api.errors import BadRequestError, ConflictError, NotFoundError
+from app.auth.dependencies import get_optional_current_user
+from app.authorization.permissions import require_kb_permission
 from app.config import settings
 from app.core.document_processing import process_document
 from app.core.retriever import estimate_tokens
-from app.models.database import ChunkRecord, Document, KnowledgeBase
-from app.models.schemas import DocumentOut, UploadDocumentOut
+from app.models.database import ChunkRecord, Document, DocumentTopic, KnowledgeBase, User
+from app.models.schemas import DocumentOut, DocumentTopicsUpdate, UploadDocumentOut
 from app.store.db import get_db
 from app.store.vector_store import vector_store
 
@@ -32,6 +34,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["documents"])
 
 KB_DEFAULT = "kb_default"
+
+
+def _topic_map(db: Session, doc_ids: list[str]) -> dict[str, list[str]]:
+    if not doc_ids:
+        return {}
+    rows = db.execute(
+        select(DocumentTopic.doc_id, DocumentTopic.topic_code).where(DocumentTopic.doc_id.in_(doc_ids))
+    ).all()
+    out: dict[str, list[str]] = {doc_id: [] for doc_id in doc_ids}
+    for doc_id, topic_code in rows:
+        out.setdefault(doc_id, []).append(topic_code)
+    return out
 
 
 def _new_doc_id() -> str:
@@ -65,6 +79,7 @@ def _persist_upload(
         logger.info("清理 failed 旧记录后重传：%s（doc_id=%s）", existing.filename, existing.id)
         Path(existing.file_path).unlink(missing_ok=True)
         db.execute(delete(ChunkRecord).where(ChunkRecord.doc_id == existing.id))
+        db.execute(delete(DocumentTopic).where(DocumentTopic.doc_id == existing.id))
         vector_store.delete_document(kb_id, existing.id)
         db.delete(existing)
         db.commit()
@@ -108,12 +123,13 @@ async def upload_document_to_kb(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
 ) -> UploadDocumentOut:
     """上传文档到指定知识库：立即返回 202 + processing，处理后台异步执行。
 
     重建索引进行中禁止上传（swap 会丢弃重建期间写入 live 的新文档，Phase 3-05 互斥）。
     """
-    _require_kb(db, kb_id)
+    require_kb_permission(db, kb_id, user, "write")
     from app.core.reindex import reindex_manager
 
     if reindex_manager.is_running(kb_id):
@@ -128,14 +144,18 @@ async def upload_document_to_kb(
 
 
 @router.get("/knowledge-bases/{kb_id}/documents", response_model=list[DocumentOut])
-def list_kb_documents(kb_id: str, db: Session = Depends(get_db)) -> list[DocumentOut]:
+def list_kb_documents(
+    kb_id: str, db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+) -> list[DocumentOut]:
     """知识库文档列表（含处理状态，前端轮询用）。"""
-    _require_kb(db, kb_id)
+    require_kb_permission(db, kb_id, user, "read")
     docs = db.scalars(
         select(Document)
         .where(Document.kb_id == kb_id)
         .order_by(Document.created_at.desc())
     )
+    docs = list(docs)
+    topics = _topic_map(db, [doc.id for doc in docs])
     return [
         DocumentOut(
             doc_id=d.id,
@@ -144,21 +164,71 @@ def list_kb_documents(kb_id: str, db: Session = Depends(get_db)) -> list[Documen
             status=d.status,
             error_message=d.error_message,
             chunk_count=d.chunk_count,
+            topics=topics.get(d.id, []),
             created_at=d.created_at,
         )
         for d in docs
     ]
 
 
+@router.get("/retrieval-topics")
+def list_retrieval_topics() -> list[dict]:
+    """主题配置：管理端用于标注文档；配置异常时返回空列表而非接口失败。"""
+    from app.core.retrieval_topics import retrieval_topics
+
+    return retrieval_topics.all()
+
+
+@router.get("/knowledge-bases/{kb_id}/documents/{doc_id}/topics")
+def get_document_topics(
+    kb_id: str,
+    doc_id: str,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
+) -> dict:
+    require_kb_permission(db, kb_id, user, "read")
+    doc = db.get(Document, doc_id)
+    if doc is None or doc.kb_id != kb_id:
+        raise NotFoundError("document_not_found", f"文档不存在：{doc_id}")
+    return {"doc_id": doc_id, "topic_codes": _topic_map(db, [doc_id]).get(doc_id, [])}
+
+
+@router.put("/knowledge-bases/{kb_id}/documents/{doc_id}/topics")
+def update_document_topics(
+    kb_id: str,
+    doc_id: str,
+    body: DocumentTopicsUpdate,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
+) -> dict:
+    """人工主题标注：替换式写入；不写 Chroma metadata，检索按 SQL doc_id 过滤。"""
+    require_kb_permission(db, kb_id, user, "write")
+    doc = db.get(Document, doc_id)
+    if doc is None or doc.kb_id != kb_id:
+        raise NotFoundError("document_not_found", f"文档不存在：{doc_id}")
+    from app.core.retrieval_topics import retrieval_topics
+
+    valid = retrieval_topics.valid_codes(body.topic_codes)
+    if set(valid) != set(body.topic_codes):
+        raise BadRequestError("invalid_topic_code", "存在无效主题，请刷新主题配置后重试")
+    db.execute(delete(DocumentTopic).where(DocumentTopic.doc_id == doc_id))
+    db.add_all(DocumentTopic(doc_id=doc_id, topic_code=code, source="manual") for code in valid)
+    db.commit()
+    return {"doc_id": doc_id, "topic_codes": valid}
+
+
 @router.delete("/knowledge-bases/{kb_id}/documents/{doc_id}")
-def delete_kb_document(kb_id: str, doc_id: str, db: Session = Depends(get_db)) -> dict:
+def delete_kb_document(
+    kb_id: str, doc_id: str, db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+) -> dict:
     """删除文档：向量 + chunk 记录 + 登记 + 原文件。"""
-    _require_kb(db, kb_id)
+    require_kb_permission(db, kb_id, user, "write")
     doc = db.get(Document, doc_id)
     if doc is None or doc.kb_id != kb_id:
         raise NotFoundError("document_not_found", f"文档不存在：{doc_id}")
 
     db.execute(delete(ChunkRecord).where(ChunkRecord.doc_id == doc_id))
+    db.execute(delete(DocumentTopic).where(DocumentTopic.doc_id == doc_id))
     vector_store.delete_document(kb_id, doc_id)
     Path(doc.file_path).unlink(missing_ok=True)
     db.delete(doc)
@@ -181,17 +251,20 @@ async def upload_document_deprecated(
     file: UploadFile = File(...),
     knowledge_base_id: str = KB_DEFAULT,
     db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
 ) -> UploadDocumentOut:
     """[deprecated] 等价 POST /api/knowledge-bases/{kb}/documents（Phase 2 起处理后台化）。"""
-    return await upload_document_to_kb(knowledge_base_id, background_tasks, file, db)
+    return await upload_document_to_kb(knowledge_base_id, background_tasks, file, db, user)
 
 
 @router.get("/documents", response_model=list[DocumentOut])
 def list_documents_deprecated(
-    knowledge_base_id: str = KB_DEFAULT, db: Session = Depends(get_db)
+    knowledge_base_id: str = KB_DEFAULT,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
 ) -> list[DocumentOut]:
     """[deprecated] 等价 GET /api/knowledge-bases/{kb}/documents。"""
-    return list_kb_documents(knowledge_base_id, db)
+    return list_kb_documents(knowledge_base_id, db, user)
 
 
 @router.get("/documents/{doc_id}/chunks")
@@ -200,11 +273,13 @@ def list_chunks(
     offset: int = 0,
     limit: int = 50,
     db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_current_user),
 ) -> dict:
     """查看某文档的分块明细：内容、大小（字符数/token 估算）、位置元数据。"""
     doc = db.get(Document, doc_id)
     if doc is None:
         raise NotFoundError("document_not_found", f"文档不存在：{doc_id}")
+    require_kb_permission(db, doc.kb_id, user, "read")
     total = db.scalar(
         select(func.count(ChunkRecord.id)).where(ChunkRecord.doc_id == doc_id)
     ) or 0

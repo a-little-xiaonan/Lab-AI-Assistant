@@ -60,13 +60,16 @@ def retrieve(
     top_k: int | None = None,
     threshold: float | None = None,
     max_tokens: int | None = None,
+    apply_rerank: bool = True,
+    max_queries: int | None = None,
 ) -> list[RetrievedChunk]:
     if settings.hybrid_retrieval_enabled:
         # 函数内懒导入：避免 retriever → hybrid_retriever → retriever 循环依赖
         from app.core.hybrid_retriever import retrieve as hybrid_retrieve
 
         return hybrid_retrieve(
-            kb_id, query_text, top_k=top_k, max_tokens=max_tokens
+            kb_id, query_text, top_k=top_k, max_tokens=max_tokens,
+            apply_rerank=apply_rerank, max_queries=max_queries,
         )
 
     # ===== Phase 2 路径（hybrid 关闭时逐字节保留）=====
