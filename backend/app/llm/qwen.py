@@ -17,7 +17,7 @@ from app.llm.errors import LLMError
 logger = logging.getLogger(__name__)
 
 EMBEDDING_DIM = 1024                      # text-embedding-v3 固定维度
-EMBEDDING_BATCH_SIZE = 16                 # 每批条数（DashScope 批量上限）
+EMBEDDING_BATCH_SIZE = 10                 # 每批条数（DashScope text-embedding-v3 上限）
 EMBEDDING_BATCH_INTERVAL = 0.2            # 批间间隔，限制 QPS
 MAX_RETRIES = 3                           # 429/5xx/网络异常重试次数
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
@@ -166,7 +166,7 @@ def embed_texts(
     model: str | None = None,
     on_batch: callable = None,
 ) -> list[list[float]]:
-    """批量向量化，16 条/批；断言 1024 维，防静默写脏数据。
+    """批量向量化，10 条/批；断言 1024 维，防静默写脏数据。
     on_batch(done, total) 每批完成后回调，供进度日志/前端使用。"""
     key = _api_key()
     model = model or settings.embedding_model

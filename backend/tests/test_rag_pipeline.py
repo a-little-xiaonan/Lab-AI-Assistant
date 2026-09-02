@@ -27,14 +27,12 @@ def _fake_chunks():
 
 @patch("app.core.rag_pipeline.retriever.retrieve", return_value=_fake_chunks())
 @patch("app.core.rag_pipeline.qwen.chat_completion", return_value="qwen-plus 按 token 计费。")
-def test_answer_returns_sources_and_citations(mock_chat, mock_retrieve):
+def test_answer_returns_internal_sources_without_visible_citations(mock_chat, mock_retrieve):
     result = rag_pipeline.answer("qwen-plus 怎么收费？", "kb_default")
 
-    # 无 [n] 引用 → 回退检索结果：末尾「参考来源」汇总段 + 同源去重
-    assert "参考来源：" in result["answer"]
-    assert "- 手册.pdf P3：" in result["answer"]
-    assert result["answer"].count("- 手册.pdf P3") == 1  # 同 (file, page) 只出现一次
-    assert "- faq.md：" in result["answer"]
+    # 来源仅作为接口内部数据保留，回答正文不展示文件名或来源汇总。
+    assert "参考来源：" not in result["answer"]
+    assert "[来源:" not in result["answer"]
     assert result["sources"][0]["source_file"] == "手册.pdf"
     assert result["sources"][0]["page"] == 3
     assert len(result["sources"]) == 2
@@ -116,14 +114,14 @@ def test_no_session_id_means_no_history():
     return_value=iter(["你", "好", "！"]),
 )
 def test_answer_stream_emits_delta_and_done(mock_stream, mock_retrieve):
-    """answer_stream：delta*（含末尾汇总块）→ done，done.full_text 与已产出文本逐字一致。"""
+    """answer_stream：delta* → done，done.full_text 与已产出文本逐字一致。"""
     items = list(rag_pipeline.answer_stream("qwen-plus 怎么收费？", "kb_default"))
     types = [i["type"] for i in items]
-    assert types == ["delta", "delta", "delta", "delta", "done"]  # 3 内容 + 1 汇总块 + done
+    assert types == ["delta", "delta", "delta", "done"]
     full = "".join(i["text"] for i in items if i["type"] == "delta")
     done = items[-1]
     assert done["full_text"] == full  # 前端契约：done 与所见文本一致
-    assert "参考来源：" in done["full_text"]
+    assert "参考来源：" not in done["full_text"]
     assert done["sources"][0]["source_file"] == "手册.pdf"
     assert done["sources"][0]["page"] == 3
     assert len(done["sources"]) == 2  # 同 (file,page) 去重

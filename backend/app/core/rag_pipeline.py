@@ -1,4 +1,4 @@
-"""RAG 主流程编排：检索 → 拼装 → 生成 → 引用规范化。
+"""RAG 主流程编排：检索 → 拼装 → 生成 → 输出净化。
 
 answer()/answer_stream() 签名保持稳定：query / kb_id / session_id / **flags，
 是后续 Query Rewrite（Phase 3-01）、Re-rank（3-02）、混合检索（3-06）、
@@ -7,12 +7,8 @@ answer()/answer_stream() 签名保持稳定：query / kb_id / session_id / **fla
 对话历史（Phase 2-03 起）由短期记忆产出：session_id 非空时从 memory_manager
 取窗口（含摘要压缩），替代 Phase 1 的 history 透传参数（已退役）。
 
-引用规范化（Phase 2-04）：
-- 正文 [n] 标记 → [来源: 文件名 P页码]（越界 n 剔除 + 日志）
-- 模型直写 [来源: X] 幻觉校验：X 必须存在于检索结果（非流式路径严格剔除）
-- 末尾「参考来源：」汇总段（同源合并、snippet ≤50 字；无引用回退检索列表）
-- 流式路径 [n] 边流边替换（CitationStreamProcessor），直写幻觉无法追溯剔除，
-  以日志 + done 帧 sources 权威兜底（与前端契约"以 done 帧 sources 为准"一致）
+访客回答不展示引用编号、来源文件名或「参考来源」汇总；检索来源仍通过
+sources 字段保留给后端调试使用，避免泄露内部资料名称。
 """
 from __future__ import annotations
 
@@ -161,94 +157,34 @@ def _prepare(
     return chunks, messages
 
 
-def _build_reference_section(
-    body: str, chunks: list[retriever.RetrievedChunk]
-) -> tuple[str, list[dict]]:
-    """汇总段 + sources（步骤 3-4）：正文有效引用（file,page）去重同源合并；
-    无任何引用时回退检索结果去重列表（保住"始终有引用"的行为）。
-    返回 (标注后全文, sources)。"""
-    cited = set()
-    for m in re.finditer(r"\[来源:\s*([^\]]+?)(?:\s+P(\d+))?\]", body):
-        cited.add((m.group(1), int(m.group(2)) if m.group(2) else None))
-
-    if cited:
-        sources = []
-        seen = set()
-        for fname, page in cited:
-            if (fname, page) in seen:
-                continue
-            seen.add((fname, page))
-            snippet = next(
-                (
-                    c.text[:SNIPPET_MAX]
-                    for c in chunks
-                    if c.source_file == fname and c.page == page
-                ),
-                "",
-            )
-            sources.append({"source_file": fname, "page": page, "snippet": snippet})
-    else:
-        sources = _dedup_sources(chunks)
-
-    if sources:
-        entries = []
-        for s in sources:
-            loc = f" P{s['page']}" if s["page"] is not None else ""
-            entries.append(f"- {s['source_file']}{loc}：{s['snippet']}")
-        body += "\n\n参考来源：\n" + "\n".join(entries)
-    return body, sources
+def _strip_citations(body: str, *, trim: bool = True) -> str:
+    """移除模型偶发输出的引用标记，避免把内部资料名称展示给访客。"""
+    body = re.sub(r"\[(?:\d+|来源:\s*[^\]]+)\]", "", body)
+    body = re.sub(r"（来源：[^）]+）", "", body)
+    body = re.sub(r"[ \t]+\n", "\n", body)
+    return body.strip() if trim else body
 
 
 def _normalize_citations(
     raw_answer: str, chunks: list[retriever.RetrievedChunk]
 ) -> tuple[str, list[dict]]:
-    """非流式引用规范化（全量后处理，可严格校验）：
-    ① [n] → [来源: ...]（越界剔除）② 直写 [来源: X] 幻觉校验 ③ 汇总段 + sources。
-    """
-    if not chunks:
-        return raw_answer, []
-    by_index = {i + 1: c for i, c in enumerate(chunks)}
-    valid_files = {c.source_file for c in chunks}
-
-    def _replace_index(m: re.Match) -> str:
-        c = by_index.get(int(m.group(1)))
-        if c is None:
-            logger.warning("回答引用越界 [%s]，剔除", m.group(1))
-            return ""
-        loc = f" P{c.page}" if c.page is not None else ""
-        return f"[来源: {c.source_file}{loc}]"
-
-    body = re.sub(r"\[(\d+)\]", _replace_index, raw_answer)
-
-    def _validate_direct(m: re.Match) -> str:
-        name = m.group(1)
-        if name in valid_files:
-            return m.group(0)
-        logger.warning("回答引用不存在的来源 %s，剔除（幻觉防护）", name)
-        return ""
-
-    body = re.sub(r"\[来源:\s*([^\]]+)\]", _validate_direct, body)
-    return _build_reference_section(body, chunks)
+    """非流式输出净化：保留内部 sources，移除访客可见的引用文本。"""
+    return _strip_citations(raw_answer), _dedup_sources(chunks) if chunks else []
 
 
 class CitationStreamProcessor:
-    """流式 [n] 替换器：保留尾部可能被跨块截断的 [n]，安全前缀即时替换。
-
-    直写 [来源: X] 的幻觉校验在流路径无法追溯剔除（已下发），仅日志记录，
-    权威性以 done 帧 sources 为准（文档 04 记录此不对称）。
-    """
+    """流式输出净化器：跨分片去除 [1]、[来源: 文件] 等引用标记。"""
 
     def __init__(self, chunks: list[retriever.RetrievedChunk]) -> None:
-        self._by_index = {i + 1: c for i, c in enumerate(chunks)}
         self._tail = ""
-        self._pattern = re.compile(r"\[(\d+)\]")
+        self._pattern = re.compile(r"\[(?:\d+|来源:\s*[^\]]+)\]")
 
     def feed(self, delta: str) -> str:
-        """处理一段增量：返回可下发的替换后文本（尾部未闭合 [n] 保留到下块）。"""
+        """处理一段增量：尾部未闭合的引用标记保留到下个分片。"""
         self._tail += delta
         open_bracket = self._tail.rfind("[")
-        if open_bracket != -1 and len(self._tail) - open_bracket <= 6:
-            boundary = open_bracket  # 可能是未完成的 [n]
+        if open_bracket != -1 and len(self._tail) - open_bracket <= 160:
+            boundary = open_bracket
         else:
             boundary = len(self._tail)
         safe, self._tail = self._tail[:boundary], self._tail[boundary:]
@@ -260,15 +196,7 @@ class CitationStreamProcessor:
         return out
 
     def _replace(self, text: str) -> str:
-        def _sub(m: re.Match) -> str:
-            c = self._by_index.get(int(m.group(1)))
-            if c is None:
-                logger.warning("流式回答引用越界 [%s]，剔除", m.group(1))
-                return ""
-            loc = f" P{c.page}" if c.page is not None else ""
-            return f"[来源: {c.source_file}{loc}]"
-
-        return self._pattern.sub(_sub, text)
+        return _strip_citations(self._pattern.sub("", text), trim=False)
 
 
 def _finalize(
@@ -302,9 +230,7 @@ def answer_stream(
     user_id: str | None = None,
     **flags,
 ) -> Iterator[dict]:
-    """流式回答生成器：依次 yield {"type": "delta", "text": 替换后增量}，
-    生成结束后 yield 汇总段（最后一个 delta），最后 yield {"type": "done",
-    "full_text", "sources"}。done.full_text 与已产出的 delta 拼接逐字一致。
+    """流式回答生成器：依次 yield 净化后的 delta，最后 yield done。
 
     LLM 流式失败 → 生成器向上抛 LLMError（由 API 层转 SSE error 帧）。
     """
@@ -321,9 +247,6 @@ def answer_stream(
         processed.append(tail)
         yield {"type": "delta", "text": tail}
 
-    # 汇总段 + sources（[n] 已流式替换，这里只做步骤 3-4）
-    body, sources = _build_reference_section("".join(processed), chunks)
-    citation_block = body[len("".join(processed)):]
-    if citation_block:
-        yield {"type": "delta", "text": citation_block}
+    body = _strip_citations("".join(processed))
+    sources = _dedup_sources(chunks) if chunks else []
     yield {"type": "done", "full_text": body, "sources": sources}

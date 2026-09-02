@@ -5,16 +5,6 @@
       <div v-else class="md-body" v-html="rendered" />
       <div v-if="message.streaming" class="cursor">▋</div>
       <div v-if="message.error" class="msg-error">{{ message.error }}</div>
-      <el-collapse v-if="message.sources.length" class="sources">
-        <el-collapse-item :title="`参考来源（${message.sources.length}）`">
-          <div v-for="(s, i) in message.sources" :key="i" class="source-item">
-            <div class="source-name">
-              📄 {{ s.source_file }}<span v-if="s.page != null"> P{{ s.page }}</span>
-            </div>
-            <div class="source-snippet">{{ s.snippet }}</div>
-          </div>
-        </el-collapse-item>
-      </el-collapse>
     </div>
   </div>
 </template>
@@ -86,22 +76,6 @@ const rendered = computed(() =>
   color: var(--el-color-danger);
   font-size: 13px;
   margin-top: 6px;
-}
-.sources {
-  margin-top: 8px;
-  border: none;
-}
-.source-item {
-  padding: 4px 0;
-}
-.source-name {
-  font-weight: 600;
-  font-size: 13px;
-}
-.source-snippet {
-  color: var(--el-text-color-secondary);
-  font-size: 12px;
-  margin-top: 2px;
 }
 :deep(.md-body pre) {
   background: #f6f8fa;
