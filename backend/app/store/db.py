@@ -6,14 +6,28 @@ MySQL 不自动建库，启动时连 server 层执行 CREATE DATABASE IF NOT EXI
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
 from app.auth.password import hash_password
-from app.models.database import Base, KnowledgeBase, Role, User, UserRole
+from app.models.database import (
+    Base,
+    ChunkRecord,
+    Document,
+    DocumentVersion,
+    KnowledgeBase,
+    Role,
+    SuggestedQuestion,
+    User,
+    UserRole,
+    utcnow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +43,61 @@ else:
     engine = create_engine(settings.database_url_resolved, pool_pre_ping=True)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+def _upgrade_schema() -> None:
+    """执行版本化迁移；连接由当前 engine 提供，避免配置层重复解析敏感 URL。"""
+    config_path = Path(__file__).resolve().parents[2] / "alembic.ini"
+    if not config_path.exists():
+        raise RuntimeError(f"缺少 Alembic 配置：{config_path}")
+    cfg = Config(str(config_path))
+    with engine.begin() as connection:
+        cfg.attributes["connection"] = connection
+        command.upgrade(cfg, "head")
+
+
+def _backfill_document_governance() -> None:
+    """幂等补齐历史文档版本与治理字段，保证升级后现有知识库继续可用。"""
+    with SessionLocal() as db:
+        kb_levels = {
+            kb.id: kb.access_level
+            for kb in db.scalars(select(KnowledgeBase))
+        }
+        for doc in db.scalars(select(Document)).all():
+            version_id = doc.current_version_id or f"ver_{doc.id}_1"
+            version = db.get(DocumentVersion, version_id)
+            if version is None:
+                version = DocumentVersion(
+                    id=version_id,
+                    document_id=doc.id,
+                    version_no=doc.current_version or 1,
+                    file_path=doc.file_path,
+                    file_hash=doc.file_hash,
+                    file_size=doc.file_size,
+                    processing_status=doc.status,
+                    chunk_count=doc.chunk_count,
+                    created_by=doc.uploader_id,
+                    created_at=doc.created_at,
+                )
+                db.add(version)
+            doc.current_version = doc.current_version or 1
+            doc.current_version_id = version_id
+            doc.sensitivity_level = doc.sensitivity_level or kb_levels.get(doc.kb_id, "guest")
+            doc.updated_at = doc.updated_at or doc.created_at or utcnow()
+            if doc.status == "ready" and settings.legacy_documents_auto_published:
+                doc.governance_status = "published"
+                doc.published_version_id = doc.published_version_id or version_id
+                version.review_status = "published"
+                version.processing_status = "ready"
+                doc.legacy_unreviewed = True
+                doc.review_comment = doc.review_comment or "历史数据迁移，待复核"
+            elif doc.status != "ready" and doc.governance_status == "published":
+                doc.governance_status = "draft"
+            db.query(ChunkRecord).filter(
+                ChunkRecord.doc_id == doc.id,
+                ChunkRecord.document_version_id.is_(None),
+            ).update({ChunkRecord.document_version_id: version_id}, synchronize_session=False)
+        db.commit()
 
 
 def _ensure_mysql_database() -> None:
@@ -88,6 +157,31 @@ def _seed_roles() -> None:
             if db.scalar(text("SELECT id FROM roles WHERE code=:code"), {"code": code}):
                 continue
             db.add(Role(id=f"role_{code}", code=code, name=name, description=description))
+        db.commit()
+
+
+def _seed_suggested_questions() -> None:
+    """幂等写入首屏招新问题；均为人工固定问题，不由 LLM 临时生成。"""
+    seed = {
+        "实验室介绍": ["实验室主要做什么？", "实验室有哪些研究方向？", "实验室平时在哪里活动？"],
+        "招新对象与要求": ["大一新生可以加入吗？", "加入实验室需要哪些基础？", "零基础可以报名吗？"],
+        "报名与考核流程": ["怎么报名加入实验室？", "招新考核包含哪些内容？", "招新一般在什么时候进行？"],
+        "日常学习与培养": ["加入后会学习哪些技术？", "实验室平时如何培养新生？", "每周需要投入多少时间？"],
+        "项目与竞赛": ["实验室做过哪些项目？", "可以参加哪些竞赛？", "新生什么时候能参与项目？"],
+        "指导教师": ["实验室的指导老师是谁？", "老师会怎样指导学生？", "实验室有哪些教学成果？"],
+        "毕业与就业方向": ["实验室成员毕业后有哪些去向？", "实验室经历对就业有什么帮助？", "实验室支持考研吗？"],
+    }
+    with SessionLocal() as db:
+        if db.scalar(select(SuggestedQuestion.id).limit(1)):
+            return
+        order = 0
+        for category, questions in seed.items():
+            for question in questions:
+                order += 1
+                db.add(SuggestedQuestion(
+                    id=f"sq_seed_{order:03d}", category=category, question=question,
+                    required_level="guest", sort_order=order, source_type="manual",
+                ))
         db.commit()
 
 
@@ -259,16 +353,20 @@ def _migrate_document_topic_review() -> None:
 
 def init_db() -> None:
     _ensure_mysql_database()
+    # 兼容既有无迁移数据库：先补建缺失表，再由 Alembic 负责已有表的增量结构。
     Base.metadata.create_all(engine)
+    _upgrade_schema()
     _migrate_add_session_name()
     _migrate_add_chunk_updated_at()
     _migrate_add_deleted_at()
     _migrate_multi_user_columns()
     _migrate_document_topic_review()
     _seed_roles()
+    _seed_suggested_questions()
     _seed_initial_admin()
     _seed_default_knowledge_base()
     _migrate_and_cleanup()
+    _backfill_document_governance()
 
 
 def get_db():

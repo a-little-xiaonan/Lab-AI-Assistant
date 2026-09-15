@@ -13,10 +13,10 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.config import settings
-from app.models.database import ChatSession
+from app.models.database import AnswerFeedback, ChatSession
 from app.store.db import SessionLocal
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,8 @@ def cleanup_expired_sessions() -> int:
             )
         ).all()
         for s in purged:
+            # 物理删除会话时同步清除回答反馈，避免反馈外键阻止消息级联删除。
+            db.execute(delete(AnswerFeedback).where(AnswerFeedback.session_id == s.id))
             # 用户长期记忆不随会话物理清理而删除：它归用户所有，可在“我的记忆”中单独管理。
             db.delete(s)
         db.commit()

@@ -29,3 +29,7 @@ pwdlib[argon2]
 PyJWT[crypto]
 email-validator
 alembic
+
+# 持久后台任务（M4）
+redis
+rq

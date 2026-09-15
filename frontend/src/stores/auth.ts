@@ -7,6 +7,16 @@ export const useAuthStore = defineStore("auth", {
   getters: {
     loggedIn: (state) => !!state.user,
     isAdmin: (state) => !!state.user?.roles.includes("admin"),
+    isContentManager: (state) => !!state.user?.roles.some(
+      (role) => role === "editor" || role === "admin",
+    ),
+    roleLabel: (state) => {
+      const roles = state.user?.roles ?? [];
+      if (roles.includes("admin")) return "管理员";
+      if (roles.includes("editor")) return "实验室成员";
+      if (roles.includes("student")) return "普通学生";
+      return "访客";
+    },
   },
   actions: {
     async init() {

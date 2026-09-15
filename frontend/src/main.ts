@@ -12,9 +12,12 @@ app.use(pinia).use(router).use(ElementPlus);
 router.beforeEach(async (to) => {
   const auth = useAuthStore(pinia);
   await auth.init();
-  if (to.name === "profile" && !auth.user) return "/login";
-  if (to.name === "knowledge-bases" && !auth.user?.roles.some((r) => r === "editor" || r === "admin")) return "/chat";
-  if (to.name === "admin-users" && !auth.isAdmin) return "/chat";
+  const access = String(to.meta.access ?? "public");
+  if (access !== "public" && !auth.loggedIn) {
+    return { path: "/login", query: { redirect: to.fullPath } };
+  }
+  if (access === "content" && !auth.isContentManager) return "/chat";
+  if (access === "admin" && !auth.isAdmin) return "/chat";
   return true;
 });
 // 先静默恢复登录态；失败时仍以访客身份正常使用公开知识库。

@@ -73,6 +73,17 @@ DOCUMENT_TOPIC_SYSTEM = """你是实验室资料主题标注助手。根据文�
 2. confidence 取 0-1；
 3. 这只是推荐，最终需要管理员审核。"""
 
+EVIDENCE_JUDGE_SYSTEM = """你是严格的知识库证据核验器。判断参考片段是否明确包含回答用户问题所需的事实。
+
+判定规则：
+1. 主题相关但没有给出问题所问的具体事实，必须判为不可回答；
+2. 不得依靠常识、猜测或对用户问题中的信息进行复述；
+3. 只列出真正能支持答案的片段编号；
+4. 只输出 JSON 对象，不要 Markdown、不要解释，格式严格如下：
+{"answerable": true, "supporting_indexes": [1]}
+不可回答时输出：
+{"answerable": false, "supporting_indexes": []}"""
+
 
 def format_retrieved_chunks(chunks: list[Chunk]) -> str:
     """参考资料段：带 [n] 编号与来源标注，模型可在回答中用 [n] 引用。"""
@@ -185,6 +196,20 @@ def build_document_topic_messages(text: str, topics: list[dict]) -> list[dict]:
     return [
         {"role": "system", "content": DOCUMENT_TOPIC_SYSTEM},
         {"role": "user", "content": f"可选主题：\n{topic_lines}\n\n文档内容：\n{text[:6000]}"},
+    ]
+
+
+def build_evidence_judge_messages(query: str, snippets: list[str]) -> list[dict]:
+    """证据灰区核验：仅让模型判断片段能否回答，不让它生成答案。"""
+    materials = "\n\n".join(
+        f"[{index}] {text[:1600]}" for index, text in enumerate(snippets, 1)
+    )
+    return [
+        {"role": "system", "content": EVIDENCE_JUDGE_SYSTEM},
+        {
+            "role": "user",
+            "content": f"用户问题：{query}\n\n待核验片段：\n{materials}",
+        },
     ]
 
 

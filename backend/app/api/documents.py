@@ -19,19 +19,26 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.api.errors import BadRequestError, ConflictError, NotFoundError
-from app.auth.dependencies import get_optional_current_user, require_roles
-from app.authorization.permissions import require_kb_permission
+from app.auth.dependencies import require_roles
+from app.authorization.permissions import enforce_action, require_kb_permission
 from app.config import settings
 from app.core.document_processing import process_document
 from app.core.retriever import estimate_tokens
-from app.models.database import ChunkRecord, Document, DocumentTopic, KnowledgeBase, User, utcnow
-from app.models.schemas import DocumentOut, DocumentTopicsUpdate, TopicSuggestionOut, UploadDocumentOut
+from app.models.database import (
+    ChunkRecord, Document, DocumentTopic, DocumentVersion, KnowledgeBase, User, utcnow,
+)
+from app.models.schemas import (
+    DocumentGovernanceUpdate, DocumentOut, DocumentTopicsUpdate, TopicSuggestionOut,
+    UploadDocumentOut,
+)
 from app.store.db import get_db
 from app.store.vector_store import vector_store
+from app.services.job_queue import enqueue_job
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["documents"])
+require_content_manager = require_roles("editor", "admin")
 
 KB_DEFAULT = "kb_default"
 
@@ -67,8 +74,27 @@ def _new_doc_id() -> str:
     return f"doc_{uuid4().hex[:12]}"
 
 
+def _document_out(db: Session, doc: Document, topic_data: dict | None = None) -> DocumentOut:
+    topic_data = topic_data or {"approved": [], "suggestions": []}
+    version = db.get(DocumentVersion, doc.current_version_id) if doc.current_version_id else None
+    return DocumentOut(
+        doc_id=doc.id, filename=doc.filename, file_size=doc.file_size,
+        status=doc.status, error_message=doc.error_message, chunk_count=doc.chunk_count,
+        governance_status=doc.governance_status, sensitivity_level=doc.sensitivity_level,
+        current_version=doc.current_version, current_version_id=doc.current_version_id,
+        published_version_id=doc.published_version_id,
+        version_review_status=version.review_status if version else None,
+        lock_version=doc.lock_version, review_comment=doc.review_comment,
+        published_at=doc.published_at, topics=topic_data.get("approved", []),
+        content_owner=doc.content_owner, source_name=doc.source_name,
+        effective_at=doc.effective_at, expires_at=doc.expires_at,
+        last_reviewed_at=doc.last_reviewed_at,
+        topic_suggestions=topic_data.get("suggestions", []), created_at=doc.created_at,
+    )
+
+
 def _persist_upload(
-    db: Session, content: bytes, filename: str, kb_id: str
+    db: Session, content: bytes, filename: str, kb_id: str, user: User
 ) -> Document:
     """公共上传步骤：校验大小 → 同名去重（failed 旧记录清理重传）→ 存盘 → 登记。
 
@@ -107,6 +133,7 @@ def _persist_upload(
             logger.exception("关键词索引同步失败（doc=%s）", existing.id)
 
     doc_id = _new_doc_id()
+    version_id = f"ver_{uuid4().hex[:20]}"
     save_dir = settings.uploads_dir / kb_id
     save_dir.mkdir(parents=True, exist_ok=True)
     save_path = save_dir / f"{doc_id}_{Path(filename).name}"
@@ -118,11 +145,54 @@ def _persist_upload(
         file_hash=hashlib.sha256(content).hexdigest()[:16],
         file_size=len(content),
         file_path=str(save_path),
+        governance_status="draft",
+        sensitivity_level=db.get(KnowledgeBase, kb_id).access_level,
+        uploader_id=user.id,
+        current_version=1,
+        current_version_id=version_id,
+        content_owner=user.nickname or user.username,
+        source_name=filename,
     )
-    db.add(doc)
+    version = DocumentVersion(
+        id=version_id, document_id=doc_id, version_no=1,
+        file_path=str(save_path), file_hash=doc.file_hash, file_size=len(content),
+        created_by=user.id,
+    )
+    db.add_all([doc, version])
+    from app.services.audit import record_in_transaction
+    record_in_transaction(db, user, "document.upload", "document", doc_id,
+                          detail={"kb_id": kb_id, "filename": filename, "version": 1})
     db.commit()
     db.refresh(doc)
     return doc
+
+
+@router.put("/knowledge-bases/{kb_id}/documents/{doc_id}/governance", response_model=DocumentOut)
+def update_document_governance(
+    kb_id: str, doc_id: str, body: DocumentGovernanceUpdate,
+    db: Session = Depends(get_db), user: User = Depends(require_content_manager),
+) -> DocumentOut:
+    kb = require_kb_permission(db, kb_id, user, "write")
+    doc = db.get(Document, doc_id)
+    if doc is None or doc.kb_id != kb_id:
+        raise NotFoundError("document_not_found", "文档不存在")
+    from app.authorization.policy import LEVEL_VALUE
+    if LEVEL_VALUE[body.sensitivity_level] < LEVEL_VALUE[kb.access_level]:
+        raise BadRequestError("invalid_sensitivity_level", "文档敏感等级不能低于知识库等级")
+    if body.effective_at and body.expires_at and body.expires_at <= body.effective_at:
+        raise BadRequestError("invalid_effective_window", "过期时间必须晚于生效时间")
+    doc.sensitivity_level = body.sensitivity_level
+    doc.content_owner = body.content_owner.strip()
+    doc.source_name = body.source_name.strip()
+    doc.effective_at = body.effective_at
+    doc.expires_at = body.expires_at
+    doc.last_reviewed_at = utcnow()
+    doc.lock_version += 1
+    from app.services.audit import record_in_transaction
+    record_in_transaction(db, user, "document.update_governance", "document", doc.id,
+                          detail={"sensitivity_level": body.sensitivity_level})
+    db.commit()
+    return _document_out(db, doc, _topic_map(db, [doc.id]).get(doc.id))
 
 
 def _require_kb(db: Session, kb_id: str) -> KnowledgeBase:
@@ -138,7 +208,7 @@ async def upload_document_to_kb(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_current_user),
+    user: User = Depends(require_content_manager),
 ) -> UploadDocumentOut:
     """上传文档到指定知识库：立即返回 202 + processing，处理后台异步执行。
 
@@ -150,20 +220,70 @@ async def upload_document_to_kb(
     if reindex_manager.is_running(kb_id):
         raise ConflictError("reindex_in_progress", "该知识库正在重建索引，请稍后再试")
     content = await file.read()
-    doc = _persist_upload(db, content, file.filename or "", kb_id)
-    background_tasks.add_task(process_document, doc.id)
+    doc = _persist_upload(db, content, file.filename or "", kb_id, user)
+    enqueue_job("document_prepare", "document", doc.id, user,
+                {"doc_id": doc.id}, f"document_prepare:{doc.id}:{doc.current_version}")
     return UploadDocumentOut(
         doc_id=doc.id, filename=doc.filename, status="processing",
         file_size=doc.file_size, kb_id=kb_id,
     )
 
 
+@router.post("/knowledge-bases/{kb_id}/documents/{doc_id}/versions",
+             response_model=UploadDocumentOut, status_code=202)
+async def upload_document_version(
+    kb_id: str, doc_id: str, background_tasks: BackgroundTasks,
+    file: UploadFile = File(...), db: Session = Depends(get_db),
+    user: User = Depends(require_content_manager),
+) -> UploadDocumentOut:
+    """为已有文档创建不可变新版本；正式版本在审核发布前继续提供检索。"""
+    require_kb_permission(db, kb_id, user, "write")
+    doc = db.get(Document, doc_id)
+    if doc is None or doc.kb_id != kb_id or doc.deleted_at is not None:
+        raise NotFoundError("document_not_found", "文档不存在")
+    if doc.status == "processing":
+        raise ConflictError("document_processing", "文档正在处理，请稍后重试")
+    content = await file.read()
+    if not content or len(content) > settings.max_upload_size_mb * 1024 * 1024:
+        raise BadRequestError("invalid_file_size", "文件为空或超过大小限制")
+    version_no = doc.current_version + 1
+    version_id = f"ver_{uuid4().hex[:20]}"
+    save_dir = settings.uploads_dir / kb_id / doc.id
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / f"v{version_no}_{Path(file.filename or doc.filename).name}"
+    save_path.write_bytes(content)
+    file_hash = hashlib.sha256(content).hexdigest()[:16]
+    version = DocumentVersion(
+        id=version_id, document_id=doc.id, version_no=version_no,
+        file_path=str(save_path), file_hash=file_hash, file_size=len(content),
+        created_by=user.id,
+    )
+    doc.current_version = version_no
+    doc.current_version_id = version_id
+    doc.file_path = str(save_path)
+    doc.file_hash = file_hash
+    doc.file_size = len(content)
+    # 已发布旧版本继续在线；新版本的处理状态由 document_versions 独立维护。
+    doc.status = "ready" if doc.published_version_id else "processing"
+    doc.error_message = None
+    doc.lock_version += 1
+    db.add(version)
+    from app.services.audit import record_in_transaction
+    record_in_transaction(db, user, "document.create_version", "document", doc.id,
+                          detail={"kb_id": kb_id, "version": version_no})
+    db.commit()
+    enqueue_job("document_prepare", "document", doc.id, user,
+                {"doc_id": doc.id}, f"document_prepare:{doc.id}:{version_no}")
+    return UploadDocumentOut(doc_id=doc.id, filename=doc.filename, status="processing",
+                             file_size=doc.file_size, kb_id=kb_id)
+
+
 @router.get("/knowledge-bases/{kb_id}/documents", response_model=list[DocumentOut])
 def list_kb_documents(
-    kb_id: str, db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+    kb_id: str, db: Session = Depends(get_db), user: User = Depends(require_content_manager)
 ) -> list[DocumentOut]:
     """知识库文档列表（含处理状态，前端轮询用）。"""
-    require_kb_permission(db, kb_id, user, "read")
+    require_kb_permission(db, kb_id, user, "write")
     docs = db.scalars(
         select(Document)
         .where(Document.kb_id == kb_id)
@@ -171,24 +291,11 @@ def list_kb_documents(
     )
     docs = list(docs)
     topics = _topic_map(db, [doc.id for doc in docs])
-    return [
-        DocumentOut(
-            doc_id=d.id,
-            filename=d.filename,
-            file_size=d.file_size,
-            status=d.status,
-            error_message=d.error_message,
-            chunk_count=d.chunk_count,
-            topics=topics.get(d.id, {}).get("approved", []),
-            topic_suggestions=topics.get(d.id, {}).get("suggestions", []),
-            created_at=d.created_at,
-        )
-        for d in docs
-    ]
+    return [_document_out(db, d, topics.get(d.id)) for d in docs]
 
 
 @router.get("/retrieval-topics")
-def list_retrieval_topics() -> list[dict]:
+def list_retrieval_topics(_user: User = Depends(require_content_manager)) -> list[dict]:
     """主题配置：管理端用于标注文档；配置异常时返回空列表而非接口失败。"""
     from app.core.retrieval_topics import retrieval_topics
 
@@ -200,9 +307,9 @@ def get_document_topics(
     kb_id: str,
     doc_id: str,
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_current_user),
+    user: User = Depends(require_content_manager),
 ) -> dict:
-    require_kb_permission(db, kb_id, user, "read")
+    require_kb_permission(db, kb_id, user, "write")
     doc = db.get(Document, doc_id)
     if doc is None or doc.kb_id != kb_id:
         raise NotFoundError("document_not_found", f"文档不存在：{doc_id}")
@@ -216,10 +323,10 @@ def update_document_topics(
     doc_id: str,
     body: DocumentTopicsUpdate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("admin")),
+    user: User = Depends(require_content_manager),
 ) -> dict:
-    """管理员审核主题：选中的标签批准，其余 AI 待审建议驳回。"""
-    require_kb_permission(db, kb_id, user, "manage")
+    """实验室成员或管理员审核主题：选中的标签批准，其余 AI 待审建议驳回。"""
+    require_kb_permission(db, kb_id, user, "write")
     doc = db.get(Document, doc_id)
     if doc is None or doc.kb_id != kb_id:
         raise NotFoundError("document_not_found", f"文档不存在：{doc_id}")
@@ -245,7 +352,7 @@ def update_document_topics(
             row.reviewed_by = user.id
             row.reviewed_at = now
         else:
-            db.delete(row)  # 管理员取消此前已批准的标签
+            db.delete(row)  # 内容管理员取消此前已批准的标签
     db.add_all(
         DocumentTopic(
             doc_id=doc_id, topic_code=code, source="manual", review_status="approved",
@@ -259,19 +366,27 @@ def update_document_topics(
 
 @router.delete("/knowledge-bases/{kb_id}/documents/{doc_id}")
 def delete_kb_document(
-    kb_id: str, doc_id: str, db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+    kb_id: str, doc_id: str, db: Session = Depends(get_db), user: User = Depends(require_content_manager)
 ) -> dict:
-    """删除文档：向量 + chunk 记录 + 登记 + 原文件。"""
+    """归档文档：保留版本和审核历史；已发布文档只有管理员可归档。"""
     require_kb_permission(db, kb_id, user, "write")
     doc = db.get(Document, doc_id)
     if doc is None or doc.kb_id != kb_id:
         raise NotFoundError("document_not_found", f"文档不存在：{doc_id}")
 
-    db.execute(delete(ChunkRecord).where(ChunkRecord.doc_id == doc_id))
-    db.execute(delete(DocumentTopic).where(DocumentTopic.doc_id == doc_id))
+    if doc.governance_status == "published":
+        enforce_action(user, "document.archive")
     vector_store.delete_document(kb_id, doc_id)
-    Path(doc.file_path).unlink(missing_ok=True)
-    db.delete(doc)
+    db.execute(delete(ChunkRecord).where(ChunkRecord.doc_id == doc_id))
+    doc.governance_status = "archived"
+    doc.deleted_at = utcnow()
+    doc.lock_version += 1
+    version = db.get(DocumentVersion, doc.current_version_id) if doc.current_version_id else None
+    if version:
+        version.review_status = "archived"
+    from app.services.audit import record_in_transaction
+    record_in_transaction(db, user, "document.archive", "document", doc.id,
+                          detail={"kb_id": kb_id})
     db.commit()
     # 关键词索引同步（缓存，异常不阻断）
     try:
@@ -291,7 +406,7 @@ async def upload_document_deprecated(
     file: UploadFile = File(...),
     knowledge_base_id: str = KB_DEFAULT,
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_current_user),
+    user: User = Depends(require_content_manager),
 ) -> UploadDocumentOut:
     """[deprecated] 等价 POST /api/knowledge-bases/{kb}/documents（Phase 2 起处理后台化）。"""
     return await upload_document_to_kb(knowledge_base_id, background_tasks, file, db, user)
@@ -301,7 +416,7 @@ async def upload_document_deprecated(
 def list_documents_deprecated(
     knowledge_base_id: str = KB_DEFAULT,
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_current_user),
+    user: User = Depends(require_content_manager),
 ) -> list[DocumentOut]:
     """[deprecated] 等价 GET /api/knowledge-bases/{kb}/documents。"""
     return list_kb_documents(knowledge_base_id, db, user)
@@ -313,13 +428,13 @@ def list_chunks(
     offset: int = 0,
     limit: int = 50,
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_current_user),
+    user: User = Depends(require_content_manager),
 ) -> dict:
     """查看某文档的分块明细：内容、大小（字符数/token 估算）、位置元数据。"""
     doc = db.get(Document, doc_id)
     if doc is None:
         raise NotFoundError("document_not_found", f"文档不存在：{doc_id}")
-    require_kb_permission(db, doc.kb_id, user, "read")
+    require_kb_permission(db, doc.kb_id, user, "write")
     total = db.scalar(
         select(func.count(ChunkRecord.id)).where(ChunkRecord.doc_id == doc_id)
     ) or 0

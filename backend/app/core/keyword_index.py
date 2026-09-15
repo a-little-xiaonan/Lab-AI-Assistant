@@ -15,7 +15,7 @@ import threading
 
 import jieba
 from rank_bm25 import BM25Okapi
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.config import settings
 from app.models.database import ChunkRecord, Document
@@ -24,6 +24,17 @@ from app.store.db import SessionLocal
 logger = logging.getLogger(__name__)
 
 jieba.setLogLevel(logging.WARNING)  # 压掉 jieba 前缀词典加载日志
+
+
+def _published_now():
+    """正式可检索文档条件：已发布、未归档，且处于生效时间窗。"""
+    from app.models.database import utcnow
+    now = utcnow()
+    return (
+        Document.governance_status == "published", Document.deleted_at.is_(None),
+        or_(Document.effective_at.is_(None), Document.effective_at <= now),
+        or_(Document.expires_at.is_(None), Document.expires_at > now),
+    )
 
 
 def _meta_from_chunk(doc_id: str, c) -> dict:
@@ -104,10 +115,14 @@ class KeywordIndex:
             total = 0
             db = SessionLocal()
             try:
-                docs = db.execute(select(Document.id, Document.kb_id, Document.filename)).all()
+                docs = db.execute(select(Document.id, Document.kb_id, Document.filename).where(
+                    *_published_now()
+                )).all()
                 for did, dkb, fname in docs:
                     self._filenames.setdefault(dkb, {})[did] = fname
-                rows = db.scalars(select(ChunkRecord).order_by(ChunkRecord.kb_id, ChunkRecord.id))
+                rows = db.scalars(select(ChunkRecord).join(
+                    Document, Document.id == ChunkRecord.doc_id
+                ).where(*_published_now()).order_by(ChunkRecord.kb_id, ChunkRecord.id))
                 for row in rows.yield_per(2000):
                     kb = self._kbs.setdefault(row.kb_id, _KbIndex())
                     kb.chunk_ids.append(row.id)
@@ -134,11 +149,15 @@ class KeywordIndex:
             db = SessionLocal()
             try:
                 docs = db.execute(
-                    select(Document.id, Document.filename).where(Document.kb_id == kb_id)
+                    select(Document.id, Document.filename).where(
+                        Document.kb_id == kb_id, *_published_now(),
+                    )
                 ).all()
                 self._filenames[kb_id] = {d[0]: d[1] for d in docs}
                 rows = db.scalars(
-                    select(ChunkRecord).where(ChunkRecord.kb_id == kb_id).order_by(ChunkRecord.id)
+                    select(ChunkRecord).join(Document, Document.id == ChunkRecord.doc_id).where(
+                        ChunkRecord.kb_id == kb_id, *_published_now(),
+                    ).order_by(ChunkRecord.id)
                 )
                 kb = _KbIndex()
                 for row in rows:

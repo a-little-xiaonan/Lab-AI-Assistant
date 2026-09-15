@@ -13,6 +13,7 @@ import {
 import type { MessageItem, SessionItem, Source } from "../types";
 
 export interface ChatMessage {
+  id?: number;
   role: "user" | "assistant";
   content: string;
   sources: Source[];
@@ -45,7 +46,12 @@ export const useSessionStore = defineStore("session", {
       const savedId = localStorage.getItem(STORAGE_KEY);
       if (savedId && this.sessions.some((s) => s.id === savedId)) {
         await this.switchSession(savedId);
+        return;
       }
+      // 登录身份变化后，不能继续显示上一个身份的会话内容。
+      this.currentSessionId = null;
+      this.messages = [];
+      localStorage.removeItem(STORAGE_KEY);
     },
 
     async loadSessions() {
@@ -99,6 +105,7 @@ export const useSessionStore = defineStore("session", {
       localStorage.setItem(STORAGE_KEY, id);
       const detail = await getSession(id);
       this.messages = detail.messages.map((m: MessageItem) => ({
+        id: m.id,
         role: m.role,
         content: m.content,
         sources: [],
@@ -165,6 +172,7 @@ export const useSessionStore = defineStore("session", {
             flush();
             assistantMsg.content = evt.data.full_text; // 以 done 帧为准（契约）
             assistantMsg.sources = evt.data.sources;
+            assistantMsg.id = evt.data.message_id;
             assistantMsg.streaming = false;
             await this.loadSessions();
             // AI 会话命名是后台异步的：延迟二次刷新，让列表显示新标题

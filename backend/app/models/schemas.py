@@ -69,6 +69,59 @@ class UserRolesUpdate(BaseModel):
     roles: list[str] = Field(min_length=1)
 
 
+class RoleApplicationCreate(BaseModel):
+    target_role: str = Field(default="editor", pattern="^editor$")
+    reason: str = Field(min_length=10, max_length=1000)
+    evidence_text: str | None = Field(default=None, max_length=2000)
+
+
+class RoleApplicationReview(BaseModel):
+    comment: str | None = Field(default=None, max_length=1000)
+
+
+class RoleApplicationOut(BaseModel):
+    id: str
+    user_id: str
+    target_role: str
+    reason: str
+    evidence_text: str | None = None
+    status: str
+    reviewed_by: str | None = None
+    review_comment: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    reviewed_at: datetime | None = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class EvaluationStartRequest(BaseModel):
+    mode: str = Field(default="retrieval", pattern="^(retrieval|full)$")
+    split: str = Field(default="dev", pattern="^(dev|holdout|all)$")
+    kb_id: str | None = None
+
+
+class FeedbackCreate(BaseModel):
+    rating: str = Field(pattern="^(helpful|unhelpful)$")
+    reason_code: str | None = Field(default=None, pattern="^(wrong|outdated|bad_citation|incomplete|no_answer|permission|other)$")
+    comment: str | None = Field(default=None, max_length=1000)
+
+
+class FeedbackReview(BaseModel):
+    resolution_note: str = Field(min_length=1, max_length=1000)
+
+
+class SuggestedQuestionCreate(BaseModel):
+    category: str = Field(min_length=1, max_length=64)
+    question: str = Field(min_length=2, max_length=500)
+    required_level: str = Field(default="guest", pattern="^(guest|student|editor|admin)$")
+    sort_order: int = 0
+    enabled: bool = True
+
+
+class SuggestedQuestionUpdate(SuggestedQuestionCreate):
+    pass
+
+
 class KnowledgeBasePermissionGrant(BaseModel):
     permission: str = Field(pattern="^(read|write|manage)$")
     role_code: str | None = None
@@ -84,6 +137,7 @@ class SourceOut(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     sources: list[SourceOut] = []
+    message_id: int | None = None
 
 
 class SessionCreate(BaseModel):
@@ -110,6 +164,7 @@ class SessionOut(BaseModel):
 
 
 class MessageOut(BaseModel):
+    id: int
     role: str
     content: str
     created_at: datetime
@@ -148,6 +203,20 @@ class DocumentOut(BaseModel):
     status: str  # processing / ready / failed
     error_message: str | None = None
     chunk_count: int
+    governance_status: str = "draft"
+    sensitivity_level: str = "guest"
+    current_version: int = 1
+    current_version_id: str | None = None
+    published_version_id: str | None = None
+    version_review_status: str | None = None
+    lock_version: int = 1
+    review_comment: str | None = None
+    published_at: datetime | None = None
+    content_owner: str | None = None
+    source_name: str | None = None
+    effective_at: datetime | None = None
+    expires_at: datetime | None = None
+    last_reviewed_at: datetime | None = None
     topics: list[str] = []
     topic_suggestions: list["TopicSuggestionOut"] = []
     created_at: datetime
@@ -177,6 +246,50 @@ class UploadDocumentOut(BaseModel):
     status: str  # processing（异步处理中）
     file_size: int
     kb_id: str
+
+
+class DocumentReviewAction(BaseModel):
+    expected_lock_version: int = Field(ge=1)
+    comment: str | None = Field(default=None, max_length=1000)
+
+
+class DocumentRollbackAction(DocumentReviewAction):
+    version_id: str
+
+
+class DocumentGovernanceUpdate(BaseModel):
+    sensitivity_level: str = Field(pattern="^(guest|student|editor|admin)$")
+    content_owner: str = Field(min_length=1, max_length=128)
+    source_name: str = Field(min_length=1, max_length=255)
+    effective_at: datetime | None = None
+    expires_at: datetime | None = None
+
+
+class DocumentQualityCheckOut(BaseModel):
+    check_type: str
+    severity: str
+    result: str
+    details: dict = {}
+    created_at: datetime
+
+
+class DocumentReviewOut(BaseModel):
+    action: str
+    reviewer_id: str | None = None
+    comment: str | None = None
+    created_at: datetime
+
+
+class DocumentVersionOut(BaseModel):
+    id: str
+    version_no: int
+    processing_status: str
+    review_status: str
+    chunk_count: int
+    file_size: int
+    change_summary: str | None = None
+    created_by: str | None = None
+    created_at: datetime
 
 
 # ----- 重新索引（Phase 3-05）-----

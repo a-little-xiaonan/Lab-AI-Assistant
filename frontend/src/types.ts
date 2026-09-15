@@ -46,6 +46,7 @@ export interface SessionItem {
 }
 
 export interface MessageItem {
+  id: number;
   role: "user" | "assistant";
   content: string;
   created_at: string;
@@ -59,7 +60,7 @@ export interface SessionDetail extends SessionItem {
 export type SSEEvent =
   | { event: "meta"; data: { session_id: string } }
   | { event: "delta"; data: { text: string } }
-  | { event: "done"; data: { full_text: string; sources: Source[] } }
+  | { event: "done"; data: { full_text: string; sources: Source[]; message_id: number } }
   | { event: "error"; data: { code: string; message: string } };
 
 export interface ChatPayload {
@@ -90,6 +91,55 @@ export interface UserMemory {
   updated_at: string;
 }
 
+export interface RoleApplication {
+  id: string;
+  user_id: string;
+  target_role: "editor";
+  reason: string;
+  evidence_text: string | null;
+  status: "pending" | "approved" | "rejected" | "cancelled";
+  reviewed_by: string | null;
+  review_comment: string | null;
+  created_at: string;
+  updated_at: string;
+  reviewed_at: string | null;
+  username?: string;
+  nickname?: string;
+}
+
+export interface AuditLogItem {
+  id: string;
+  request_id: string | null;
+  actor_user_id: string | null;
+  actor_role: string | null;
+  action: string;
+  resource_type: string;
+  resource_id: string | null;
+  result: string;
+  reason_code: string | null;
+  detail: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface EvaluationRunItem {
+  id: string;
+  status: "running" | "completed" | "failed";
+  mode: "retrieval" | "full";
+  dataset_version: string;
+  dataset_split: "dev" | "holdout" | "all";
+  kb_snapshot: string;
+  git_commit: string | null;
+  metrics: Record<string, number | string | null>;
+  result_path: string | null;
+  error_message: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+export interface SuggestedQuestion { id: string; category: string; question: string; required_level?: string; sort_order?: number; enabled?: boolean; }
+export interface AnswerFeedback { id: string; message_id: number; session_id: string; rating: "helpful" | "unhelpful"; reason_code: string | null; comment: string | null; status: string; resolution_note: string | null; evaluation_candidate: boolean; created_at: string; }
+export interface BackgroundJobItem { id: string; job_type: string; resource_type: string; resource_id: string; status: string; progress_current: number; progress_total: number; attempt: number; max_attempts: number; requested_by: string | null; request_id: string | null; error_message: string | null; created_at: string; started_at: string | null; finished_at: string | null; }
+
 // ---- Phase 3-04 知识库管理 ----
 
 export interface DocumentItem {
@@ -99,9 +149,44 @@ export interface DocumentItem {
   status: string; // processing / ready / failed / reindexing
   error_message: string | null;
   chunk_count: number;
+  governance_status: string;
+  sensitivity_level: "guest" | "student" | "editor" | "admin";
+  current_version: number;
+  current_version_id: string | null;
+  published_version_id: string | null;
+  version_review_status: string | null;
+  lock_version: number;
+  review_comment: string | null;
+  published_at: string | null;
+  content_owner: string | null;
+  source_name: string | null;
+  effective_at: string | null;
+  expires_at: string | null;
+  last_reviewed_at: string | null;
   topics: string[];
   topic_suggestions: TopicSuggestion[];
   created_at: string;
+}
+
+export interface ReviewSummary {
+  doc_id: string;
+  kb_id: string;
+  filename: string;
+  governance_status: string;
+  version_id: string;
+  version_no: number;
+  review_status: string;
+  processing_status: string;
+  chunk_count: number;
+  lock_version: number;
+  review_comment: string | null;
+  created_at: string;
+}
+
+export interface ReviewDetail extends ReviewSummary {
+  quality_checks: Array<{ check_type: string; severity: string; result: string; details: Record<string, unknown>; created_at: string }>;
+  reviews: Array<{ action: string; reviewer_id: string | null; comment: string | null; created_at: string }>;
+  chunks: Array<Omit<ChunkItem, "created_at" | "updated_at">>;
 }
 
 export interface TopicSuggestion {

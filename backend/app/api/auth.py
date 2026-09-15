@@ -21,6 +21,7 @@ from app.config import settings
 from app.models.database import RefreshToken, Role, User, UserRole, utcnow
 from app.models.schemas import LoginRequest, RegisterRequest, TokenOut, UserOut
 from app.store.db import get_db
+from app.services.audit import record_best_effort, record_in_transaction
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 REFRESH_COOKIE = "rag_refresh_token"
@@ -86,19 +87,33 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)) -> UserOut:
     db.add(user)
     db.flush()
     db.add(UserRole(user_id=user.id, role_id=student.id))
+    record_in_transaction(db, user, "auth.register", "user", user.id)
     db.commit()
     db.refresh(user)
     return user_out(user)
 
 
 @router.post("/login", response_model=TokenOut)
-def login(body: LoginRequest, response: Response, db: Session = Depends(get_db)) -> TokenOut:
+def login(body: LoginRequest, request: Request, response: Response,
+          db: Session = Depends(get_db)) -> TokenOut:
     user = db.scalar(select(User).where(User.username == body.username.strip().lower()))
     if user is None or not verify_password(body.password, user.password_hash):
+        record_best_effort(
+            None, "auth.login", "user", result="failed",
+            reason_code="invalid_credentials",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
         raise ApiError(401, "invalid_credentials", "用户名或密码错误")
     if user.status != "active" or user.deleted_at is not None:
         raise ApiError(403, "account_unavailable", "账号已被禁用或删除")
-    return _issue_tokens(db, user, response)
+    result = _issue_tokens(db, user, response)
+    record_best_effort(
+        user, "auth.login", "user", user.id,
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    return result
 
 
 @router.post("/refresh", response_model=TokenOut)

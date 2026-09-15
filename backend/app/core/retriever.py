@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from sqlalchemy import or_, select
 
 from app.config import settings
 from app.llm.qwen import embed_query
@@ -28,6 +29,7 @@ class RetrievedChunk:
     source_file: str = ""
     page: int | None = None
     similarity: float | None = None  # 混合路径观测字段：向量相似度（可选）
+    rerank_score: float | None = None  # 已执行重排时保留原始分，供证据门槛复用
 
     def __post_init__(self) -> None:
         self.source_file = self.metadata.get("source_file", "")
@@ -54,6 +56,32 @@ def truncate_to_budget(
     return kept
 
 
+def filter_published(kb_id: str, chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
+    """进入 Prompt 前终检发布状态；数据库异常时 fail closed，不泄露候选正文。"""
+    if not chunks or not settings.document_governance_enabled:
+        return chunks
+    doc_ids = {chunk.metadata.get("doc_id") for chunk in chunks if chunk.metadata.get("doc_id")}
+    if not doc_ids:
+        return []
+    try:
+        from app.models.database import Document, utcnow
+        from app.store.db import SessionLocal
+
+        now = utcnow()
+        with SessionLocal() as db:
+            allowed = set(db.scalars(select(Document.id).where(
+                Document.id.in_(doc_ids), Document.kb_id == kb_id,
+                Document.status == "ready", Document.governance_status == "published",
+                Document.deleted_at.is_(None),
+                or_(Document.effective_at.is_(None), Document.effective_at <= now),
+                or_(Document.expires_at.is_(None), Document.expires_at > now),
+            )).all())
+        return [chunk for chunk in chunks if chunk.metadata.get("doc_id") in allowed]
+    except Exception:
+        logger.exception("文档发布状态终检失败，拒绝本轮候选：kb=%s", kb_id)
+        return []
+
+
 def retrieve(
     kb_id: str,
     query_text: str,
@@ -67,10 +95,11 @@ def retrieve(
         # 函数内懒导入：避免 retriever → hybrid_retriever → retriever 循环依赖
         from app.core.hybrid_retriever import retrieve as hybrid_retrieve
 
-        return hybrid_retrieve(
+        results = hybrid_retrieve(
             kb_id, query_text, top_k=top_k, max_tokens=max_tokens,
             apply_rerank=apply_rerank, max_queries=max_queries,
         )
+        return filter_published(kb_id, results)
 
     # ===== Phase 2 路径（hybrid 关闭时逐字节保留）=====
     top_k = top_k if top_k is not None else settings.retrieval_top_k
@@ -92,4 +121,4 @@ def retrieve(
 
     if not filtered:
         logger.info("检索无命中（阈值 %s 过滤）：kb=%s query=%s", threshold, kb_id, query_text[:40])
-    return kept
+    return filter_published(kb_id, kept)

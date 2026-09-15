@@ -28,10 +28,11 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { ElMessage } from "element-plus";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { useAuthStore } from "../stores/auth";
 
 const router = useRouter();
+const route = useRoute();
 const auth = useAuthStore();
 const registerMode = ref(false);
 const loading = ref(false);
@@ -51,7 +52,8 @@ async function submit() {
       await auth.login(username.value, password.value);
     }
     ElMessage.success("登录成功");
-    router.replace("/chat");
+    const redirect = typeof route.query.redirect === "string" ? route.query.redirect : "/chat";
+    router.replace(redirect.startsWith("/") && !redirect.startsWith("//") ? redirect : "/chat");
   } catch (err) {
     ElMessage.error((err as Error).message);
   } finally {

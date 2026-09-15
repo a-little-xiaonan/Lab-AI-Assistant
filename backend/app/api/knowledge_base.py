@@ -17,9 +17,9 @@ from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from app.api.errors import BadRequestError, ConflictError, NotFoundError
-from app.auth.dependencies import get_optional_current_user
-from app.authorization.permissions import can_create_kb, list_operable_kbs, list_readable_kbs, require_kb_permission
+from app.api.errors import ApiError, BadRequestError, ConflictError, NotFoundError
+from app.auth.dependencies import require_roles
+from app.authorization.permissions import can_create_kb, list_operable_kbs, require_kb_permission
 from app.config import settings
 from app.core.reindex import reindex_manager
 from app.models.database import (
@@ -47,6 +47,8 @@ from app.store.vector_store import vector_store
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["knowledge-bases"])
+require_content_manager = require_roles("editor", "admin")
+require_admin = require_roles("admin")
 
 KB_DEFAULT = "kb_default"
 
@@ -79,7 +81,7 @@ def _kb_out(db: Session, kb: KnowledgeBase) -> KnowledgeBaseOut:
 def create_knowledge_base(
     body: KnowledgeBaseCreate,
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_current_user),
+    user: User = Depends(require_content_manager),
 ) -> KnowledgeBaseOut:
     if db.scalar(select(KnowledgeBase).where(KnowledgeBase.name == body.name)):
         raise ConflictError("duplicate_name", f"知识库名称已存在：{body.name}")
@@ -98,10 +100,13 @@ def create_knowledge_base(
         access_level=body.access_level,
         # 旧字段同步一个粗略映射，兼容尚未升级的外部消费者。
         visibility={"guest": "public", "student": "authenticated", "editor": "restricted", "admin": "restricted"}[body.access_level],
-        owner_id=user.id if user else None,
+        owner_id=user.id,
         embedding_model=body.embedding_model or settings.embedding_model,
     )
     db.add(kb)
+    from app.services.audit import record_in_transaction
+    record_in_transaction(db, user, "kb.create", "knowledge_base", kb.id,
+                          detail={"access_level": kb.access_level, "name": kb.name})
     db.commit()
     db.refresh(kb)
     return _kb_out(db, kb)
@@ -109,7 +114,7 @@ def create_knowledge_base(
 
 @router.get("/knowledge-bases", response_model=list[KnowledgeBaseOut])
 def list_knowledge_bases(
-    db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+    db: Session = Depends(get_db), user: User = Depends(require_content_manager)
 ) -> list[KnowledgeBaseOut]:
     # 管理页只返回可操作的库；聊天端不会再调用此接口来选择知识库。
     return [_kb_out(db, kb) for kb in list_operable_kbs(db, user)]
@@ -117,9 +122,11 @@ def list_knowledge_bases(
 
 @router.get("/knowledge-bases/{kb_id}", response_model=KnowledgeBaseDetailOut)
 def get_knowledge_base(
-    kb_id: str, db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+    kb_id: str, db: Session = Depends(get_db), user: User = Depends(require_content_manager)
 ) -> KnowledgeBaseDetailOut:
-    kb = require_kb_permission(db, kb_id, user, "read")
+    from app.api.documents import _document_out
+
+    kb = require_kb_permission(db, kb_id, user, "write")
     out = _kb_out(db, kb)
     docs = db.scalars(
         select(Document).where(Document.kb_id == kb_id).order_by(Document.created_at.desc())
@@ -145,22 +152,13 @@ def get_knowledge_base(
             })
     return KnowledgeBaseDetailOut(
         **out.model_dump(),
-        documents=[
-            DocumentOut(
-                doc_id=d.id, filename=d.filename, file_size=d.file_size,
-                status=d.status, error_message=d.error_message,
-                chunk_count=d.chunk_count, created_at=d.created_at,
-                topics=topics.get(d.id, {}).get("approved", []),
-                topic_suggestions=topics.get(d.id, {}).get("suggestions", []),
-            )
-            for d in docs
-        ],
+        documents=[_document_out(db, d, topics.get(d.id)) for d in docs],
     )
 
 
 @router.delete("/knowledge-bases/{kb_id}")
 def delete_knowledge_base(
-    kb_id: str, db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+    kb_id: str, db: Session = Depends(get_db), user: User = Depends(require_content_manager)
 ) -> dict:
     """删除知识库：①SQLite 记录（事务面）→ ②Chroma collection → ③uploads 目录。
 
@@ -183,6 +181,9 @@ def delete_knowledge_base(
         )
     )
     db.execute(delete(Document).where(Document.kb_id == kb_id))
+    from app.services.audit import record_in_transaction
+    record_in_transaction(db, user, "kb.delete", "knowledge_base", kb.id,
+                          detail={"name": kb.name})
     db.delete(kb)
     db.commit()
 
@@ -210,9 +211,10 @@ def grant_knowledge_base_permission(
     kb_id: str,
     body: KnowledgeBasePermissionGrant,
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_current_user),
+    user: User = Depends(require_admin),
 ) -> dict:
     """授予角色或单个用户权限；两者必须且只能提供一个。"""
+    raise ApiError(410, "acl_deprecated", "旧 ACL 已退役，请使用知识库 access_level 等级授权")
     require_kb_permission(db, kb_id, user, "manage")
     if bool(body.role_code) == bool(body.user_id):
         raise BadRequestError("invalid_permission_subject", "必须指定角色或用户中的一个")
@@ -247,9 +249,10 @@ def grant_knowledge_base_permission(
 def list_knowledge_base_permissions(
     kb_id: str,
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_current_user),
+    user: User = Depends(require_admin),
 ) -> dict:
     """查看授权清单：仅知识库管理员可见，避免泄露成员信息。"""
+    raise ApiError(410, "acl_deprecated", "旧 ACL 已退役，请使用知识库 access_level 等级授权")
     require_kb_permission(db, kb_id, user, "manage")
     role_rows = db.execute(
         select(KnowledgeBaseRolePermission, Role.code, Role.name)
@@ -291,8 +294,9 @@ def revoke_role_permission(
     kb_id: str,
     permission_id: int,
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_current_user),
+    user: User = Depends(require_admin),
 ) -> dict:
+    raise ApiError(410, "acl_deprecated", "旧 ACL 已退役，请使用知识库 access_level 等级授权")
     require_kb_permission(db, kb_id, user, "manage")
     row = db.get(KnowledgeBaseRolePermission, permission_id)
     if row is None or row.kb_id != kb_id:
@@ -307,8 +311,9 @@ def revoke_user_permission(
     kb_id: str,
     permission_id: int,
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_current_user),
+    user: User = Depends(require_admin),
 ) -> dict:
+    raise ApiError(410, "acl_deprecated", "旧 ACL 已退役，请使用知识库 access_level 等级授权")
     require_kb_permission(db, kb_id, user, "manage")
     row = db.get(KnowledgeBaseUserPermission, permission_id)
     if row is None or row.kb_id != kb_id:
@@ -342,7 +347,7 @@ def reindex_knowledge_base(
     background_tasks: BackgroundTasks,
     body: ReindexRequest | None = None,
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_current_user),
+    user: User = Depends(require_content_manager),
 ) -> ReindexStatusOut:
     """重建索引：单文档（body.doc_id）或全库（缺省）。重建期间检索不中断（双 buffer）。
 
@@ -352,16 +357,21 @@ def reindex_knowledge_base(
     if reindex_manager.is_running(kb_id):
         raise ConflictError("reindex_in_progress", "该知识库正在重建索引，请稍后再试")
     task = reindex_manager.start(kb_id, body.doc_id if body else None)
-    background_tasks.add_task(reindex_manager.run, kb_id, task.doc_id)
+    from app.services.job_queue import enqueue_job
+    enqueue_job(
+        "document_reindex" if task.doc_id else "kb_reindex", "knowledge_base", kb_id,
+        user, {"kb_id": kb_id, "doc_id": task.doc_id},
+        f"reindex:{kb_id}:{task.doc_id or 'all'}",
+    )
     return _status_out(task)
 
 
 @router.get("/knowledge-bases/{kb_id}/reindex/status", response_model=ReindexStatusOut)
 def reindex_status(
-    kb_id: str, db: Session = Depends(get_db), user: User | None = Depends(get_optional_current_user)
+    kb_id: str, db: Session = Depends(get_db), user: User = Depends(require_content_manager)
 ) -> ReindexStatusOut:
     """重建进度（无任务 → status=idle）。"""
-    require_kb_permission(db, kb_id, user, "read")
+    require_kb_permission(db, kb_id, user, "write")
     task = reindex_manager.get(kb_id)
     if task is None:
         return ReindexStatusOut(kb_id=kb_id, status="idle")

@@ -6,12 +6,6 @@
         <el-button type="primary" size="small" style="width: 100%" @click="store.createSession()">
           ＋ 新建会话
         </el-button>
-        <el-button v-if="auth.user?.roles.some((r) => r === 'editor' || r === 'admin')" size="small" style="width: 100%; margin: 8px 0 0" @click="$router.push('/knowledge-bases')">
-          📚 知识库管理
-        </el-button>
-        <el-button v-if="auth.isAdmin" size="small" style="width: 100%; margin: 8px 0 0" @click="$router.push('/admin/users')">
-          👥 用户与角色
-        </el-button>
         <el-button
           size="small"
           style="width: 100%; margin: 8px 0 0"
@@ -74,15 +68,9 @@
     </el-aside>
 
     <el-container>
-      <!-- 顶部：身份信息 -->
+      <!-- 问答区顶部导航：管理入口由当前角色决定是否显示 -->
       <el-header class="header">
-        <div class="user-actions">
-          <template v-if="auth.user">
-            <el-button link @click="$router.push('/profile')">{{ auth.user.nickname }}</el-button>
-            <el-button link type="danger" @click="signOut">退出</el-button>
-          </template>
-          <el-button v-else link type="primary" @click="$router.push('/login')">登录 / 注册</el-button>
-        </div>
+        <ModuleHeader section="chat" @signed-out="store.init" />
       </el-header>
 
       <el-main class="main">
@@ -98,6 +86,7 @@
           <div v-if="!store.messages.length" class="empty-tip">
             <p>👋 你好，我是 RAG 智能助手</p>
             <p>选择左侧会话，或在下方输入问题开始提问</p>
+            <SuggestedQuestions @select="store.sendMessage" />
           </div>
           <ChatMessage
             v-for="(m, i) in store.messages"
@@ -121,13 +110,13 @@ import { computed, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import ChatMessage from "../components/ChatMessage.vue";
 import MessageInput from "../components/MessageInput.vue";
+import ModuleHeader from "../components/ModuleHeader.vue";
+import SuggestedQuestions from "../components/SuggestedQuestions.vue";
 import { renameSession as apiRenameSession } from "../api/sessions";
 import { useSessionStore } from "../stores/session";
-import { useAuthStore } from "../stores/auth";
 import type { SessionItem } from "../types";
 
 const store = useSessionStore();
-const auth = useAuthStore();
 const scrollbarRef = ref();
 const showAllSessions = ref(false);
 
@@ -163,7 +152,7 @@ async function deleteSelected() {
   const ids = Object.keys(selected.value).filter((k) => selected.value[k]);
   if (!ids.length) return;
   try {
-    await ElMessageBox.confirm(`确定删除选中的 ${ids.length} 个会话？消息与记忆一并清除。`, "批量删除", {
+    await ElMessageBox.confirm(`确定移除选中的 ${ids.length} 个会话？会话将从列表隐藏，数据仍会保留。`, "批量移除", {
       type: "warning",
       confirmButtonText: "删除",
       cancelButtonText: "取消",
@@ -179,9 +168,9 @@ async function deleteSelected() {
 async function deleteAll() {
   try {
     await ElMessageBox.confirm(
-      `确定删除全部 ${store.sessions.length} 个会话？此操作不可恢复。`,
-      "删除全部会话",
-      { type: "warning", confirmButtonText: "全部删除", cancelButtonText: "取消" },
+      `确定移除全部 ${store.sessions.length} 个会话？会话将从列表隐藏，数据仍会保留。`,
+      "移除全部会话",
+      { type: "warning", confirmButtonText: "全部移除", cancelButtonText: "取消" },
     );
     const deleted = await store.batchDelete();
     ElMessage.success(`已删除 ${deleted} 个会话`);
@@ -218,7 +207,7 @@ async function renameSession(session: SessionItem) {
 
 async function confirmDelete(session: { id: string }) {
   try {
-    await ElMessageBox.confirm("删除后会话记录不可恢复，确定删除？", "删除会话", {
+    await ElMessageBox.confirm("移除后会话将从当前列表隐藏，但数据仍会保留。确定移除？", "移除会话", {
       type: "warning",
       confirmButtonText: "删除",
       cancelButtonText: "取消",
@@ -227,16 +216,6 @@ async function confirmDelete(session: { id: string }) {
     ElMessage.success("会话已删除");
   } catch {
     /* 用户取消 */
-  }
-}
-
-async function signOut() {
-  try {
-    await auth.logout();
-    await store.loadSessions();
-    ElMessage.success("已退出登录");
-  } catch (err) {
-    ElMessage.error((err as Error).message);
   }
 }
 
@@ -326,12 +305,9 @@ watch(
   color: var(--el-text-color-secondary);
 }
 .header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  border-bottom: 1px solid var(--el-border-color-light);
+  height: 64px;
+  padding: 0;
 }
-.user-actions { display: flex; align-items: center; gap: 8px; }
 .main {
   display: flex;
   flex-direction: column;

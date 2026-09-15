@@ -1,8 +1,15 @@
 <template>
-  <el-container class="kb-page">
+  <el-container class="kb-page" direction="vertical">
+    <ModuleHeader section="knowledge" />
     <el-header class="kb-header">
-      <el-page-header content="知识库管理" @back="$router.push('/chat')" />
-      <el-button type="primary" @click="showCreate = true">＋ 新建知识库</el-button>
+      <div>
+        <h1>知识库工作台</h1>
+        <p>管理实验室资料、文档主题与检索索引</p>
+      </div>
+      <div>
+        <el-button @click="$router.push('/knowledge-bases/reviews')">审核工作台</el-button>
+        <el-button type="primary" @click="showCreate = true">＋ 新建知识库</el-button>
+      </div>
     </el-header>
 
     <el-main>
@@ -52,8 +59,8 @@
           <el-select v-model="createAccessLevel" style="width: 100%">
             <el-option label="游客级：所有人可读取" value="guest" />
             <el-option label="学生级：登录学生及以上可读取" value="student" />
-            <el-option label="编辑级：编辑者及管理员可读取" value="editor" />
-            <el-option label="管理员级：仅管理员可读取" value="admin" />
+            <el-option label="实验室成员级：成员及管理员可读取" value="editor" :disabled="!auth.isAdmin" />
+            <el-option label="管理员级：仅管理员可读取" value="admin" :disabled="!auth.isAdmin" />
           </el-select>
         </el-form-item>
       </el-form>
@@ -86,10 +93,18 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="160">
+        <el-table-column label="发布状态" width="110">
+          <template #default="{ row }">
+            <el-tag :type="row.governance_status === 'published' ? 'success' : 'warning'" size="small">
+              {{ row.version_review_status || row.governance_status }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="205">
           <template #default="{ row }">
             <el-button link size="small" @click="openChunks(row)">查看</el-button>
-            <el-button v-if="auth.isAdmin" link size="small" @click="openTopics(row)">审核主题</el-button>
+            <el-button v-if="auth.isContentManager" link size="small" @click="openTopics(row)">审核主题</el-button>
+            <el-button v-if="auth.isContentManager" link size="small" @click="openGovernance(row)">治理</el-button>
             <el-button link size="small" :loading="reindexingId === row.doc_id" @click="reindexDoc(row.doc_id)">重建</el-button>
             <el-button link size="small" type="danger" @click="confirmDeleteDoc(row)">删除</el-button>
           </template>
@@ -106,7 +121,7 @@
 
     <el-dialog v-model="showTopics" :title="`${topicDocument?.filename ?? ''} · 资料主题`" width="520px">
       <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
-        AI 推荐仅供审核，未审核标签不会参与定向检索；勾选后保存即视为管理员批准。
+        AI 推荐仅供审核，未审核标签不会参与定向检索；勾选后保存即视为实验室成员或管理员批准。
       </el-alert>
       <el-checkbox-group v-model="selectedTopicCodes">
         <div v-for="topic in availableTopics" :key="topic.code" class="topic-option">
@@ -121,6 +136,18 @@
         <el-button @click="showTopics = false">取消</el-button>
         <el-button type="primary" @click="saveTopics">保存主题</el-button>
       </template>
+    </el-dialog>
+
+    <el-dialog v-model="showGovernance" :title="`${governanceDocument?.filename ?? ''} · 治理信息`" width="560px">
+      <el-form label-width="100px">
+        <el-form-item label="内容负责人" required><el-input v-model="governanceForm.content_owner" maxlength="128" /></el-form-item>
+        <el-form-item label="资料来源" required><el-input v-model="governanceForm.source_name" maxlength="255" /></el-form-item>
+        <el-form-item label="敏感等级"><el-select v-model="governanceForm.sensitivity_level" style="width:100%"><el-option label="游客" value="guest"/><el-option label="学生" value="student"/><el-option label="实验室成员" value="editor"/><el-option label="管理员" value="admin"/></el-select></el-form-item>
+        <el-form-item label="生效时间"><el-date-picker v-model="governanceForm.effective_at" type="datetime" value-format="YYYY-MM-DDTHH:mm:ss" clearable style="width:100%" /></el-form-item>
+        <el-form-item label="过期时间"><el-date-picker v-model="governanceForm.expires_at" type="datetime" value-format="YYYY-MM-DDTHH:mm:ss" clearable style="width:100%" /></el-form-item>
+        <el-form-item label="最后复核"><span>{{ formatTime(governanceDocument?.last_reviewed_at) }}</span></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="showGovernance=false">取消</el-button><el-button type="primary" @click="saveGovernance">保存并记录复核</el-button></template>
     </el-dialog>
 
     <!-- chunk 明细：大抽屉 + 左导航右详情 -->
@@ -172,6 +199,7 @@
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import DocumentUpload from "../components/DocumentUpload.vue";
+import ModuleHeader from "../components/ModuleHeader.vue";
 import { useKnowledgeBasesStore } from "../stores/knowledgeBases";
 import { useAuthStore } from "../stores/auth";
 import {
@@ -183,6 +211,7 @@ import {
   reindex as apiReindex,
   reindexStatus,
   updateDocumentTopics,
+  updateDocumentGovernance,
 } from "../api/knowledgeBases";
 import type { ChunkItem, DocumentItem, KnowledgeBase, RetrievalTopic, Stats } from "../types";
 
@@ -214,6 +243,24 @@ const showTopics = ref(false);
 const topicDocument = ref<DocumentItem | null>(null);
 const availableTopics = ref<RetrievalTopic[]>([]);
 const selectedTopicCodes = ref<string[]>([]);
+const showGovernance = ref(false);
+const governanceDocument = ref<DocumentItem | null>(null);
+const governanceForm = ref({ sensitivity_level: "guest" as DocumentItem["sensitivity_level"], content_owner: "", source_name: "", effective_at: null as string | null, expires_at: null as string | null });
+
+function openGovernance(row: DocumentItem) {
+  governanceDocument.value = row;
+  governanceForm.value = { sensitivity_level: row.sensitivity_level, content_owner: row.content_owner || "", source_name: row.source_name || row.filename, effective_at: row.effective_at, expires_at: row.expires_at };
+  showGovernance.value = true;
+}
+
+async function saveGovernance() {
+  const row = governanceDocument.value;
+  if (!row || !governanceForm.value.content_owner.trim() || !governanceForm.value.source_name.trim()) return ElMessage.warning("请填写内容负责人和资料来源");
+  try {
+    await updateDocumentGovernance(detailKbId.value, row.doc_id, governanceForm.value);
+    await refreshDetail(); showGovernance.value = false; ElMessage.success("治理信息已更新");
+  } catch (error) { ElMessage.error((error as Error).message); }
+}
 
 function formatTime(t: string | undefined | null): string {
   if (!t) return "—";
@@ -307,7 +354,7 @@ async function doCreate() {
 }
 
 function accessLevelLabel(level: KnowledgeBase["access_level"]): string {
-  return { guest: "游客级", student: "学生级", editor: "编辑级", admin: "管理员级" }[level];
+  return { guest: "游客级", student: "学生级", editor: "实验室成员级", admin: "管理员级" }[level];
 }
 
 async function confirmDeleteKb(kb: KnowledgeBase) {
@@ -420,11 +467,16 @@ onBeforeUnmount(() => timers.forEach((t) => window.clearInterval(t)));
   height: 100%;
 }
 .kb-header {
+  height: auto;
+  min-height: 86px;
+  padding: 18px 28px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--el-border-color-light);
 }
+.kb-header h1 { margin: 0 0 6px; font-size: 22px; }
+.kb-header p { margin: 0; color: var(--el-text-color-secondary); font-size: 13px; }
 .stats-row {
   margin-bottom: 16px;
 }

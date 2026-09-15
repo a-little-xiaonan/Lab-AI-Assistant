@@ -44,6 +44,7 @@ def _rerank_dashscope(
         c = by_idx.pop(idx, None)
         if c is None:
             continue  # 响应越界兜底
+        c.rerank_score = float(score)
         c.score = round(score, 4)  # score 语义切换为重排分（观测日志可见）
         out.append(c)
     out.extend(by_idx.values())  # 未返回项兜底（理论上不出现）
@@ -65,5 +66,6 @@ def _rerank_local(
     scores = _local_model.predict([(query, c.text) for c in candidates])
     ranked = sorted(zip(scores, candidates), key=lambda p: p[0], reverse=True)
     for s, c in ranked:
+        c.rerank_score = float(s)
         c.score = round(float(s), 4)
     return [c for _, c in ranked]

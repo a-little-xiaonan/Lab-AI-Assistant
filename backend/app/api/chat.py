@@ -149,16 +149,17 @@ async def _sse_stream(
                 yield format_sse_event("delta", {"text": item["text"]})
             elif item["type"] == "done":
                 # 先落库成功再发 done 帧：客户端收到 done 时数据已持久化
-                db.add(
-                    Message(
-                        session_id=session.id, role="assistant", content=item["full_text"]
-                    )
+                assistant_message = Message(
+                    session_id=session.id, role="assistant", content=item["full_text"]
                 )
+                db.add(assistant_message)
                 db.commit()
+                db.refresh(assistant_message)
                 _remember_turn(session.id, AUTO_KB_SCOPE, req.message, item["full_text"], user_id)
                 yield format_sse_event(
                     "done",
-                    {"full_text": item["full_text"], "sources": item["sources"]},
+                    {"full_text": item["full_text"], "sources": item["sources"],
+                     "message_id": assistant_message.id},
                 )
                 return
     except StopIteration:
@@ -278,14 +279,11 @@ async def chat(
     result = answer(req.message, readable_kb_ids, session_id=session.id, user_id=user.id if user else None)
 
     # 消息落库（user + assistant 成对）+ 记忆窗口更新
-    db.add_all(
-        [
-            Message(session_id=session.id, role="user", content=req.message),
-            Message(session_id=session.id, role="assistant", content=result["answer"]),
-        ]
-    )
+    assistant_message = Message(session_id=session.id, role="assistant", content=result["answer"])
+    db.add_all([Message(session_id=session.id, role="user", content=req.message), assistant_message])
     db.commit()
     _remember_turn(session.id, AUTO_KB_SCOPE, req.message, result["answer"], user.id if user else None)
+    # 非流式响应保持 Phase 1 契约；消息 ID 可从会话详情读取。
     response = JSONResponse({"answer": result["answer"], "sources": result["sources"]})
     if set_anonymous and user is None:
         _set_anonymous_cookie(response, anonymous_id)

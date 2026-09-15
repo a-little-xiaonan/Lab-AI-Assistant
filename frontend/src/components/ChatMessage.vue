@@ -5,6 +5,7 @@
       <div v-else class="md-body" v-html="rendered" />
       <div v-if="message.streaming" class="cursor">▋</div>
       <div v-if="message.error" class="msg-error">{{ message.error }}</div>
+      <AnswerFeedback v-if="message.role === 'assistant' && message.id && !message.streaming" :message-id="message.id" />
     </div>
   </div>
 </template>
@@ -15,6 +16,7 @@ import { marked } from "marked";
 import hljs from "highlight.js";
 import "highlight.js/styles/github.css";
 import type { ChatMessage } from "../stores/session";
+import AnswerFeedback from "./AnswerFeedback.vue";
 
 const props = defineProps<{ message: ChatMessage }>();
 

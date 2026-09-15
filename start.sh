@@ -22,6 +22,8 @@ BACKEND_LOG="${LOG_DIR}/backend.log"
 FRONTEND_LOG="${LOG_DIR}/frontend.log"
 BACKEND_PID="${LOG_DIR}/backend.pid"
 FRONTEND_PID="${LOG_DIR}/frontend.pid"
+WORKER_LOG="${LOG_DIR}/worker.log"
+WORKER_PID="${LOG_DIR}/worker.pid"
 
 # ---------- 基础工具 ----------
 
@@ -112,15 +114,46 @@ start_frontend() {
   wait_http "http://localhost:${FRONTEND_PORT}/" "前端" 30
 }
 
+start_worker() {
+  if is_running "${WORKER_PID}" "python worker.py"; then
+    log "RQ Worker 已在运行"
+    return 0
+  fi
+  mkdir -p "${LOG_DIR}"
+  if ! docker ps --format '{{.Names}}' | grep -qx redis; then
+    err "RQ 模式需要名为 redis 的运行中容器"
+    return 1
+  fi
+  log "启动 RQ Worker..."
+  cd "${BACKEND_DIR}" || return 1
+  nohup "${PYTHON}" worker.py >> "${WORKER_LOG}" 2>&1 &
+  echo $! > "${WORKER_PID}"
+  sleep 1
+  is_running "${WORKER_PID}" "python worker.py" && log "RQ Worker 已启动" || { err "Worker 启动失败，请查看 ${WORKER_LOG}"; return 1; }
+}
+
+stop_worker() {
+  if [ -f "${WORKER_PID}" ]; then
+    local pid
+    pid="$(cat "${WORKER_PID}" 2>/dev/null || echo "")"
+    [ -n "${pid}" ] && kill "${pid}" 2>/dev/null && log "已停止 RQ Worker（pid ${pid}）"
+    rm -f "${WORKER_PID}"
+  fi
+}
+
 cmd_start() {
   ensure_mysql || return 1
   start_backend
   start_frontend
+  if grep -Eq '^TASK_MODE=rq([[:space:]]*)$' "${ROOT}/.env" 2>/dev/null; then
+    start_worker || return 1
+  fi
   echo
   log "全部就绪：前端 http://localhost:${FRONTEND_PORT} （后端 ${BACKEND_PORT}，接口文档 /docs）"
 }
 
 cmd_stop() {
+  stop_worker
   for entry in "${BACKEND_PID}:uvicorn app.main:app" "${FRONTEND_PID}:vite"; do
     local pid_file="${entry%%:*}" name="${entry#*:}"
     if [ -f "${pid_file}" ]; then
@@ -140,11 +173,13 @@ cmd_stop() {
 }
 
 cmd_status() {
-  local backend="未运行" frontend="未运行"
+  local backend="未运行" frontend="未运行" worker="未运行"
   is_running "${BACKEND_PID}" "uvicorn app.main:app" && backend="运行中（${BACKEND_PORT}）"
   is_running "${FRONTEND_PID}" "vite" && frontend="运行中（${FRONTEND_PORT}）"
+  is_running "${WORKER_PID}" "python worker.py" && worker="运行中"
   echo "后端：${backend}"
   echo "前端：${frontend}"
+  echo "Worker：${worker}"
   docker ps --format '{{.Names}} {{.Status}}' | grep -q '^mysql ' && echo "MySQL：运行中" || echo "MySQL：未运行"
 }
 
@@ -154,7 +189,8 @@ cmd_logs() {
   case "${target}" in
     backend)  tail -f "${BACKEND_LOG}" ;;
     frontend) tail -f "${FRONTEND_LOG}" ;;
-    *) err "logs 参数：backend 或 frontend" ;;
+    worker)   tail -f "${WORKER_LOG}" ;;
+    *) err "logs 参数：backend、frontend 或 worker" ;;
   esac
 }
 
@@ -165,5 +201,9 @@ case "${1:-start}" in
   stop)   cmd_stop ;;
   status) cmd_status ;;
   logs)   cmd_logs "${2:-}" ;;
-  *) err "用法：./start.sh [start|stop|status|logs [backend|frontend]]" ;;
+  worker-start) start_worker ;;
+  worker-stop) stop_worker ;;
+  worker-status) is_running "${WORKER_PID}" "python worker.py" && log "Worker 运行中" || warn "Worker 未运行" ;;
+  worker-logs) cmd_logs worker ;;
+  *) err "用法：./start.sh [start|stop|status|logs [backend|frontend|worker]|worker-start|worker-stop|worker-status|worker-logs]" ;;
 esac

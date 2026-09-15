@@ -74,7 +74,8 @@ class ReindexManager:
         """
         task = self.get(kb_id)
         if task is None:
-            return
+            # RQ Worker 是独立进程，不能读取 API 进程内登记的任务对象。
+            task = self.start(kb_id, doc_id)
         logger.info("开始重建索引：kb=%s doc=%s", kb_id, doc_id or "（全库）")
         db = SessionLocal()
         try:

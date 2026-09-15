@@ -99,7 +99,17 @@ class VectorStore:
             )
             self._collections[name] = coll
 
-    def swap_collections(self, kb_id: str) -> None:
+    def drop_temp_collection(self, kb_id: str) -> None:
+        """发布失败时丢弃 docs_new；正式 docs/docs_old 不受影响。"""
+        name = self._collection_name(kb_id, "docs_new")
+        with self._lock:
+            try:
+                self._client.delete_collection(name)
+            except Exception:
+                pass
+            self._collections.pop(name, None)
+
+    def swap_collections(self, kb_id: str, allow_empty: bool = False) -> None:
         """双 buffer 切换：两次改名零删除 → 检索零中断窗口。
 
         序列（持锁；_get_collection 同锁 → 切换期间新查询阻塞毫秒级后拿到新句柄）：
@@ -111,7 +121,7 @@ class VectorStore:
         with self._lock:
             old = self._get_collection(kb_id, "docs")
             new = self._get_collection(kb_id, "docs_new")
-            if new.count() == 0:
+            if new.count() == 0 and not allow_empty:
                 raise ValueError(f"临时 collection 为空，拒绝切换：{kb_id}")
             old.modify(name=self._collection_name(kb_id, "docs_old"))
             self._collections.pop(self._collection_name(kb_id, "docs"), None)

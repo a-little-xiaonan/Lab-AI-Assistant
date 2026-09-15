@@ -1,11 +1,13 @@
 <template>
-  <el-container class="admin-page">
-    <el-header class="admin-header">
-      <el-page-header content="用户与角色管理" @back="$router.push('/chat')" />
+  <section class="admin-users">
+    <div class="page-heading">
+      <div>
+        <h1>用户与角色</h1>
+        <p>管理用户状态与系统角色，仅管理员可执行。</p>
+      </div>
       <el-button :loading="loading" @click="load">刷新</el-button>
-    </el-header>
-    <el-main>
-      <el-alert title="student 只能使用获授权知识库；editor 可管理内容；admin 可管理用户、知识库与授权。" type="info" :closable="false" show-icon style="margin-bottom: 16px" />
+    </div>
+      <el-alert title="普通学生仅使用问答；实验室成员可管理内容；管理员可管理用户、知识库与授权。" type="info" :closable="false" show-icon style="margin-bottom: 16px" />
       <el-table v-loading="loading" :data="users" stripe>
         <el-table-column prop="username" label="账号" min-width="130" />
         <el-table-column prop="nickname" label="昵称" min-width="120" />
@@ -13,7 +15,7 @@
         <el-table-column label="角色" min-width="230">
           <template #default="{ row }">
             <el-checkbox-group :model-value="row.roles" @change="saveRoles(row, Array.isArray($event) ? $event.map(String) : [])">
-              <el-checkbox label="student">学生</el-checkbox><el-checkbox label="editor">编辑</el-checkbox><el-checkbox label="admin">管理员</el-checkbox>
+              <el-checkbox label="student">普通学生</el-checkbox><el-checkbox label="editor">实验室成员</el-checkbox><el-checkbox label="admin">管理员</el-checkbox>
             </el-checkbox-group>
           </template>
         </el-table-column>
@@ -24,8 +26,7 @@
         </el-table-column>
         <el-table-column label="注册时间" width="180"><template #default="{ row }">{{ formatTime(row.created_at) }}</template></el-table-column>
       </el-table>
-    </el-main>
-  </el-container>
+  </section>
 </template>
 
 <script setup lang="ts">
@@ -57,6 +58,8 @@ onMounted(load);
 </script>
 
 <style scoped>
-.admin-page { height: 100%; }
-.admin-header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--el-border-color-light); }
+.admin-users { max-width: 1200px; margin: 0 auto; }
+.page-heading { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 18px; }
+.page-heading h1 { margin: 0 0 6px; font-size: 24px; }
+.page-heading p { margin: 0; color: var(--el-text-color-secondary); }
 </style>

@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.config import settings
 from app.core import retriever
+from app.core.evidence_gate import EvidenceDecision, filter_evidence
 from app.llm import qwen
 from app.llm.errors import LLMError
 from app.llm.prompt_templates import (
@@ -120,7 +122,7 @@ def _retrieve_scope(kb_ids: list[str], query: str, history: str) -> tuple[list[r
 
 def _prepare(
     query: str, kb_id: str | list[str], history: str = "", user_id: str | None = None
-) -> tuple[list[retriever.RetrievedChunk], list[dict]]:
+) -> tuple[list[retriever.RetrievedChunk], list[dict], EvidenceDecision]:
     """检索 + 场景分支 + 长期记忆召回（answer 与 answer_stream 共享）。
 
     检索为空/全部低于阈值 → no_context 模板（无参考资料段，明确告知未找到）；
@@ -143,6 +145,7 @@ def _prepare(
     except Exception:
         logger.exception("检索失败，降级为纯 LLM 回答：kb=%s", kb_id)
         chunks = []
+    chunks, evidence = filter_evidence(query, chunks)
     memories = format_memories(long_term_memory.recall(query, user_id)) if user_id else ""
     if chunks:
         messages = build_rag_answer_messages(
@@ -154,7 +157,7 @@ def _prepare(
         )
     else:
         messages = build_no_context_messages(query, history=history, memories=memories)
-    return chunks, messages
+    return chunks, messages, evidence
 
 
 def _strip_citations(body: str, *, trim: bool = True) -> str:
@@ -218,9 +221,42 @@ def answer(
     异常路径：检索失败 → 降级为纯 LLM 回答（日志标记）；LLM 失败 → 抛 LLMError，
     由 API 层转统一错误（不静默返回空）。
     """
-    chunks, messages = _prepare(query, kb_id, history=_get_history_context(session_id), user_id=user_id)
+    started = time.monotonic()
+    chunks, messages, evidence = _prepare(
+        query, kb_id, history=_get_history_context(session_id), user_id=user_id
+    )
+    retrieval_elapsed = time.monotonic() - started
+    generation_started = time.monotonic()
     raw_answer = qwen.chat_completion(messages)
-    return _finalize(raw_answer, chunks)
+    result = _finalize(raw_answer, chunks)
+    if flags.get("include_diagnostics"):
+        result["diagnostics"] = {
+            "evidence": evidence.as_dict(),
+            "retrieval_elapsed_seconds": round(retrieval_elapsed, 4),
+            "generation_elapsed_seconds": round(
+                time.monotonic() - generation_started, 4
+            ),
+            "retrieved": [
+                {
+                    "rank": index,
+                    "chunk_id": chunk.chunk_id,
+                    "source_file": chunk.source_file,
+                    "score": round(float(chunk.score), 6),
+                    "similarity": (
+                        round(float(chunk.similarity), 6)
+                        if chunk.similarity is not None
+                        else None
+                    ),
+                    "rerank_score": (
+                        round(float(chunk.rerank_score), 6)
+                        if chunk.rerank_score is not None
+                        else None
+                    ),
+                }
+                for index, chunk in enumerate(chunks, 1)
+            ],
+        }
+    return result
 
 
 def answer_stream(
@@ -234,7 +270,9 @@ def answer_stream(
 
     LLM 流式失败 → 生成器向上抛 LLMError（由 API 层转 SSE error 帧）。
     """
-    chunks, messages = _prepare(query, kb_id, history=_get_history_context(session_id), user_id=user_id)
+    chunks, messages, _evidence = _prepare(
+        query, kb_id, history=_get_history_context(session_id), user_id=user_id
+    )
     proc = CitationStreamProcessor(chunks)
     processed = []
     for delta in qwen.chat_completion_stream(messages):

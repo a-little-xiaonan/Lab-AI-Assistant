@@ -6,6 +6,8 @@ import type {
   KnowledgeBaseDetail,
   KnowledgeBasePermissions,
   ReindexStatus,
+  ReviewDetail,
+  ReviewSummary,
   RetrievalTopic,
   Stats,
 } from "../types";
@@ -22,6 +24,33 @@ async function parseError(resp: Response): Promise<Error> {
     /* 非 JSON 错误体 */
   }
   return new Error(`请求失败（${resp.status}）`);
+}
+
+export async function listDocumentReviews(): Promise<ReviewSummary[]> {
+  const resp = await apiFetch("/api/document-reviews");
+  if (!resp.ok) throw await parseError(resp);
+  return resp.json();
+}
+
+export async function getDocumentReviewDetail(docId: string): Promise<ReviewDetail> {
+  const resp = await apiFetch(`/api/documents/${docId}/review-detail`);
+  if (!resp.ok) throw await parseError(resp);
+  return resp.json();
+}
+
+export async function reviewDocument(
+  docId: string,
+  action: "submit-review" | "preapprove" | "request-change" | "reject" | "publish",
+  expectedLockVersion: number,
+  comment?: string,
+): Promise<Record<string, unknown>> {
+  const resp = await apiFetch(`/api/documents/${docId}/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expected_lock_version: expectedLockVersion, comment: comment || null }),
+  });
+  if (!resp.ok) throw await parseError(resp);
+  return resp.json();
 }
 
 export async function listKnowledgeBases(): Promise<KnowledgeBase[]> {
@@ -142,6 +171,20 @@ export async function updateDocumentTopics(kbId: string, docId: string, topicCod
   if (!resp.ok) throw await parseError(resp);
   const data = await resp.json();
   return data.topic_codes;
+}
+
+export async function updateDocumentGovernance(
+  kbId: string,
+  docId: string,
+  data: Pick<DocumentItem, "sensitivity_level" | "content_owner" | "source_name" | "effective_at" | "expires_at">,
+): Promise<DocumentItem> {
+  const resp = await apiFetch(`/api/knowledge-bases/${kbId}/documents/${docId}/governance`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!resp.ok) throw await parseError(resp);
+  return resp.json();
 }
 
 /** 文档 chunk 明细（内容/大小/位置元数据，复用后端 Phase 1 接口） */

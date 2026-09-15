@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -153,7 +153,7 @@ class KnowledgeBaseUserPermission(Base):
 
 
 class Document(Base):
-    """文档登记表：上传去重、索引状态、chunk 统计。
+    """文档登记表：技术处理状态与内容治理状态相互独立。
 
     kb_id 不设数据库外键（既有表无迁移框架，create_all 不会补约束），
     由 API 层操作前校验 + 应用层级联保证一致性；ORM 层仍配 relationship。
@@ -168,9 +168,29 @@ class Document(Base):
     file_size: Mapped[int] = mapped_column(Integer, default=0)  # 字节
     file_path: Mapped[str] = mapped_column(String(512))
     status: Mapped[str] = mapped_column(String(16), default="processing")  # processing/ready/failed
+    governance_status: Mapped[str] = mapped_column(String(24), default="draft", index=True)
+    sensitivity_level: Mapped[str] = mapped_column(String(16), default="guest", index=True)
+    uploader_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    current_version: Mapped[int] = mapped_column(Integer, default=1)
+    current_version_id: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    published_version_id: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    lock_version: Mapped[int] = mapped_column(Integer, default=1)
+    reviewed_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    published_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    effective_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    review_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    legacy_unreviewed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
     chunks: Mapped[list["ChunkRecord"]] = relationship(
         back_populates="document", cascade="all, delete-orphan"
@@ -178,6 +198,92 @@ class Document(Base):
     topics: Mapped[list["DocumentTopic"]] = relationship(
         back_populates="document", cascade="all, delete-orphan"
     )
+    versions: Mapped[list["DocumentVersion"]] = relationship(
+        back_populates="document", cascade="all, delete-orphan"
+    )
+
+
+class DocumentVersion(Base):
+    """文档不可变版本：每次重新上传生成一条，旧版本供审计和回滚。"""
+
+    __tablename__ = "document_versions"
+    __table_args__ = (
+        UniqueConstraint("document_id", "version_no", name="uq_document_versions_doc_no"),
+    )
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    version_no: Mapped[int] = mapped_column(Integer)
+    file_path: Mapped[str] = mapped_column(String(512))
+    file_hash: Mapped[str] = mapped_column(String(64), index=True)
+    file_size: Mapped[int] = mapped_column(Integer, default=0)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    change_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    processing_status: Mapped[str] = mapped_column(String(16), default="processing", index=True)
+    review_status: Mapped[str] = mapped_column(String(24), default="draft", index=True)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    document: Mapped[Document] = relationship(back_populates="versions")
+
+
+class DocumentVersionChunk(Base):
+    """待审版本分块：与正式 chunks 分离，审核前绝不进入检索索引。"""
+
+    __tablename__ = "document_version_chunks"
+    __table_args__ = (
+        UniqueConstraint("document_version_id", "chunk_index", name="uq_version_chunks_version_index"),
+    )
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    document_version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    doc_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    kb_id: Mapped[str] = mapped_column(String(64), index=True)
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(Text)
+    char_length: Mapped[int] = mapped_column(Integer, default=0)
+    token_estimate: Mapped[int] = mapped_column(Integer, default=0)
+    page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    slide_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sheet_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    row_range: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class DocumentQualityCheck(Base):
+    """文档版本质量检查结果；blocking 失败会阻止提交审核和发布。"""
+
+    __tablename__ = "document_quality_checks"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    document_version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    check_type: Mapped[str] = mapped_column(String(32), index=True)
+    severity: Mapped[str] = mapped_column(String(16), index=True)
+    result: Mapped[str] = mapped_column(String(16), index=True)
+    details_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class DocumentReview(Base):
+    """不可变审核流水：提交、预审、批准、驳回、归档和回滚均追加记录。"""
+
+    __tablename__ = "document_reviews"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    document_version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    reviewer_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(24), index=True)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class DocumentTopic(Base):
@@ -211,6 +317,9 @@ class ChunkRecord(Base):
 
     id: Mapped[str] = mapped_column(String(96), primary_key=True)  # {doc_id}_{chunk_index}
     doc_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
+    document_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     kb_id: Mapped[str] = mapped_column(String(64), index=True)
     chunk_index: Mapped[int] = mapped_column(Integer)
     text: Mapped[str] = mapped_column(Text)
@@ -250,9 +359,129 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     actor_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    actor_role: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(64), index=True)
     resource_type: Mapped[str] = mapped_column(String(64))
     resource_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    result: Mapped[str] = mapped_column(String(16), default="success", index=True)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     detail_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ip_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent_summary: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class RoleApplication(Base):
+    """实验室成员申请：历史永久保留，pending_key 保证每人最多一条待审批。"""
+
+    __tablename__ = "role_applications"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    target_role: Mapped[str] = mapped_column(String(32), default="editor")
+    reason: Mapped[str] = mapped_column(Text)
+    evidence_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    pending_key: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    review_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class EvaluationRun(Base):
+    """评测运行索引与汇总；逐题详情保存在版本化 JSON 文件。"""
+
+    __tablename__ = "evaluation_runs"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), default="running", index=True)
+    mode: Mapped[str] = mapped_column(String(16))
+    dataset_version: Mapped[str] = mapped_column(String(64))
+    dataset_split: Mapped[str] = mapped_column(String(16), default="dev")
+    kb_snapshot: Mapped[str] = mapped_column(String(128))
+    git_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str] = mapped_column(String(64))
+    embedding_model: Mapped[str] = mapped_column(String(64))
+    config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class BackgroundJob(Base):
+    """持久后台任务：MySQL 是用户可见状态的事实源，Redis 只负责投递。"""
+
+    __tablename__ = "background_jobs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_type: Mapped[str] = mapped_column(String(32), index=True)
+    resource_type: Mapped[str] = mapped_column(String(32), index=True)
+    resource_id: Mapped[str] = mapped_column(String(96), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    progress_current: Mapped[int] = mapped_column(Integer, default=0)
+    progress_total: Mapped[int] = mapped_column(Integer, default=0)
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    idempotency_key: Mapped[str] = mapped_column(String(255), index=True)
+    active_key: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
+    requested_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    queue_job_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class SuggestedQuestion(Base):
+    """招新首页推荐问题；只允许人工审核后的问题对外展示。"""
+
+    __tablename__ = "suggested_questions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    category: Mapped[str] = mapped_column(String(64), index=True)
+    question: Mapped[str] = mapped_column(String(500))
+    required_level: Mapped[str] = mapped_column(String(16), default="guest", index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    source_type: Mapped[str] = mapped_column(String(16), default="manual")
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class AnswerFeedback(Base):
+    """回答反馈：保留只读快照，不携带私人长期记忆。"""
+
+    __tablename__ = "answer_feedback"
+    __table_args__ = (UniqueConstraint("message_id", "identity_key", name="uq_feedback_message_identity"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), index=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    anonymous_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    identity_key: Mapped[str] = mapped_column(String(96))
+    rating: Mapped[str] = mapped_column(String(16), index=True)
+    reason_code: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    comment: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    reviewer_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    resolution_note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evaluation_candidate: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

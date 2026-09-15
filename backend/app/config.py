@@ -52,6 +52,27 @@ class Settings(BaseSettings):
     initial_admin_username: str = "admin"
     initial_admin_password: str = ""
     initial_admin_nickname: str = "总管理员"
+    audit_hash_salt: str = ""  # IP 审计哈希盐；为空时复用 JWT_SECRET，不得提交真实值
+
+    # ----- 文档治理（M1：AI 初标 + 人工审核后发布）-----
+    document_governance_enabled: bool = True
+    document_publish_requires_admin: bool = True
+    review_separation_enabled: bool = False
+    legacy_documents_auto_published: bool = True
+    document_expiry_warning_days: int = 7
+    sensitive_scan_enabled: bool = True
+
+    # ----- 持久后台任务（M4）-----
+    task_mode: str = "inline"  # inline / rq
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    rq_queue_name: str = "rag-jobs"
+    job_max_retries: int = 3
+    job_stale_seconds: int = 600
+    job_lock_ttl_seconds: int = 900
+
+    # ----- 招新反馈（M5）-----
+    feedback_comment_max_length: int = 1000
+    feedback_rate_limit_per_hour: int = 20
 
     # ----- 存储（相对路径统一锚定项目根目录，与运行目录无关）-----
     chroma_persist_dir: str = "./data/chroma"
@@ -68,6 +89,19 @@ class Settings(BaseSettings):
     # 相关命中 0.5+，故从设计文档建议值 0.3 上调到 0.45，防噪声混入引用
     similarity_threshold: float = 0.45
     max_context_tokens: int = 3000
+
+    # ----- 回答证据门槛（最终召回结果进入 Prompt 前）-----
+    evidence_gate_enabled: bool = True
+    evidence_min_similarity: float = 0.45
+    evidence_min_lexical_coverage: float = 0.50
+    evidence_min_supporting_chunks: int = 1
+    evidence_rerank_enabled: bool = True
+    evidence_rerank_accept_score: float = 0.22
+    evidence_rerank_reject_score: float = 0.15
+    evidence_judge_enabled: bool = True
+    evidence_judge_max_chunks: int = 3
+    evidence_judge_model: str = ""  # 空值表示复用主对话模型
+    evidence_fail_closed: bool = True  # 外部判定失败时宁可拒答，不把弱证据交给模型
 
     # ----- 混合检索（Phase 3-06）-----
     hybrid_retrieval_enabled: bool = True   # 总开关；false → 行为与 Phase 2 完全一致

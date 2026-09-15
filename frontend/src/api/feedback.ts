@@ -1,0 +1,12 @@
+import { apiFetch, parseApiError } from "./client";
+import type { AnswerFeedback, SuggestedQuestion } from "../types";
+
+export async function listSuggestedQuestions(): Promise<SuggestedQuestion[]> { const r=await apiFetch("/api/chat/suggested-questions"); if(!r.ok) throw await parseApiError(r); return r.json(); }
+export async function saveAnswerFeedback(messageId:number, data:{rating:"helpful"|"unhelpful";reason_code?:string;comment?:string}):Promise<AnswerFeedback>{const r=await apiFetch(`/api/chat/messages/${messageId}/feedback`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});if(!r.ok)throw await parseApiError(r);return r.json();}
+export async function listFeedback(params:Record<string,string>={}):Promise<{total:number;items:AnswerFeedback[]}>{const q=new URLSearchParams(params);const r=await apiFetch(`/api/admin/feedback?${q}`);if(!r.ok)throw await parseApiError(r);return r.json();}
+export async function transitionFeedback(id:string,action:"triage"|"resolve"|"ignore",note:string):Promise<AnswerFeedback>{const r=await apiFetch(`/api/admin/feedback/${id}/${action}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({resolution_note:note})});if(!r.ok)throw await parseApiError(r);return r.json();}
+export async function addEvaluationCandidate(id:string):Promise<AnswerFeedback>{const r=await apiFetch(`/api/admin/feedback/${id}/evaluation-candidate`,{method:"POST"});if(!r.ok)throw await parseApiError(r);return r.json();}
+export async function listAdminQuestions():Promise<SuggestedQuestion[]>{const r=await apiFetch("/api/admin/suggested-questions");if(!r.ok)throw await parseApiError(r);return r.json();}
+export async function createSuggestedQuestion(data:Omit<SuggestedQuestion,"id">):Promise<SuggestedQuestion>{const r=await apiFetch("/api/admin/suggested-questions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});if(!r.ok)throw await parseApiError(r);return r.json();}
+export async function updateSuggestedQuestion(id:string,data:Omit<SuggestedQuestion,"id">):Promise<SuggestedQuestion>{const r=await apiFetch(`/api/admin/suggested-questions/${id}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});if(!r.ok)throw await parseApiError(r);return r.json();}
+export async function deleteSuggestedQuestion(id:string):Promise<void>{const r=await apiFetch(`/api/admin/suggested-questions/${id}`,{method:"DELETE"});if(!r.ok)throw await parseApiError(r);}
