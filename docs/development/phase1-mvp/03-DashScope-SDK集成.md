@@ -23,7 +23,7 @@
   - 超时设置（connect / read），超时抛自定义 `LLMError`
   - 备用模型切换预留：`LLM_MODEL_FALLBACK` 配置（qwen-plus → qwen-max）
 - [ ] 速率控制：embedding 按批次调用（建议 16 条/批），批间间隔限制 QPS
-- [ ] `scripts/smoke_test.py`：一条对话 + 一条 embedding 的冒烟脚本（不入测试套件，手动执行）
+- [ ] `scripts/smoke/smoke_test.py`：一条对话 + 一条 embedding 的冒烟脚本（不入测试套件，手动执行）
 
 ## 3. 设计要点
 
@@ -42,7 +42,7 @@ backend/app/llm/
 
 backend/
 ├── config.py          # 追加 LLM_MODEL、EMBEDDING_MODEL、LLM_MODEL_FALLBACK、LLM_TIMEOUT 等字段
-└── scripts/smoke_test.py   # 冒烟验证
+└── scripts/smoke/smoke_test.py   # 冒烟验证
 ```
 
 ## 5. 验收标准

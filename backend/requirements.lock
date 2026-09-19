@@ -62,6 +62,7 @@ lxml==6.1.2
 mako==1.4.1
 markdown-it-py==4.2.0
 markupsafe==3.0.3
+mcp==1.30.0
 mdit-py-plugins==0.6.1
 mdurl==0.1.2
 mmh3==5.3.0
@@ -134,6 +135,7 @@ shellingham==1.5.4
 six==1.17.0
 smart-open==8.0.1
 soupsieve==2.9.2
+sse-starlette==3.4.11
 spacy==3.8.16
 spacy-legacy==3.0.12
 spacy-loggers==1.0.5

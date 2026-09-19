@@ -15,14 +15,14 @@
 ## 2. 任务拆解
 
 - [ ] 安装解析依赖：`pymupdf`（PDF）、`python-docx`（DOCX）、`unstructured`（PPT/Excel/HTML/未知格式；其依赖自带 python-pptx、openpyxl）
-- [ ] `app/core/document_loader.py`：格式分发（见 §3.1）
+- [ ] `app/core/documents/parsing/document_loader.py`：格式分发（见 §3.1）
   - `.pdf` → PyMuPDF 逐页提取，记录 `page`
   - `.md` / `.txt` → 直读（优先 UTF-8，失败回退 GBK）
   - `.docx` → python-docx 合并段落，尽量保留章节信息
   - `.pptx` / `.xlsx` / `.html` → unstructured 解析（输出元素列表，含 slide/sheet/表格结构）
   - 其余 / 解析失败 → 四级兜底链（见 §3.2）
-- [ ] `app/core/cleaner.py`：文本清洗 —— 去除乱码字符（非法 Unicode）、合并断行、去除页眉页脚（正则 + 启发式）
-- [ ] `app/core/chunker.py`：按格式选择切块策略（见 §3.3），超长块递归字符分割 `chunk_size=512, overlap=64`（§4.1）
+- [ ] `app/core/documents/parsing/cleaner.py`：文本清洗 —— 去除乱码字符（非法 Unicode）、合并断行、去除页眉页脚（正则 + 启发式）
+- [ ] `app/core/documents/parsing/chunker.py`：按格式选择切块策略（见 §3.3），超长块递归字符分割 `chunk_size=512, overlap=64`（§4.1）
 - [ ] 每个 chunk 生成完整元数据（§3.4 schema）
 - [ ] 上传保存：`data/uploads/{kb_id}/{doc_id}/原始文件名`，`doc_id` 用 UUID（或内容 hash 去重）
 - [ ] 单元测试：`tests/test_chunker.py`（中文切分不破句、overlap 生效、元数据齐全、PPT/Excel 样例）

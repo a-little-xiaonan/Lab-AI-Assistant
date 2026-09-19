@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from app.core import rag_pipeline
-from app.core.retriever import RetrievedChunk
+from app.core.retrieval.retriever import RetrievedChunk
 from app.llm.errors import LLMError
 
 

@@ -9,9 +9,10 @@ import logging
 import time
 from collections.abc import Iterator
 
-from dashscope import Generation, TextEmbedding, TextReRank
+from dashscope import Generation, MultiModalConversation, TextEmbedding, TextReRank
 
 from app.config import settings
+from app.core.agent.runtime import current_budget, timeout_seconds
 from app.llm.errors import LLMError
 
 logger = logging.getLogger(__name__)
@@ -35,18 +36,64 @@ def _api_key() -> str:
     return key
 
 
+def _base_address() -> dict[str, str]:
+    """按单次请求传入地址，避免更改 SDK 全局状态影响其他客户端。"""
+    return {"base_address": settings.dashscope_base_url} if settings.dashscope_base_url else {}
+
+
+def _is_multimodal(model: str) -> bool:
+    return model == "qwen3.8-flash" or model.startswith("qwen3.8-flash-")
+
+
+def _multimodal_messages(messages: list[dict]) -> list[dict]:
+    converted = []
+    for message in messages:
+        item = message.copy()
+        content = item.get("content")
+        if isinstance(content, str):
+            item["content"] = [{"text": content}] if content else []
+        converted.append(item)
+    return converted
+
+
+def _model_call(*, model: str, messages: list[dict], **kwargs):
+    if _is_multimodal(model):
+        kwargs.setdefault("result_format", "message")
+        return MultiModalConversation.call(model=model, messages=_multimodal_messages(messages),
+                                           **kwargs)
+    return Generation.call(model=model, messages=messages, **kwargs)
+
+
+def _output_text(output) -> str:
+    if not output:
+        return ""
+    if isinstance(output.get("text"), str):
+        return output["text"]
+    choices = output.get("choices") or []
+    if not choices:
+        return ""
+    content = choices[0].get("message", {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return ""
+
+
 def _retry(fn, *args, **kwargs):
     """指数退避重试：429/5xx 状态码或网络异常时重试，最多 MAX_RETRIES 次。"""
     last_err = None
     for attempt in range(MAX_RETRIES):
         try:
+            if current_budget.get():
+                kwargs["timeout"] = timeout_seconds(kwargs.get("timeout", settings.llm_timeout))
             resp = fn(*args, **kwargs)
             if resp.status_code == 200:
                 return resp
             if resp.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES - 1:
                 wait = 2 ** attempt
                 logger.warning("DashScope 返回 %s，%.1fs 后重试（第 %d 次）", resp.status_code, wait, attempt + 1)
-                time.sleep(wait)
+                time.sleep(timeout_seconds(wait))
                 continue
             raise LLMError(
                 code=f"llm_status_{resp.status_code}",
@@ -59,8 +106,47 @@ def _retry(fn, *args, **kwargs):
             if attempt < MAX_RETRIES - 1:
                 wait = 2 ** attempt
                 logger.warning("模型调用异常：%s，%.1fs 后重试（第 %d 次）", exc, wait, attempt + 1)
-                time.sleep(wait)
+                time.sleep(timeout_seconds(wait))
     raise LLMError(code="llm_call_failed", message=f"模型调用失败：{last_err}")
+
+
+def tool_completion(messages: list[dict], tools: list[dict], *, timeout: float) -> dict:
+    """原生工具消息协议。预算内单次决策，不复用无界重试。"""
+    try:
+        resp = _model_call(
+            model=settings.llm_model, messages=messages, tools=tools,
+            result_format="message", api_key=_api_key(), stream=False,
+            timeout=timeout_seconds(timeout),
+            **_base_address(),
+        )
+        if resp.status_code != 200:
+            raise LLMError("agent_route_failed", "工具选择服务暂不可用，请稍后重试。")
+        message = (resp.output or {}).get("choices", [])[0]["message"]
+        content = message.get("content") or ""
+        calls = message.get("tool_calls") or []
+        if not isinstance(content, str) or not isinstance(calls, list) or len(calls) > 8:
+            raise ValueError("invalid tool message")
+        seen = set()
+        normalized = []
+        for call in calls:
+            cid, fn = call["id"], call["function"]
+            if (not isinstance(cid, str) or not cid or len(cid) > 200 or cid in seen
+                    or call.get("type") != "function"
+                    or not isinstance(fn.get("name"), str)
+                    or not isinstance(fn.get("arguments"), str)):
+                raise ValueError("invalid tool call")
+            seen.add(cid)
+            normalized.append({"id": cid, "type": "function", "function": {
+                "name": fn["name"], "arguments": fn["arguments"],
+            }})
+        result = {"role": "assistant", "content": content}
+        if normalized:
+            result["tool_calls"] = normalized
+        return result
+    except LLMError:
+        raise
+    except Exception:
+        raise LLMError("agent_route_failed", "工具选择失败或响应格式无效，请稍后重试。") from None
 
 
 def chat_completion(messages: list[dict], model: str | None = None, stream: bool = False) -> str:
@@ -68,14 +154,15 @@ def chat_completion(messages: list[dict], model: str | None = None, stream: bool
     key = _api_key()
     model = model or settings.llm_model
     resp = _retry(
-        Generation.call,
+        _model_call,
         model=model,
         messages=messages,
         api_key=key,
         stream=stream,
         timeout=settings.llm_timeout,
+        **_base_address(),
     )
-    text = (resp.output or {}).get("text") or ""
+    text = _output_text(resp.output)
     if not text.strip():
         raise LLMError(code="llm_empty_response", message="模型返回为空")
     return text
@@ -131,13 +218,14 @@ def chat_completion_stream(messages: list[dict], model: str | None = None) -> It
     key = _api_key()
     model = model or settings.llm_model
     gen = _start_stream_with_retry(
-        lambda: Generation.call(
+        lambda: _model_call(
             model=model,
             messages=messages,
             api_key=key,
             stream=True,
             incremental_output=True,
             timeout=settings.llm_stream_timeout,
+            **_base_address(),
         )
     )
     prev = ""
@@ -148,7 +236,7 @@ def chat_completion_stream(messages: list[dict], model: str | None = None) -> It
                 code="llm_stream_interrupted",
                 message=f"流式输出中断（{chunk.status_code}）：{getattr(chunk, 'message', '') or chunk.code}",
             )
-        text = getattr(getattr(chunk, "output", None), "text", None) or ""
+        text = _output_text(getattr(chunk, "output", None))
         if text.startswith(prev):
             delta = text[len(prev):]  # merge 模式：累积 → 切差量
         else:
@@ -180,6 +268,7 @@ def embed_texts(
             dimension=EMBEDDING_DIM,
             api_key=key,
             timeout=settings.llm_timeout,
+            **_base_address(),
         )
         # 注意：dashscope 1.27 的 TextEmbedding 响应 output 是 dict（实测），
         # 而 Generation 的 output 是对象 —— 两处访问方式不同，勿统一
@@ -228,6 +317,7 @@ def rerank_texts(
         top_n=len(documents),
         api_key=key,
         timeout=settings.llm_timeout,
+        **_base_address(),
     )
     results = sorted(resp.output.results, key=lambda r: r.relevance_score, reverse=True)
     return [(r.index, r.relevance_score) for r in results]

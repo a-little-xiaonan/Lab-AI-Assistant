@@ -1,6 +1,6 @@
 # QA 评估样例集（Phase 2-04 基线）
 
-用于 `backend/scripts/eval_run.py` 批量评估 RAG 效果，作为 Phase 3（Query Rewrite / Re-ranking 等）的对比基线。
+用于 `backend/scripts/evaluation/eval_run.py` 批量评估 RAG 效果，作为 Phase 3（Query Rewrite / Re-ranking 等）的对比基线。
 
 - **类别约定**：`normal` 正常问答（知识库有答案）/ `no-answer` 无答案题（应明确告知未找到）/ `multi-source` 多来源题 / `followup` 追问题（依赖对话历史）
 - **打分规则**（人工三档，1-3 分，填在 results 文件的空表里）：

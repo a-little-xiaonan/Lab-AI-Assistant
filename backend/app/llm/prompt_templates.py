@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from app.core.models import Chunk
+from app.core.documents.parsing.models import Chunk
 
 RAG_ANSWER_SYSTEM = """你是一个专业的知识助手。请仅基于以下参考资料回答用户问题。
 如果参考资料中没有相关信息，请明确告知用户你无法找到相关内容。

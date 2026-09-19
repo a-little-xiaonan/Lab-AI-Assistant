@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from sqlalchemy import select
 
-from app.api.chat import _sse_stream
+from app.api.conversation.chat import _sse_stream
 from app.llm.errors import LLMError
 from app.models.database import ChatSession, Message
 from app.models.schemas import ChatRequest
@@ -51,7 +51,7 @@ def test_chat_stream_full_flow(client):
     deltas = ["你", "好，", "有什么可以帮您？"]
     sources = [{"source_file": "手册.pdf", "page": 3, "snippet": "内容片段"}]
     with patch(
-        "app.api.chat.answer_stream", side_effect=lambda *a, **k: _fake_stream(deltas, sources=sources)
+        "app.api.conversation.chat.answer_stream", side_effect=lambda *a, **k: _fake_stream(deltas, sources=sources)
     ):
         with client.stream(
             "POST", "/api/chat", json={"message": "你好", "stream": True}
@@ -83,7 +83,7 @@ def test_chat_stream_error_frame(client):
         yield {"type": "delta", "text": "部分内容"}
         raise LLMError("llm_stream_interrupted", "流式输出中断")
 
-    with patch("app.api.chat.answer_stream", side_effect=lambda *a, **k: fake_stream()):
+    with patch("app.api.conversation.chat.answer_stream", side_effect=lambda *a, **k: fake_stream()):
         with client.stream(
             "POST", "/api/chat", json={"message": "你好", "stream": True}
         ) as r:
@@ -120,7 +120,7 @@ def test_chat_stream_disconnect_keeps_no_partial_message(db_session):
     db_session.commit()
 
     req = ChatRequest(message="你好", stream=True)
-    with patch("app.api.chat.answer_stream", side_effect=lambda *a, **k: fake_stream()):
+    with patch("app.api.conversation.chat.answer_stream", side_effect=lambda *a, **k: fake_stream()):
         frames = asyncio.run(_collect_frames(_sse_stream(req, FakeRequest(), db_session, session)))
 
     assert frames[0].startswith("event: meta")
@@ -135,7 +135,7 @@ async def _collect_frames(gen):
 
 def test_chat_non_stream_regression(client):
     """stream=false：响应结构与 Phase 1 一致，user+assistant 成对落库，未知 session 自动创建。"""
-    with patch("app.api.chat.answer", return_value={"answer": "你好！", "sources": []}):
+    with patch("app.api.conversation.chat.answer", return_value={"answer": "你好！", "sources": []}):
         r = client.post("/api/chat", json={"message": "你好"})
     assert r.status_code == 200
     assert r.json() == {"answer": "你好！", "sources": []}

@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 
 from app.config import settings
-from app.core.retriever import estimate_tokens
+from app.core.retrieval.retriever import estimate_tokens
 from app.llm import qwen
 from app.llm.errors import LLMError
 from app.llm.prompt_templates import build_summarize_history_messages

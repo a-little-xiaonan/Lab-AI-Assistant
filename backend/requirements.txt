@@ -14,6 +14,8 @@ chromadb==1.5.9
 
 # LLM
 dashscope
+mcp>=1.30,<2.0
+httpx>=0.28,<1.0
 
 # 存储（SQLite 或 MySQL + pymysql）
 sqlalchemy

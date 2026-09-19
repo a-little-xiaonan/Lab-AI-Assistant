@@ -1,8 +1,8 @@
 """分块器纯逻辑测试（无需 API key）。"""
 import pytest
 
-from app.core.chunker import fixed_split
-from app.core.models import RawElement
+from app.core.documents.parsing.chunker import fixed_split
+from app.core.documents.parsing.models import RawElement
 
 
 def test_short_text_kept_whole():
@@ -47,7 +47,7 @@ def test_empty_text():
 
 
 def test_chunk_metadata_and_no_cross_structure():
-    from app.core.chunker import chunk
+    from app.core.documents.parsing.chunker import chunk
 
     elements = [
         RawElement(text="甲" * 30, page=1),
@@ -69,7 +69,7 @@ def test_chunk_metadata_and_no_cross_structure():
 
 
 def test_overlap_never_crosses_structure_blocks():
-    from app.core.chunker import chunk
+    from app.core.documents.parsing.chunker import chunk
 
     # 两个结构块都要被切碎：块间不得有内容交叉
     elements = [

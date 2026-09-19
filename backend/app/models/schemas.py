@@ -61,6 +61,16 @@ class UserMemoryUpdate(BaseModel):
     content: str = Field(min_length=1, max_length=500)
 
 
+class ChunkUpdate(BaseModel):
+    """单个文档分块的乐观锁更新。
+
+    expected_updated_at 必须来自最近一次分块查询，避免管理员之间静默覆盖。
+    """
+
+    text: str = Field(min_length=1, max_length=20_000)
+    expected_updated_at: datetime
+
+
 class UserStatusUpdate(BaseModel):
     status: str = Field(pattern="^(active|disabled)$")
 

@@ -55,6 +55,19 @@ class VectorStore:
                 metadatas=[c.metadata() for c in chunks],
             )
 
+    def upsert_chunk(self, kb_id: str, chunk, embedding: list[float],
+                     suffix: str = "docs") -> None:
+        """覆盖单个 chunk，供人工校订后同步正式检索索引。"""
+        chunk_id = f"{chunk.doc_id}_{chunk.chunk_index}"
+        with self._lock:
+            coll = self._get_collection(kb_id, suffix)
+            coll.upsert(
+                ids=[chunk_id],
+                documents=[chunk.text],
+                embeddings=[embedding],
+                metadatas=[chunk.metadata()],
+            )
+
     def query(self, kb_id: str, query_embedding: list[float], top_k: int) -> list[tuple[str, str, dict, float]]:
         """返回 (chunk_id, text, metadata, distance) 列表，按距离升序（最近优先）。
 

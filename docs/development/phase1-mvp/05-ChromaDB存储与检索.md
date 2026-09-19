@@ -19,13 +19,13 @@
   - `query(kb_id, query_embedding, top_k)` → `(chunk_text, score, metadata)`
   - `delete_document(kb_id, doc_id)` / `delete_collection(kb_id)`
   - persist 目录来自 `settings.CHROMA_PERSIST_DIR`（默认 `./data/chroma`）
-- [ ] `app/core/embedder.py`：调用 `qwen.embed_texts`，分批向量化 + 入库，带进度回调（前端/日志用）
-- [ ] `app/core/retriever.py`：检索接口，参数对齐 §5 建议值
+- [ ] `app/core/retrieval/indexing/embedder.py`：调用 `qwen.embed_texts`，分批向量化 + 入库，带进度回调（前端/日志用）
+- [ ] `app/core/retrieval/retriever.py`：检索接口，参数对齐 §5 建议值
   - `top_k = 5~10`（settings.RETRIEVAL_TOP_K，默认 5）
   - `similarity_threshold = 0.3` 过滤（低于阈值直接丢弃，返回空也不硬凑）
   - `max_context_tokens = 3000` 截断（按分数从高到低累积，超限截断）
 - [ ] 幂等写入：相同 `doc_id` 重复入库 → 先删旧 chunk 再插入（或按 `(doc_id, chunk_index)` 覆盖）
-- [ ] `scripts/index_demo.py`：冒烟 —— 2 个小文档入库 → 检索验证
+- [ ] `scripts/knowledge/index_demo.py`：冒烟 —— 2 个小文档入库 → 检索验证
 
 ## 3. 设计要点
 
@@ -40,9 +40,9 @@
 
 ```
 backend/app/store/vector_store.py   # ChromaDB 薄封装
-backend/app/core/embedder.py        # 向量化 + 入库编排
-backend/app/core/retriever.py       # 检索 + 阈值过滤 + token 截断
-backend/scripts/index_demo.py       # 冒烟脚本
+backend/app/core/retrieval/indexing/embedder.py        # 向量化 + 入库编排
+backend/app/core/retrieval/retriever.py       # 检索 + 阈值过滤 + token 截断
+backend/scripts/knowledge/index_demo.py       # 冒烟脚本
 backend/requirements.txt            # 追加 chromadb
 ```
 

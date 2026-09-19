@@ -4,7 +4,7 @@ import {
   createKnowledgeBase as apiCreateKb,
   deleteKnowledgeBase as apiDeleteKb,
   listKnowledgeBases,
-} from "../api/knowledgeBases";
+} from "../api/knowledge/knowledgeBases";
 import type { KnowledgeBase } from "../types";
 
 export const useKnowledgeBasesStore = defineStore("knowledgeBases", {

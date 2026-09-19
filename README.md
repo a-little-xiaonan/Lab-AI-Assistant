@@ -4,6 +4,7 @@
 
 - 后端：FastAPI + 通义千问（DashScope qwen-plus / text-embedding-v3）+ ChromaDB + MySQL/SQLite
 - 前端：Vite + Vue 3 + TypeScript + Element Plus（聊天界面）
+- 项目目录与代码入口：[docs/README.md](docs/README.md)
 - 技术设计文档：`docs/RAG-AI-Assistant-技术设计文档.md`；分阶段开发文档：`docs/development/`
 - 当前进度：**Phase 3 全部完成**；并已完成多用户基础能力：登录认证、角色权限、知识库授权、会话归属与用户级记忆隔离。
 
@@ -58,7 +59,7 @@ npm run build    # 类型检查 + 生产构建
 
 ```bash
 cd backend
-../.venv/bin/python scripts/promote_admin.py <你的用户名>
+../.venv/bin/python scripts/administration/promote_admin.py <你的用户名>
 ```
 
 3. 重新登录后，侧栏会出现“用户与角色”和“知识库管理”。管理员可分配 `student`、`editor`、`admin` 角色，并为知识库授予角色读取、编辑或管理权限。
@@ -86,19 +87,19 @@ TOPIC_RETRIEVAL_ENABLED=true
 
 ```bash
 # 无 key 也能玩的：解析预览（看任意文件切出多少块、元数据对不对）
-../.venv/bin/python scripts/parse_preview.py ../docs/RAG-AI-Assistant-技术设计文档.md
+../.venv/bin/python scripts/knowledge/parse_preview.py ../docs/RAG-AI-Assistant-技术设计文档.md
 
 # 有 key 后：冒烟测试（对话 + embedding 1024 维）
-../.venv/bin/python scripts/smoke_test.py
+../.venv/bin/python scripts/smoke/smoke_test.py
 
 # 流式实测（SSE 逐字输出）
-../.venv/bin/python scripts/smoke_test_stream.py
+../.venv/bin/python scripts/smoke/smoke_test_stream.py
 
 # 评估基线（跑 docs/eval/qa-samples.md 样例集 → results-日期.md，人工三档打分）
-../.venv/bin/python scripts/eval_run.py
+../.venv/bin/python scripts/evaluation/eval_run.py
 
 # 入库演示（把 tests/fixtures 下样例文档入库并检索；上传已异步化，脚本内会轮询状态）
-../.venv/bin/python scripts/index_demo.py
+../.venv/bin/python scripts/knowledge/index_demo.py
 
 # 单元测试（不需要 key）
 ../.venv/bin/python -m pytest tests/ -v
@@ -158,16 +159,20 @@ curl http://localhost:8100/api/stats
 backend/app/
 ├── main.py              # FastAPI 入口（CORS、路由注册、统一异常处理）
 ├── config.py            # 配置单例（唯一读环境变量处，相对路径锚定项目根）
-├── api/                 # 路由：health / stats / knowledge_base / documents / chat
-├── core/                # document_loader / chunker / embedder / retriever / rag_pipeline
-│   └── document_processing.py   # 上传后台处理 worker（解析→向量化→状态机）
+├── api/                 # conversation / identity / knowledge / operations / system
+│   └── router.py        # 业务子路由统一聚合入口
+├── core/
+│   ├── documents/       # parsing（加载/清洗/切分）+ lifecycle（处理/发布/重索引）
+│   ├── retrieval/       # indexing（索引）+ planning（查询规划）+ ranking（证据过滤/重排）
+│   └── rag_pipeline.py  # 问答生成主编排
+├── services/            # identity / knowledge / jobs / operations 业务服务
 ├── llm/                 # qwen.py（对话+流式+向量化+重试）、prompt_templates.py、errors.py
 ├── store/               # vector_store.py（ChromaDB 薄封装）、db.py（SQLite/MySQL）
 ├── models/              # schemas.py（Pydantic）、database.py（SQLAlchemy 表）
 └── memory/              # short_term.py（滑动窗口+摘要压缩）、memory_manager.py（实例注册表）
-backend/scripts/         # smoke_test / smoke_test_stream / index_demo / parse_preview / eval_run
+backend/scripts/         # administration / evaluation / knowledge / smoke
 backend/tests/           # 单测（无需 API key）
-frontend/                # Vite + Vue3 + TS + Element Plus（聊天界面）
+frontend/src/            # api / views / components 均按业务域分目录
 docs/eval/               # QA 评估样例集 + 基线结果
 data/                    # 运行时数据（gitignore）：chroma/、uploads/、app.db
 ```
@@ -186,6 +191,6 @@ data/                    # 运行时数据（gitignore）：chroma/、uploads/�
 - **长期记忆**（Phase 3-03）：每轮对话后台提取（LLM → 置信度过滤 → 向量入库 `kb_{kb_id}_memory`），提问时召回相关记忆拼入 prompt（参考资料 → 相关记忆 → 对话历史 → 问题）；按知识库隔离、跨会话共享；清理入口 `DELETE /api/memory/{session_id}`
 - **上传异步化**：Phase 2 起上传立即返回 202 + processing，后台处理完成后 status=ready/failed（失败带 error_message），前端轮询列表
 - **引用规范**：正文 `[来源: 文件名 P页码]` + 末尾「参考来源：」汇总段（同源合并、snippet ≤50 字）；幻觉防护（越界引用剔除、直写不存在的来源剔除）
-- **评估基线**：`docs/eval/qa-samples.md` 18 条样例 + `scripts/eval_run.py`，Phase 3 每个增强跑同一批对比
+- **评估基线**：`docs/eval/qa-samples.md` 18 条样例 + `scripts/evaluation/eval_run.py`，Phase 3 每个增强跑同一批对比
 - **并发**：ChromaDB 写入进程内锁串行（单进程 uvicorn 前提，`--workers >1` 需升级锁方案）
 - Phase 3：Query Rewrite / Re-ranking / 长期记忆 / 混合检索 / 文档重索引 / 前端知识库管理

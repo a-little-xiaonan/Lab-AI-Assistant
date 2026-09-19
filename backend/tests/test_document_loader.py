@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from app.core import document_loader
-from app.core.document_loader import DocumentParseError, UnsupportedFormatError
+from app.core.documents.parsing import document_loader
+from app.core.documents.parsing.document_loader import DocumentParseError, UnsupportedFormatError
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

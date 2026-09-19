@@ -26,7 +26,7 @@
   - 检索有结果但模型判定与问题无关 → 允许模型说明未找到（prompt 授权）
 - [x] 评估基线（`docs/eval/` 目录）：
   - 建立 10~20 条 QA 样例集：正常问答 / 无答案题 / 多来源题 / 追问题
-  - `scripts/eval_run.py`：批量跑样例 → 输出回答 + 引用 → 人工记录质量评分（如 引用正确性 / 回答准确性 / 告知明确性 三档打分）
+  - `scripts/evaluation/eval_run.py`：批量跑样例 → 输出回答 + 引用 → 人工记录质量评分（如 引用正确性 / 回答准确性 / 告知明确性 三档打分）
 - [x] 结果沉淀：`docs/eval/results-{date}.md`，作为 Phase 3 优化的前后对比基线
 
 ## 3. 设计要点
@@ -42,7 +42,7 @@
 ```
 backend/app/llm/prompt_templates.py   # 模板体系（重构 Phase 1-06）
 backend/app/core/rag_pipeline.py      # 场景分支 + 引用后处理
-backend/scripts/eval_run.py           # 评估脚本
+backend/scripts/evaluation/eval_run.py           # 评估脚本
 docs/eval/qa-samples.md               # QA 样例集（人工维护）
 docs/eval/results-*.md                # 每轮评估结果
 ```

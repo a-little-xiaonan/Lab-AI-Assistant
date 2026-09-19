@@ -16,6 +16,7 @@ os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 os.environ.setdefault("SSL_CERT_DIR", Path(certifi.where()).parent.as_posix())
 
 from pydantic_settings import BaseSettings, SettingsConfigDict  # noqa: E402
+from pydantic import Field  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +33,30 @@ class Settings(BaseSettings):
 
     # ----- DashScope（通义千问）-----
     dashscope_api_key: str = ""          # 启动时只 warning，调用时才校验（用户后填）
+    dashscope_base_url: str = ""         # 可选的业务空间专属 DashScope SDK 地址
     llm_model: str = "qwen-plus"
     llm_model_fallback: str = "qwen-max"  # 备用模型（预留，主模型失败时切换）
     embedding_model: str = "text-embedding-v3"
     llm_timeout: int = 60
     llm_stream_timeout: int = 300  # 流式超时放宽：长回答生成期间无单个块超时风险
+
+    # ----- 轻量 Agent（M1，启用需另行验收确认）-----
+    agent_enabled: bool = False
+    agent_max_tool_rounds: int = Field(default=5, ge=1, le=5)
+    agent_max_tool_calls: int = Field(default=8, ge=1, le=8)
+    agent_prepare_timeout_seconds: float = Field(default=30, gt=0, le=90)
+    tools_timezone: str = "Asia/Shanghai"
+    document_read_enabled: bool = False
+    calculator_enabled: bool = False
+    web_search_enabled: bool = False
+    web_read_enabled: bool = False
+    bailian_mcp_web_search_url: str = "https://dashscope.aliyuncs.com/api/v1/mcps/WebSearch/mcp"
+    bailian_mcp_web_search_tool: str = ""  # 空值时仅从发现到的单一搜索工具中选择
+    bailian_mcp_timeout_seconds: float = Field(default=8, gt=0, le=20)
+    web_page_timeout_seconds: float = Field(default=8, gt=0, le=20)
+    web_max_redirects: int = Field(default=3, ge=0, le=3)
+    web_max_response_bytes: int = Field(default=2 * 1024 * 1024, ge=1024, le=2 * 1024 * 1024)
+    web_page_max_chars: int = Field(default=12_000, ge=1000, le=20_000)
 
     # ----- 服务 -----
     app_host: str = "0.0.0.0"

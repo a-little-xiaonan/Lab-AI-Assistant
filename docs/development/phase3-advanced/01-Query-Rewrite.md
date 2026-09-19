@@ -12,7 +12,7 @@
 
 ## 2. 任务拆解
 
-- [x] `app/core/query_rewrite.py`：
+- [x] `app/core/retrieval/planning/query_rewrite.py`：
   - `rewrite(query) -> list[str]`：LLM 改写，返回 1 条原查询 + 2~3 条改写（扩展同义词、拆分子问题、补全领域术语）
   - prompt 明确约束：「仅输出检索查询列表，每行一条，不要解释」—— 输出格式错误时降级（见设计要点）
 - [x] `rag_pipeline` 接入：

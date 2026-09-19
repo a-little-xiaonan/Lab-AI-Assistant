@@ -12,7 +12,7 @@
 
 ## 2. 任务拆解
 
-- [x] `app/core/reranker.py`：
+- [x] `app/core/retrieval/ranking/reranker.py`：
   - `rerank(query, candidates: list[Chunk]) -> list[Chunk]`（返回重排后的有序列表）
   - **后端 A — 本地 Cross-Encoder**：如 `BAAI/bge-reranker-base`（transformers，需首次下载模型）
   - **后端 B — DashScope re-rank API**（实现时以官方文档为准，如无现成接口则后端 A 为准）

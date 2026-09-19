@@ -27,8 +27,8 @@ def _record_factory(*args, **kwargs):
 
 logging.setLogRecordFactory(_record_factory)
 
-from app.api import admin, auth, chat, documents, feedback, health, jobs, knowledge_base, memory, reviews, role_applications, stats
 from app.api.errors import ApiError
+from app.api.router import api_router
 from app.config import ensure_data_dirs, settings
 from app.core.session_cleanup import cleanup_expired_sessions
 from app.llm.errors import LLMError
@@ -55,7 +55,7 @@ async def _periodic_cleanup() -> None:
 async def lifespan(_app: FastAPI):
     ensure_data_dirs()
     init_db()
-    from app.services.job_recovery import recover_stale_jobs
+    from app.services.jobs.job_recovery import recover_stale_jobs
     try:
         recovery = await asyncio.to_thread(recover_stale_jobs)
     except Exception:
@@ -80,16 +80,13 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # 路由统一 /api 前缀
-    for router in (health.router, stats.router, auth.router, admin.router, documents.router, chat.router,
-                   knowledge_base.router, memory.router, reviews.router, role_applications.router,
-                   jobs.router, feedback.router):
-        app.include_router(router, prefix="/api")
+    # 所有业务路由先在 app.api.router 聚合，再统一添加 /api 前缀。
+    app.include_router(api_router, prefix="/api")
 
     @app.exception_handler(ApiError)
     async def api_error_handler(req: Request, exc: ApiError):
         if exc.status in {401, 403}:
-            from app.services.audit import record_best_effort
+            from app.services.operations.audit import record_best_effort
             record_best_effort(
                 None, "authorization.denied", "http_request", req.url.path,
                 result="denied", reason_code=exc.code,

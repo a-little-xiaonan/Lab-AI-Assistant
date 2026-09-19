@@ -15,12 +15,14 @@ from __future__ import annotations
 import logging
 import re
 import time
+from dataclasses import dataclass
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.config import settings
-from app.core import retriever
-from app.core.evidence_gate import EvidenceDecision, filter_evidence
+from app.core.agent.runtime import current_budget, record_failure, submit_context, timeout_seconds
+from app.core.retrieval import retriever
+from app.core.retrieval.ranking.evidence_gate import EvidenceDecision, filter_evidence
 from app.llm import qwen
 from app.llm.errors import LLMError
 from app.llm.prompt_templates import (
@@ -78,14 +80,14 @@ def _retrieve_scope(kb_ids: list[str], query: str, history: str) -> tuple[list[r
 
     def _one(kb_id: str):
         if settings.query_planning_enabled or settings.topic_retrieval_enabled:
-            from app.core.retrieval_orchestrator import retrieve as orchestrated_retrieve
+            from app.core.retrieval.retrieval_orchestrator import retrieve as orchestrated_retrieve
 
             result = orchestrated_retrieve(kb_id, query, history)
             return result.chunks, result.answer_outline
         return retriever.retrieve(kb_id, query), ""
 
     with ThreadPoolExecutor(max_workers=min(4, len(kb_ids)), thread_name_prefix="scope-retrieve") as pool:
-        futures = {pool.submit(_one, kb_id): kb_id for kb_id in kb_ids}
+        futures = {submit_context(pool, _one, kb_id): kb_id for kb_id in kb_ids}
         for future in as_completed(futures):
             kb_id = futures[future]
             try:
@@ -96,6 +98,7 @@ def _retrieve_scope(kb_ids: list[str], query: str, history: str) -> tuple[list[r
                 if outline:
                     answer_outline = outline
             except Exception:
+                record_failure("knowledge_retrieval_failed")
                 logger.exception("知识库检索失败，跳过：kb=%s", kb_id)
 
     # 每库排序表均参与 RRF，不比较不同库的原始相似度/BM25 分数。
@@ -110,7 +113,7 @@ def _retrieve_scope(kb_ids: list[str], query: str, history: str) -> tuple[list[r
         chunk.score = scores[chunk.chunk_id]
     if settings.rerank_enabled and len(merged) > 1:
         try:
-            from app.core.reranker import rerank
+            from app.core.retrieval.ranking.reranker import rerank
 
             merged = rerank(query, merged)
         except Exception:
@@ -120,32 +123,67 @@ def _retrieve_scope(kb_ids: list[str], query: str, history: str) -> tuple[list[r
     return final, answer_outline
 
 
-def _prepare(
-    query: str, kb_id: str | list[str], history: str = "", user_id: str | None = None
-) -> tuple[list[retriever.RetrievedChunk], list[dict], EvidenceDecision]:
-    """检索 + 场景分支 + 长期记忆召回（answer 与 answer_stream 共享）。
+@dataclass
+class KnowledgeEvidence:
+    chunks: list[retriever.RetrievedChunk]
+    candidates: list[retriever.RetrievedChunk]
+    decision: EvidenceDecision
+    answer_outline: str = ""
+    status: str = "no_data"
+    failures: tuple[str, ...] = ()
 
-    检索为空/全部低于阈值 → no_context 模板（无参考资料段，明确告知未找到）；
-    检索失败降级纯 LLM（日志标记）。长期记忆（Phase 3-03）在两种场景都拼入，
-    记忆召回失败返回空段，不阻断主链路。
-    """
+
+def prepare_evidence(query: str, kb_id: str | list[str], history: str = "", *,
+                     strict: bool = False) -> KnowledgeEvidence:
+    """只检索及核验证据，不读取个人记忆、不生成答案。"""
     answer_outline = ""
+    failures = []
+    budget = current_budget.get()
+    failure_start = len(budget.failures) if budget else 0
     try:
+        timeout_seconds(settings.llm_timeout)
         if isinstance(kb_id, list):
             chunks, answer_outline = _retrieve_scope(kb_id, query, history)
         # 新编排仅在显式开启时接管；默认继续走原 retriever，保证当前稳定链路与测试契约不变。
         elif settings.query_planning_enabled or settings.topic_retrieval_enabled:
-            from app.core.retrieval_orchestrator import retrieve as orchestrated_retrieve
+            from app.core.retrieval.retrieval_orchestrator import retrieve as orchestrated_retrieve
 
             result = orchestrated_retrieve(kb_id, query, history)
             chunks = result.chunks
             answer_outline = result.answer_outline
         else:
             chunks = retriever.retrieve(kb_id, query)
+        if strict:
+            # 编排中的主题路也必须终检，不能仅依赖全局路过滤。
+            scope = kb_id if isinstance(kb_id, list) else [kb_id]
+            checked = []
+            for current in scope:
+                group = [c for c in chunks if c.metadata.get("knowledge_base_id", current) == current]
+                checked.extend(retriever.filter_published(current, group))
+            chunks = checked
     except Exception:
-        logger.exception("检索失败，降级为纯 LLM 回答：kb=%s", kb_id)
+        logger.exception("知识检索失败，本次无可用证据：kb=%s", kb_id)
+        failures.append("knowledge_retrieval_failed")
         chunks = []
+    timeout_seconds(settings.llm_timeout)
+    # 已通过 ACL、发布状态与有效期终检的候选可仅作为“展开定位”，不能直接回答。
+    candidates = list(chunks)
     chunks, evidence = filter_evidence(query, chunks)
+    if "failed" in evidence.reason:
+        failures.append("evidence_verification_failed")
+        if strict:
+            chunks = []
+    if budget:
+        failures.extend(budget.failures[failure_start:])
+    status = "ok" if chunks else "failed" if failures else "no_data"
+    return KnowledgeEvidence(chunks, candidates, evidence, answer_outline, status, tuple(set(failures)))
+
+
+def _prepare(
+    query: str, kb_id: str | list[str], history: str = "", user_id: str | None = None
+) -> tuple[list[retriever.RetrievedChunk], list[dict], EvidenceDecision]:
+    prepared = prepare_evidence(query, kb_id, history)
+    chunks, evidence, answer_outline = prepared.chunks, prepared.decision, prepared.answer_outline
     memories = format_memories(long_term_memory.recall(query, user_id)) if user_id else ""
     if chunks:
         messages = build_rag_answer_messages(

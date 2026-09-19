@@ -2,14 +2,14 @@
 // 知识库选择（kbId/列表）在 stores/knowledgeBases.ts（与管理页共用，Phase 3-04 迁出）
 import { defineStore } from "pinia";
 import { reactive } from "vue";
-import { chatStream } from "../api/chat";
+import { chatStream } from "../api/conversation/chat";
 import {
   batchDeleteSessions as apiBatchDeleteSessions,
   createSession as apiCreateSession,
   deleteSession as apiDeleteSession,
   getSession,
   listSessions,
-} from "../api/sessions";
+} from "../api/conversation/sessions";
 import type { MessageItem, SessionItem, Source } from "../types";
 
 export interface ChatMessage {
