@@ -1,18 +1,42 @@
 <template>
   <el-container class="kb-page" direction="vertical">
     <ModuleHeader section="knowledge" />
-    <el-header class="kb-header">
-      <div>
+    <el-header class="kb-header" :class="{ 'is-managing': showDetail }">
+      <div v-if="!showDetail">
+        <span class="header-eyebrow">知识中心</span>
         <h1>知识库工作台</h1>
         <p>管理实验室资料、文档主题与检索索引</p>
       </div>
-      <div>
+      <div v-else class="workspace-heading">
+        <el-button class="back-button" @click="closeDetail">← 返回知识库</el-button>
+        <div>
+          <span class="header-eyebrow">文档管理工作台</span>
+          <div class="workspace-title-row">
+            <h1>{{ detailKb?.name || "正在加载" }}</h1>
+            <el-tag v-if="detailKb" effect="plain">{{ accessLevelLabel(detailKb.access_level) }}</el-tag>
+          </div>
+          <p>{{ detailKb?.description || "管理该知识库的文档、分块、主题与检索索引" }}</p>
+        </div>
+      </div>
+      <div class="header-actions">
         <el-button @click="$router.push('/knowledge-bases/reviews')">审核工作台</el-button>
-        <el-button type="primary" @click="showCreate = true">＋ 新建知识库</el-button>
+        <template v-if="!showDetail">
+          <el-button type="primary" @click="showCreate = true">＋ 新建知识库</el-button>
+        </template>
+        <template v-else-if="detailKb">
+          <el-button :loading="detailLoading" @click="refreshDetail">刷新</el-button>
+          <el-button
+            type="warning"
+            :loading="reindexingId === detailKb.id"
+            @click="confirmReindex(detailKb)"
+          >
+            重建全库索引
+          </el-button>
+        </template>
       </div>
     </el-header>
 
-    <el-main>
+    <el-main v-if="!showDetail" class="overview-main">
       <!-- 统计栏 -->
       <el-row :gutter="16" class="stats-row">
         <el-col :span="6"><el-card shadow="never"><div class="stat"><div class="stat-num">{{ stats.document_count }}</div><div class="stat-label">文档总数</div></div></el-card></el-col>
@@ -22,8 +46,8 @@
       </el-row>
 
       <!-- 知识库卡片网格 -->
-      <el-row :gutter="16" class="kb-grid">
-        <el-col v-for="kb in kbStore.knowledgeBases" :key="kb.id" :span="8">
+      <div class="kb-grid">
+        <div v-for="kb in kbStore.knowledgeBases" :key="kb.id">
           <el-card shadow="hover" class="kb-card">
             <template #header>
               <div class="kb-card-header">
@@ -42,8 +66,154 @@
               <el-button size="small" type="danger" :disabled="kb.id === 'kb_default'" @click="confirmDeleteKb(kb)">删除</el-button>
             </div>
           </el-card>
-        </el-col>
-      </el-row>
+        </div>
+      </div>
+    </el-main>
+
+    <el-main v-else class="workspace-main">
+      <el-skeleton v-if="detailLoading && !detailKb" :rows="8" animated />
+      <template v-else>
+        <section class="workspace-summary">
+          <div class="summary-tile summary-tile-primary">
+            <span>文档总数</span>
+            <strong>{{ detailDocs.length }}</strong>
+            <small>当前知识库中的全部资料</small>
+          </div>
+          <div class="summary-tile">
+            <span>可检索文档</span>
+            <strong>{{ readyDocumentCount }}</strong>
+            <small>已完成解析与分块</small>
+          </div>
+          <div class="summary-tile">
+            <span>Chunk 数量</span>
+            <strong>{{ detailKb?.chunk_count || 0 }}</strong>
+            <small>参与检索的知识单元</small>
+          </div>
+          <div class="summary-tile">
+            <span>已发布</span>
+            <strong>{{ publishedDocumentCount }}</strong>
+            <small>通过审核并正式生效</small>
+          </div>
+        </section>
+
+        <el-card shadow="never" class="upload-card">
+          <template #header>
+            <div class="panel-heading">
+              <div>
+                <h2>上传新资料</h2>
+                <p>文件上传后会自动解析、分块并进入审核流程</p>
+              </div>
+              <el-tag type="info" effect="plain">PDF / MD / TXT / DOCX</el-tag>
+            </div>
+          </template>
+          <DocumentUpload v-if="detailKbId" :kb-id="detailKbId" @uploaded="handleDocumentUploaded" />
+        </el-card>
+
+        <el-card shadow="never" class="documents-card">
+          <template #header>
+            <div class="panel-heading documents-heading">
+              <div>
+                <h2>文档与检索单元</h2>
+                <p>共 {{ detailDocs.length }} 份文档，当前显示 {{ filteredDetailDocs.length }} 份</p>
+              </div>
+              <div class="document-filters">
+                <el-input
+                  v-model="documentSearch"
+                  clearable
+                  placeholder="搜索文件名或资料来源"
+                  class="document-search"
+                />
+                <el-select v-model="documentStatusFilter" class="status-filter">
+                  <el-option label="全部处理状态" value="all" />
+                  <el-option label="已就绪" value="ready" />
+                  <el-option label="处理中" value="processing" />
+                  <el-option label="处理失败" value="failed" />
+                </el-select>
+                <el-select v-model="governanceStatusFilter" class="status-filter">
+                  <el-option label="全部发布状态" value="all" />
+                  <el-option label="已发布" value="published" />
+                  <el-option label="待审核" value="pending" />
+                </el-select>
+              </div>
+            </div>
+          </template>
+
+          <el-alert
+            v-if="detailError"
+            :title="detailError"
+            type="error"
+            :closable="false"
+            class="detail-error"
+          />
+
+          <el-table
+            :data="filteredDetailDocs"
+            v-loading="detailLoading"
+            stripe
+            class="documents-table"
+            empty-text="没有符合条件的文档"
+          >
+            <el-table-column label="文档" min-width="260" fixed>
+              <template #default="{ row }">
+                <div class="document-cell">
+                  <div class="document-icon">{{ documentExtension(row.filename) }}</div>
+                  <div class="document-copy">
+                    <strong>{{ row.filename }}</strong>
+                    <span>{{ row.source_name || "未标注资料来源" }} · {{ formatTime(row.created_at) }}</span>
+                  </div>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="Chunk" width="105" align="center">
+              <template #default="{ row }"><strong class="chunk-count">{{ row.chunk_count }}</strong></template>
+            </el-table-column>
+            <el-table-column label="主题" min-width="190">
+              <template #default="{ row }">
+                <div class="topic-tags">
+                  <el-tag v-for="name in topicNames(row.topics).slice(0, 2)" :key="name" size="small" effect="plain">{{ name }}</el-tag>
+                  <span v-if="!row.topics?.length" class="muted-text">未标注</span>
+                  <el-tag v-if="pendingCount(row)" size="small" type="warning">AI 待审 {{ pendingCount(row) }}</el-tag>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="处理状态" width="120">
+              <template #default="{ row }">
+                <el-tag :type="processingStatusType(row.status)" effect="light">
+                  {{ processingStatusLabel(row.status) }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="发布状态" width="135">
+              <template #default="{ row }">
+                <el-tag :type="row.governance_status === 'published' ? 'success' : 'warning'" effect="plain">
+                  {{ row.version_review_status || row.governance_status }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="内容负责人" min-width="130">
+              <template #default="{ row }">{{ row.content_owner || "—" }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="300" fixed="right">
+              <template #default="{ row }">
+                <div class="document-actions">
+                  <el-button type="primary" plain size="small" @click="openChunks(row)">Chunk</el-button>
+                  <el-button size="small" @click="openTopics(row)">主题</el-button>
+                  <el-button size="small" @click="openGovernance(row)">治理</el-button>
+                  <el-dropdown trigger="click" @command="handleDocumentCommand($event, row)">
+                    <el-button size="small">更多 ···</el-button>
+                    <template #dropdown>
+                      <el-dropdown-menu>
+                        <el-dropdown-item command="reindex">重建该文档索引</el-dropdown-item>
+                        <el-dropdown-item command="delete" divided class="danger-menu-item">删除文档</el-dropdown-item>
+                      </el-dropdown-menu>
+                    </template>
+                  </el-dropdown>
+                </div>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-card>
+      </template>
     </el-main>
 
     <!-- 新建知识库弹窗 -->
@@ -70,56 +240,7 @@
       </template>
     </el-dialog>
 
-    <!-- 库详情抽屉：文档列表 -->
-    <el-drawer v-model="showDetail" :title="detailKb?.name ?? '文档管理'" size="560px">
-      <DocumentUpload v-if="detailKbId" :kb-id="detailKbId" @uploaded="refreshDetail" />
-      <el-table :data="detailDocs" size="small" style="margin-top: 12px">
-        <el-table-column prop="filename" label="文件名" min-width="140" show-overflow-tooltip />
-        <el-table-column prop="chunk_count" label="chunks" width="70" />
-        <el-table-column label="主题" min-width="110" show-overflow-tooltip>
-          <template #default="{ row }">
-            <span>{{ topicNames(row.topics).join("、") || "未标注" }}</span>
-            <el-tag v-if="pendingCount(row)" size="small" type="warning" style="margin-left: 5px">
-              AI 待审 {{ pendingCount(row) }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="状态" width="100">
-          <template #default="{ row }">
-            <el-tag v-if="row.status === 'ready'" type="success" size="small">ready</el-tag>
-            <el-tag v-else-if="row.status === 'failed'" type="danger" size="small">failed</el-tag>
-            <el-tag v-else size="small" type="warning">
-              {{ row.status === "processing" ? "处理中" : "重建中" }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="发布状态" width="110">
-          <template #default="{ row }">
-            <el-tag :type="row.governance_status === 'published' ? 'success' : 'warning'" size="small">
-              {{ row.version_review_status || row.governance_status }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="205">
-          <template #default="{ row }">
-            <el-button link size="small" @click="openChunks(row)">查看</el-button>
-            <el-button v-if="auth.isContentManager" link size="small" @click="openTopics(row)">审核主题</el-button>
-            <el-button v-if="auth.isContentManager" link size="small" @click="openGovernance(row)">治理</el-button>
-            <el-button link size="small" :loading="reindexingId === row.doc_id" @click="reindexDoc(row.doc_id)">重建</el-button>
-            <el-button link size="small" type="danger" @click="confirmDeleteDoc(row)">删除</el-button>
-          </template>
-        </el-table-column>
-      </el-table>
-      <el-alert
-        v-if="detailError"
-        :title="detailError"
-        type="error"
-        :closable="false"
-        style="margin-top: 8px"
-      />
-    </el-drawer>
-
-    <el-dialog v-model="showTopics" :title="`${topicDocument?.filename ?? ''} · 资料主题`" width="520px">
+    <el-dialog v-model="showTopics" :title="`${topicDocument?.filename ?? ''} · 资料主题`" width="680px">
       <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
         AI 推荐仅供审核，未审核标签不会参与定向检索；勾选后保存即视为实验室成员或管理员批准。
       </el-alert>
@@ -138,7 +259,7 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="showGovernance" :title="`${governanceDocument?.filename ?? ''} · 治理信息`" width="560px">
+    <el-dialog v-model="showGovernance" :title="`${governanceDocument?.filename ?? ''} · 治理信息`" width="680px">
       <el-form label-width="100px">
         <el-form-item label="内容负责人" required><el-input v-model="governanceForm.content_owner" maxlength="128" /></el-form-item>
         <el-form-item label="资料来源" required><el-input v-model="governanceForm.source_name" maxlength="255" /></el-form-item>
@@ -151,7 +272,7 @@
     </el-dialog>
 
     <!-- chunk 明细：大抽屉 + 左导航右详情 -->
-    <el-drawer v-model="showChunks" :title="chunksTitle" size="75%">
+    <el-drawer v-model="showChunks" :title="chunksTitle" size="92%" class="chunk-drawer">
       <div v-if="chunksLoading" class="chunks-loading">加载中...</div>
       <div v-else class="chunks-layout">
         <!-- 左：chunk 导航列表 -->
@@ -230,7 +351,7 @@
 </template>
 
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import DocumentUpload from "../../components/knowledge/DocumentUpload.vue";
 import ModuleHeader from "../../components/shared/ModuleHeader.vue";
@@ -264,8 +385,31 @@ const detailKbId = ref("");
 const detailKb = ref<KnowledgeBase | null>(null);
 const detailDocs = ref<DocumentItem[]>([]);
 const detailError = ref("");
+const detailLoading = ref(false);
+const documentSearch = ref("");
+const documentStatusFilter = ref("all");
+const governanceStatusFilter = ref("all");
 const reindexingId = ref(""); // 正在重建的 doc_id 或 kb_id（按钮 loading）
 const timers: number[] = [];
+
+const filteredDetailDocs = computed(() => {
+  const query = documentSearch.value.trim().toLowerCase();
+  return detailDocs.value.filter((doc) => {
+    const matchesQuery = !query || [doc.filename, doc.source_name, doc.content_owner]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(query));
+    const matchesStatus = documentStatusFilter.value === "all" || doc.status === documentStatusFilter.value;
+    const matchesGovernance = governanceStatusFilter.value === "all"
+      || (governanceStatusFilter.value === "published"
+        ? doc.governance_status === "published"
+        : doc.governance_status !== "published");
+    return matchesQuery && matchesStatus && matchesGovernance;
+  });
+});
+const readyDocumentCount = computed(() => detailDocs.value.filter((doc) => doc.status === "ready").length);
+const publishedDocumentCount = computed(
+  () => detailDocs.value.filter((doc) => doc.governance_status === "published").length,
+);
 
 // chunk 明细
 const showChunks = ref(false);
@@ -306,6 +450,21 @@ async function saveGovernance() {
 function formatTime(t: string | undefined | null): string {
   if (!t) return "—";
   return new Date(t).toLocaleString("zh-CN", { hour12: false });
+}
+
+function documentExtension(filename: string): string {
+  return filename.split(".").pop()?.slice(0, 4).toUpperCase() || "DOC";
+}
+
+function processingStatusLabel(status: string): string {
+  return { ready: "已就绪", failed: "处理失败", processing: "处理中", reindexing: "重建中" }[status] || status;
+}
+
+function processingStatusType(status: string): "success" | "danger" | "warning" | "info" {
+  if (status === "ready") return "success";
+  if (status === "failed") return "danger";
+  if (status === "processing" || status === "reindexing") return "warning";
+  return "info";
 }
 
 function topicNames(codes: string[] = []): string[] {
@@ -478,12 +637,26 @@ async function confirmDeleteKb(kb: KnowledgeBase) {
 
 async function openDetail(kbId: string) {
   detailKbId.value = kbId;
+  detailKb.value = null;
+  detailDocs.value = [];
+  documentSearch.value = "";
+  documentStatusFilter.value = "all";
+  governanceStatusFilter.value = "all";
   showDetail.value = true;
   await refreshDetail();
 }
 
+function closeDetail() {
+  showDetail.value = false;
+  detailKbId.value = "";
+  detailKb.value = null;
+  detailDocs.value = [];
+  detailError.value = "";
+}
+
 async function refreshDetail() {
   if (!detailKbId.value) return;
+  detailLoading.value = true;
   try {
     const detail = await getKnowledgeBaseDetail(detailKbId.value);
     detailKb.value = { id: detail.id, name: detail.name, description: detail.description, embedding_model: detail.embedding_model, access_level: detail.access_level, document_count: detail.document_count, chunk_count: detail.chunk_count, created_at: detail.created_at };
@@ -491,7 +664,18 @@ async function refreshDetail() {
     detailError.value = "";
   } catch (e) {
     detailError.value = (e as Error).message;
+  } finally {
+    detailLoading.value = false;
   }
+}
+
+async function handleDocumentUploaded() {
+  await Promise.all([refreshDetail(), refreshStats(), kbStore.load()]);
+}
+
+function handleDocumentCommand(command: string, row: DocumentItem) {
+  if (command === "reindex") void reindexDoc(row.doc_id);
+  if (command === "delete") void confirmDeleteDoc(row);
 }
 
 async function confirmDeleteDoc(row: DocumentItem) {
@@ -564,61 +748,259 @@ onBeforeUnmount(() => timers.forEach((t) => window.clearInterval(t)));
 <style scoped>
 .kb-page {
   height: 100%;
+  min-height: 100vh;
+  background: #f5f7fb;
 }
 .kb-header {
   height: auto;
-  min-height: 86px;
-  padding: 18px 28px;
+  min-height: 112px;
+  padding: 22px 32px;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 24px;
   border-bottom: 1px solid var(--el-border-color-light);
+  background: rgba(255, 255, 255, 0.96);
+  box-sizing: border-box;
 }
-.kb-header h1 { margin: 0 0 6px; font-size: 22px; }
+.kb-header.is-managing {
+  min-height: 132px;
+}
+.header-eyebrow {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--el-color-primary);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.kb-header h1 { margin: 0 0 7px; font-size: 26px; letter-spacing: -0.02em; }
 .kb-header p { margin: 0; color: var(--el-text-color-secondary); font-size: 13px; }
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.header-actions .el-button + .el-button { margin-left: 0; }
+.workspace-heading {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  min-width: 0;
+}
+.back-button {
+  align-self: flex-start;
+  margin-top: 2px;
+}
+.workspace-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.workspace-title-row h1 {
+  max-width: 560px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.overview-main,
+.workspace-main {
+  padding: 24px 32px 40px;
+  overflow: auto;
+}
 .stats-row {
-  margin-bottom: 16px;
+  margin-bottom: 20px;
 }
 .stat {
   text-align: center;
+  padding: 6px 0;
 }
 .stat-num {
-  font-size: 22px;
-  font-weight: 600;
+  font-size: 26px;
+  font-weight: 700;
 }
 .stat-label {
   font-size: 12px;
   color: var(--el-text-color-secondary);
-  margin-top: 2px;
+  margin-top: 4px;
+}
+.kb-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 18px;
+}
+.kb-card {
+  height: 100%;
+  border-radius: 12px;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.kb-card:hover {
+  transform: translateY(-2px);
 }
 .kb-card-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 .kb-name {
   font-weight: 600;
+  margin-right: auto;
 }
 .kb-desc {
   font-size: 13px;
   color: var(--el-text-color-secondary);
-  min-height: 20px;
-  margin: 0 0 8px;
+  min-height: 40px;
+  margin: 0 0 12px;
+  line-height: 1.6;
 }
 .kb-stats {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--el-text-color-secondary);
-  margin-bottom: 10px;
+  margin-bottom: 14px;
 }
 .kb-actions {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
 }
-.permission-add {
+.kb-actions .el-button + .el-button { margin-left: 0; }
+.workspace-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 18px;
+}
+.summary-tile {
+  min-height: 116px;
+  padding: 20px 22px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 14px;
+  background: #fff;
   display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+.summary-tile span {
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+}
+.summary-tile strong {
+  margin: 7px 0 3px;
+  font-size: 30px;
+  line-height: 1;
+}
+.summary-tile small {
+  margin-top: auto;
+  color: var(--el-text-color-placeholder);
+}
+.summary-tile-primary {
+  color: #fff;
+  border-color: transparent;
+  background: linear-gradient(135deg, #3567e9, #7357df);
+  box-shadow: 0 12px 28px rgba(62, 93, 210, 0.2);
+}
+.summary-tile-primary span,
+.summary-tile-primary small {
+  color: rgba(255, 255, 255, 0.78);
+}
+.upload-card,
+.documents-card {
+  border-radius: 14px;
+  margin-bottom: 18px;
+}
+.panel-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+}
+.panel-heading h2 {
+  margin: 0 0 5px;
+  font-size: 17px;
+}
+.panel-heading p {
+  margin: 0;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+.documents-heading {
+  align-items: flex-end;
+}
+.document-filters {
+  display: flex;
+  align-items: center;
   gap: 10px;
-  margin-bottom: 14px;
+}
+.document-search { width: 280px; }
+.status-filter { width: 160px; }
+.detail-error { margin-bottom: 14px; }
+.documents-table {
+  width: 100%;
+  --el-table-header-bg-color: #f8f9fc;
+  --el-table-row-hover-bg-color: #f6f8ff;
+}
+.document-cell {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 5px 0;
+}
+.document-icon {
+  width: 42px;
+  height: 42px;
+  flex-shrink: 0;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  font-size: 10px;
+  font-weight: 800;
+}
+.document-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.document-copy strong,
+.document-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.document-copy strong { font-size: 14px; }
+.document-copy span { color: var(--el-text-color-secondary); font-size: 12px; }
+.chunk-count {
+  color: var(--el-color-primary);
+  font-size: 15px;
+}
+.topic-tags {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.muted-text { color: var(--el-text-color-placeholder); font-size: 12px; }
+.document-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.document-actions .el-button + .el-button { margin-left: 0; }
+:global(.danger-menu-item) { color: var(--el-color-danger); }
+.upload-card :deep(.el-upload),
+.upload-card :deep(.el-upload-dragger) {
+  width: 100%;
+}
+.upload-card :deep(.el-upload-dragger) {
+  padding: 22px;
+  border-radius: 10px;
+  background: #fafbff;
 }
 .topic-option {
   display: flex;
@@ -637,14 +1019,16 @@ onBeforeUnmount(() => timers.forEach((t) => window.clearInterval(t)));
 }
 .chunks-layout {
   display: flex;
-  gap: 16px;
-  height: calc(100vh - 90px);
+  gap: 22px;
+  height: calc(100vh - 105px);
+  padding: 0 4px 10px;
+  box-sizing: border-box;
 }
 .chunk-nav-wrapper {
-  width: 220px;
+  width: 300px;
   flex-shrink: 0;
   border-right: 1px solid var(--el-border-color-light);
-  padding-right: 8px;
+  padding-right: 14px;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -659,8 +1043,8 @@ onBeforeUnmount(() => timers.forEach((t) => window.clearInterval(t)));
   padding-top: 8px;
 }
 .chunk-nav-item {
-  padding: 8px 10px;
-  border-radius: 6px;
+  padding: 12px 13px;
+  border-radius: 9px;
   cursor: pointer;
   margin-bottom: 6px;
   border: 1px solid var(--el-border-color-lighter);
@@ -673,14 +1057,14 @@ onBeforeUnmount(() => timers.forEach((t) => window.clearInterval(t)));
   border-color: var(--el-color-primary);
 }
 .chunk-nav-title {
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--el-color-primary);
 }
 .chunk-nav-preview {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--el-text-color-secondary);
-  margin-top: 2px;
+  margin-top: 5px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -735,5 +1119,35 @@ onBeforeUnmount(() => timers.forEach((t) => window.clearInterval(t)));
   white-space: pre-wrap;
   word-break: break-word;
   font-family: inherit;
+}
+@media (max-width: 1200px) {
+  .workspace-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .documents-heading { align-items: flex-start; flex-direction: column; }
+  .document-filters { width: 100%; }
+  .document-search { flex: 1; width: auto; }
+}
+@media (max-width: 820px) {
+  .kb-header,
+  .kb-header.is-managing {
+    align-items: flex-start;
+    flex-direction: column;
+    padding: 18px;
+  }
+  .header-actions { width: 100%; flex-wrap: wrap; }
+  .workspace-heading { align-items: flex-start; flex-direction: column; gap: 10px; }
+  .overview-main,
+  .workspace-main { padding: 18px; }
+  .stats-row :deep(.el-col-6) { max-width: 50%; flex: 0 0 50%; margin-bottom: 12px; }
+  .workspace-summary { grid-template-columns: 1fr 1fr; }
+  .document-filters { align-items: stretch; flex-direction: column; }
+  .document-search,
+  .status-filter { width: 100%; }
+  .chunk-nav-wrapper { width: 210px; }
+}
+@media (max-width: 560px) {
+  .workspace-summary { grid-template-columns: 1fr; }
+  .panel-heading { align-items: flex-start; flex-direction: column; }
+  .chunks-layout { gap: 10px; }
+  .chunk-nav-wrapper { width: 150px; }
 }
 </style>
