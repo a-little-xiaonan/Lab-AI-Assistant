@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     llm_timeout: int = 60
     llm_stream_timeout: int = 300  # 流式超时放宽：长回答生成期间无单个块超时风险
 
+    # ----- Context Cache POC（P0：默认关闭，不接入聊天主链路）-----
+    context_cache_poc_enabled: bool = False
+    context_cache_poc_model: str = ""  # 空值时复用 llm_model；需在业务空间确认显式缓存支持
+
     # ----- 回答依据路由（默认开启）-----
     intent_router_enabled: bool = True
     intent_route_timeout_seconds: float = Field(default=8, gt=0, le=30)

@@ -88,3 +88,47 @@ def test_stream_empty_output_raises():
         with pytest.raises(LLMError) as ei:
             list(qwen.chat_completion_stream([{"role": "user", "content": "x"}]))
     assert ei.value.code == "llm_empty_response"
+
+
+def test_context_cache_usage_supports_dict_and_missing_fields():
+    """缓存用量兼容 DashScope 常见字段，缺失字段保持未知而不是伪造 0。"""
+    usage = qwen.context_cache_usage(SimpleNamespace(usage={
+        "input_tokens": 2048,
+        "prompt_tokens_details": {
+            "cached_tokens": 1024,
+            "cache_creation_input_tokens": 0,
+        },
+    }))
+    assert usage.input_tokens == 2048
+    assert usage.cached_tokens == 1024
+    assert usage.cache_creation_input_tokens == 0
+    assert usage.cache_hit is True
+    assert qwen.context_cache_usage(SimpleNamespace()).cache_hit is None
+
+
+def test_context_cache_probe_keeps_query_after_cache_marker(monkeypatch):
+    """P0 仅允许稳定前缀进入缓存块，动态问题必须作为后续 user 消息。"""
+    monkeypatch.setattr(qwen.settings, "context_cache_poc_enabled", True)
+    chunks = _stream_resp([
+        SimpleNamespace(status_code=200, code="", message="", output={"text": "可以报名"}),
+        SimpleNamespace(status_code=200, code="", message="", output={"text": ""}, usage={
+            "input_tokens": 1500,
+            "prompt_tokens_details": {"cached_tokens": 1100, "cache_creation_input_tokens": 0},
+        }),
+    ])
+    with patch("app.llm.qwen.MultiModalConversation.call", return_value=chunks) as call:
+        result = qwen.probe_context_cache("固定资料" * 400, "零基础可以报名吗？", "qwen-test")
+    messages = call.call_args.kwargs["messages"]
+    assert messages[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert messages[1]["content"] == [{"text": "零基础可以报名吗？"}]
+    assert result.answer == "可以报名"
+    assert result.usage.cached_tokens == 1100
+    assert result.usage.cache_hit is True
+    assert result.ttft_seconds is not None
+
+
+def test_context_cache_probe_requires_explicit_switch(monkeypatch):
+    monkeypatch.setattr(qwen.settings, "context_cache_poc_enabled", False)
+    with pytest.raises(LLMError) as exc:
+        qwen.probe_context_cache("固定资料", "问题")
+    assert exc.value.code == "context_cache_poc_disabled"

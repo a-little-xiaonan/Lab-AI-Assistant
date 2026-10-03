@@ -8,6 +8,8 @@ import itertools
 import logging
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
+from typing import Any
 
 from dashscope import Generation, MultiModalConversation, TextEmbedding, TextReRank
 
@@ -27,6 +29,29 @@ _KEY_MISSING_HINT = (
     "未配置 DASHSCOPE_API_KEY：请将 .env.example 复制为 .env，"
     "填入阿里云百炼创建的 API Key 后重启服务"
 )
+
+
+@dataclass(frozen=True)
+class ContextCacheUsage:
+    """供应商返回的缓存用量；字段缺失时保持 None，不把未知误判为未命中。"""
+
+    input_tokens: int | None = None
+    cached_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+
+    @property
+    def cache_hit(self) -> bool | None:
+        return None if self.cached_tokens is None else self.cached_tokens > 0
+
+
+@dataclass(frozen=True)
+class ContextCacheProbeResult:
+    """P0 冒烟验证结果；不进入正常聊天响应，也不记录 Prompt 正文。"""
+
+    answer: str
+    usage: ContextCacheUsage
+    ttft_seconds: float | None
+    elapsed_seconds: float
 
 
 def _api_key() -> str:
@@ -78,6 +103,66 @@ def _output_text(output) -> str:
     if isinstance(content, list):
         return "".join(part.get("text", "") for part in content if isinstance(part, dict))
     return ""
+
+
+def _response_value(source: Any, field: str, default: Any = None) -> Any:
+    """兼容 DashScope 响应中的对象与字典字段访问。"""
+    if isinstance(source, dict):
+        return source.get(field, default)
+    return getattr(source, field, default)
+
+
+def _optional_int(value: Any) -> int | None:
+    """供应商缺字段或类型异常时保留未知状态，避免把异常值计为 0。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def context_cache_usage(response: Any) -> ContextCacheUsage:
+    """提取 DashScope/OpenAI 兼容响应中的缓存用量。
+
+    当前百炼响应会因模型或地域在 usage.prompt_tokens_details、
+    usage.cached_tokens 等位置返回命中数。这里仅做兼容读取；未返回字段
+    代表“无法观测”，不能据此认定缓存未命中。
+    """
+    usage = _response_value(response, "usage")
+    if usage is None:
+        return ContextCacheUsage()
+    details = _response_value(usage, "prompt_tokens_details", {}) or {}
+    cached = _response_value(details, "cached_tokens")
+    if cached is None:
+        cached = _response_value(usage, "cached_tokens")
+    created = _response_value(details, "cache_creation_input_tokens")
+    if created is None:
+        created = _response_value(usage, "cache_creation_input_tokens")
+    return ContextCacheUsage(
+        input_tokens=_optional_int(
+            _response_value(usage, "input_tokens", _response_value(usage, "prompt_tokens"))
+        ),
+        cached_tokens=_optional_int(cached),
+        cache_creation_input_tokens=_optional_int(created),
+    )
+
+
+def build_context_cache_probe_messages(stable_prefix: str, query: str) -> list[dict]:
+    """构造 P0 专用显式缓存消息，稳定前缀与动态问题严格分离。"""
+    if not stable_prefix.strip() or not query.strip():
+        raise ValueError("稳定前缀与测试问题均不能为空")
+    return [
+        {
+            "role": "system",
+            "content": [{
+                "type": "text",
+                "text": stable_prefix,
+                "cache_control": {"type": "ephemeral"},
+            }],
+        },
+        {"role": "user", "content": [{"text": query}]},
+    ]
 
 
 def _retry(fn, *args, **kwargs):
@@ -247,6 +332,73 @@ def chat_completion_stream(messages: list[dict], model: str | None = None) -> It
             yield delta
     if not emitted:
         raise LLMError(code="llm_empty_response", message="模型返回为空")
+
+
+def probe_context_cache(
+    stable_prefix: str,
+    query: str,
+    model: str | None = None,
+) -> ContextCacheProbeResult:
+    """执行 P0 显式缓存冒烟验证，返回缓存用量、TTFT 与完整回答。
+
+    该函数刻意固定使用 MultiModalConversation 的消息格式，以承载
+    cache_control 标记；它不被聊天主链路调用。功能开关关闭时直接拒绝，
+    防止脚本之外的调用产生额外模型费用。
+    """
+    if not settings.context_cache_poc_enabled:
+        raise LLMError(
+            code="context_cache_poc_disabled",
+            message="Context Cache POC 未开启，请先在 .env 设置 CONTEXT_CACHE_POC_ENABLED=true",
+        )
+    messages = build_context_cache_probe_messages(stable_prefix, query)
+    selected_model = model or settings.context_cache_poc_model or settings.llm_model
+    started = time.monotonic()
+    ttft_seconds: float | None = None
+    previous = ""
+    pieces: list[str] = []
+    usage = ContextCacheUsage()
+
+    stream = _start_stream_with_retry(
+        lambda: MultiModalConversation.call(
+            model=selected_model,
+            messages=messages,
+            api_key=_api_key(),
+            stream=True,
+            incremental_output=True,
+            timeout=settings.llm_stream_timeout,
+            **_base_address(),
+        )
+    )
+    for chunk in stream:
+        if chunk.status_code != 200:
+            raise LLMError(
+                code="context_cache_probe_interrupted",
+                message=f"Context Cache POC 流式响应中断（{chunk.status_code}）："
+                        f"{getattr(chunk, 'message', '') or chunk.code}",
+            )
+        observed = context_cache_usage(chunk)
+        if any(value is not None for value in (
+            observed.input_tokens,
+            observed.cached_tokens,
+            observed.cache_creation_input_tokens,
+        )):
+            usage = observed
+        text = _output_text(getattr(chunk, "output", None))
+        delta = text[len(previous):] if text.startswith(previous) else text
+        previous = text
+        if delta:
+            if ttft_seconds is None:
+                ttft_seconds = time.monotonic() - started
+            pieces.append(delta)
+    answer = "".join(pieces)
+    if not answer.strip():
+        raise LLMError(code="llm_empty_response", message="Context Cache POC 模型返回为空")
+    return ContextCacheProbeResult(
+        answer=answer,
+        usage=usage,
+        ttft_seconds=ttft_seconds,
+        elapsed_seconds=time.monotonic() - started,
+    )
 
 
 def embed_texts(
