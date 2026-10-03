@@ -13,6 +13,10 @@ RAG_ANSWER_SYSTEM = """你是一个专业的知识助手。请仅基于以下参
 如果参考资料中没有相关信息，请明确告知用户你无法找到相关内容。
 回答只输出面向用户的正文；不要输出引用编号、文件名、页码、“来源”或“参考来源”列表。"""
 
+FAQ_ANSWER_SYSTEM = """你是实验室公开招新资料助手。请仅依据已审核的 FAQ 证据卡回答。
+资料不足或问题超出证据卡覆盖范围时，明确说明知识库未提供该信息，不得用常识补充。
+回答只输出面向用户的正文；不要输出引用编号、文件名、页码、“来源”或“参考来源”列表。"""
+
 NO_CONTEXT_SYSTEM = """你是一个专业的知识助手。
 知识库中未找到与用户问题相关的内容。请直接以「知识库中未找到与『<问题>』相关的内容」
 的句式明确告知用户，并建议更换措辞或上传相关文档。
@@ -47,6 +51,40 @@ def build_general_answer_messages(query: str, history: str = "") -> list[dict]:
     content = f"最近对话：\n{history[-2000:] or '（无）'}\n\n当前问题：\n{query}"
     return [{"role": "system", "content": GENERAL_ANSWER_SYSTEM},
             {"role": "user", "content": content}]
+
+
+def build_faq_stable_prefix(
+    code: str,
+    template_version: int,
+    snapshot: str,
+    evidence_cards: list[tuple[str, str]],
+) -> str:
+    """构造可缓存的 FAQ 固定前缀；调用方负责保证证据已审核且版本有效。"""
+    cards = "\n".join(f"[{label}] {excerpt}" for label, excerpt in evidence_cards)
+    return (
+        f"{FAQ_ANSWER_SYSTEM}\n\n"
+        f"FAQ 模板：{code}:v{template_version}\n"
+        f"知识库快照：{snapshot}\n"
+        f"已审核证据卡：\n{cards}"
+    )
+
+
+def build_faq_answer_messages(stable_prefix: str, query: str, history: str = "") -> list[dict]:
+    """FAQ 缓存 Prompt：缓存标记前绝不放动态内容。"""
+    dynamic = f"当前用户问题：{query}"
+    if history:
+        dynamic = f"必要对话上下文（仅用于理解指代）：\n{history}\n\n{dynamic}"
+    return [
+        {
+            "role": "system",
+            "content": [{
+                "type": "text",
+                "text": stable_prefix,
+                "cache_control": {"type": "ephemeral"},
+            }],
+        },
+        {"role": "user", "content": [{"text": dynamic}]},
+    ]
 
 SUMMARIZE_HISTORY_SYSTEM = (
     "你是对话历史压缩器。请将以下对话压缩为一段中文摘要，"

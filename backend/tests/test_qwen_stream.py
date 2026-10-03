@@ -132,3 +132,14 @@ def test_context_cache_probe_requires_explicit_switch(monkeypatch):
     with pytest.raises(LLMError) as exc:
         qwen.probe_context_cache("固定资料", "问题")
     assert exc.value.code == "context_cache_poc_disabled"
+
+
+def test_faq_context_cache_requires_switch_and_preserves_dynamic_question(monkeypatch):
+    """P1 缓存调用只接受显式开关，动态问题不进入带缓存标记的稳定前缀。"""
+    messages = qwen.build_context_cache_probe_messages("固定证据", "动态问题")
+    monkeypatch.setattr(qwen.settings, "context_cache_enabled", True)
+    response = SimpleNamespace(status_code=200, output={"text": "已回答"}, usage={"cached_tokens": 88})
+    with patch("app.llm.qwen.MultiModalConversation.call", return_value=response) as call:
+        assert qwen.chat_completion_with_context_cache(messages) == "已回答"
+    assert call.call_args.kwargs["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert call.call_args.kwargs["messages"][1]["content"] == [{"text": "动态问题"}]

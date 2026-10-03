@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     context_cache_poc_enabled: bool = False
     context_cache_poc_model: str = ""  # 空值时复用 llm_model；需在业务空间确认显式缓存支持
 
+    # ----- 公开 FAQ 模板（P1：默认关闭；命中失败始终回退常规 RAG）-----
+    faq_template_enabled: bool = False
+    context_cache_enabled: bool = False
+    context_cache_model: str = ""  # 空值时复用 llm_model；应配置为已验证支持显式缓存的模型
+    faq_template_history_max_chars: int = Field(default=1200, ge=0, le=4000)
+
     # ----- 回答依据路由（默认开启）-----
     intent_router_enabled: bool = True
     intent_route_timeout_seconds: float = Field(default=8, gt=0, le=30)

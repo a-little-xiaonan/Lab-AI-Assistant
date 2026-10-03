@@ -1,6 +1,6 @@
 # P1：公开 FAQ 模板与 Context Cache 接入方案
 
-> 状态：讨论稿，依赖 P0 验证通过。
+> 状态：已实施；P0 已确认供应商返回可观测的缓存命中字段，但其小样本 TTFT 结果不作为 P1 的阻断条件。
 > 适用范围：公开、稳定的实验室招新 FAQ；不包含成员资料、动态日期、联系方式和任何非公开内容。
 
 ## 1. 目标
@@ -31,7 +31,6 @@ FaqTemplate
   prompt_policy_version
   knowledge_snapshot
   stable_prompt_hash
-  evidence_bundle_json
   status=draft|active|stale|disabled
   created_at, updated_at
 
@@ -100,8 +99,7 @@ System（稳定）
 | 模块 | 预期职责 |
 | --- | --- |
 | `models/database.py` 与 Alembic | FAQ 三张表、索引和外键 |
-| `core/faq/router.py` | 问题规范化、别名/关键词匹配 |
-| `core/faq/service.py` | 模板读取、快照校验、证据构造 |
+| `core/faq/service.py` | 问题规范化、别名/关键词匹配、模板读取、快照校验、证据构造 |
 | `llm/prompt_templates.py` | FAQ 专用消息构造 |
 | `llm/qwen.py` | 使用 P0 验证的缓存 adapter，返回 usage 指标 |
 | `core/rag_pipeline.py` | 在常规检索前调用可降级 FAQ 分支 |
@@ -110,13 +108,17 @@ System（稳定）
 
 P1 不增加前端模板管理页。首批模板由受控种子脚本创建，证据与别名均经过人工审阅后设为 `active`。
 
+当前实现提供 `backend/scripts/knowledge/import_faq_template.py`：传入包含 `code`、`title`、`kb_scope`、`aliases` 与 `evidences` 的 JSON 清单，脚本会校验知识库公开性、文档发布版本、Chunk 与受控摘录，再创建 `draft` 模板；只有管理员人工确认后传入 `--activate` 才会激活。已有 `code` 不会被脚本覆盖。
+
+运行时需同时设置 `FAQ_TEMPLATE_ENABLED=true`、`CONTEXT_CACHE_ENABLED=true`；`CONTEXT_CACHE_MODEL` 为空时复用 `LLM_MODEL`，建议显式配置为已完成 P0 冒烟验证的模型。任一开关未开启时，聊天链路保持既有 RAG 行为。
+
 ## 7. 验收
 
 - 所有模板引用的文档和 Chunk 均为当前已发布公开版本；
 - 命中模板时，回答与 sources 符合现有聊天 API 契约；
 - 未命中、资料失效、缓存调用异常时，均回退正常 RAG；
 - 模板问答集的正确性、引用一致性与拒答准确性不低于常规 RAG 基线；
-- P0 确认支持时，热请求能记录缓存命中和 TTFT 指标。
+- 热请求可记录供应商返回的缓存命中用量；TTFT 收益以 P3 的消融评测为准，不阻断当前模板分支。
 
 ## 8. 风险与回退
 

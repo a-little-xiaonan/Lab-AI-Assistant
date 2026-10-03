@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from app.core import rag_pipeline
+from app.core.faq.service import FaqMatch
 from app.core.retrieval.retriever import RetrievedChunk
 from app.llm.errors import LLMError
 
@@ -156,3 +157,65 @@ def test_answer_stream_llm_error_propagates(mock_stream, mock_retrieve):
     with pytest.raises(LLMError) as exc_info:
         next(gen)
     assert exc_info.value.code == "api_key_missing"
+
+
+def _faq_match():
+    return FaqMatch(
+        code="recruit_deadline",
+        stable_prefix="已审核 FAQ 证据卡",
+        chunks=[
+            RetrievedChunk(
+                chunk_id="faq_1", text="报名截止时间为 10 月 20 日。", score=1.0,
+                metadata={"doc_id": "doc_1", "source_file": "招新公告.md", "page": 1},
+            )
+        ],
+    )
+
+
+def test_answer_uses_verified_faq_context_cache(monkeypatch):
+    """两个显式开关开启后，命中 FAQ 时不进入常规检索。"""
+    monkeypatch.setattr(rag_pipeline.settings, "faq_template_enabled", True)
+    monkeypatch.setattr(rag_pipeline.settings, "context_cache_enabled", True)
+    with patch("app.core.faq.service.match_public_faq", return_value=_faq_match()), patch(
+        "app.core.rag_pipeline.qwen.chat_completion_with_context_cache", return_value="截止时间为 10 月 20 日。"
+    ) as cache_chat, patch("app.core.rag_pipeline.retriever.retrieve") as retrieve:
+        result = rag_pipeline.answer("报名截止时间是什么时候？", ["kb_public"], include_diagnostics=True)
+
+    assert result["answer"] == "截止时间为 10 月 20 日。"
+    assert result["diagnostics"]["answer_mode"] == "faq_context_cache"
+    assert result["diagnostics"]["evidence"]["reason"] == "faq_template_verified"
+    cache_chat.assert_called_once()
+    retrieve.assert_not_called()
+
+
+def test_faq_cache_failure_falls_back_to_regular_rag(monkeypatch):
+    monkeypatch.setattr(rag_pipeline.settings, "faq_template_enabled", True)
+    monkeypatch.setattr(rag_pipeline.settings, "context_cache_enabled", True)
+    fallback_chunks = _fake_chunks()
+    fallback_evidence = rag_pipeline.EvidenceDecision(True, "fallback", 1, 1, 0.9, 1.0, None, False)
+    with patch("app.core.faq.service.match_public_faq", return_value=_faq_match()), patch(
+        "app.core.rag_pipeline.qwen.chat_completion_with_context_cache",
+        side_effect=LLMError("context_cache_disabled", "缓存调用失败"),
+    ), patch("app.core.rag_pipeline._prepare", return_value=(
+        fallback_chunks, [{"role": "user", "content": "普通 RAG"}], fallback_evidence, "ok"
+    )), patch("app.core.rag_pipeline.qwen.chat_completion", return_value="常规 RAG 回答") as normal_chat:
+        result = rag_pipeline.answer("报名截止时间是什么时候？", ["kb_public"])
+
+    assert result["answer"] == "常规 RAG 回答"
+    normal_chat.assert_called_once()
+
+
+def test_faq_cache_stream_failure_before_output_falls_back(monkeypatch):
+    monkeypatch.setattr(rag_pipeline.settings, "faq_template_enabled", True)
+    monkeypatch.setattr(rag_pipeline.settings, "context_cache_enabled", True)
+    fallback_evidence = rag_pipeline.EvidenceDecision(True, "fallback", 1, 1, 0.9, 1.0, None, False)
+    with patch("app.core.faq.service.match_public_faq", return_value=_faq_match()), patch(
+        "app.core.rag_pipeline.qwen.chat_completion_stream_with_context_cache",
+        side_effect=LLMError("llm_call_failed", "缓存调用失败"),
+    ), patch("app.core.rag_pipeline._prepare", return_value=(
+        _fake_chunks(), [{"role": "user", "content": "普通 RAG"}], fallback_evidence, "ok"
+    )), patch("app.core.rag_pipeline.qwen.chat_completion_stream", return_value=iter(["常规", "回答"])):
+        items = list(rag_pipeline.answer_stream("报名截止时间是什么时候？", ["kb_public"]))
+
+    assert "".join(item["text"] for item in items if item["type"] == "delta") == "常规回答"
+    assert items[-1]["type"] == "done"

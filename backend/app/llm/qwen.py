@@ -401,6 +401,75 @@ def probe_context_cache(
     )
 
 
+def chat_completion_with_context_cache(messages: list[dict], model: str | None = None) -> str:
+    """FAQ 专用非流式显式缓存调用；主链路未开启时禁止误用。"""
+    if not settings.context_cache_enabled:
+        raise LLMError("context_cache_disabled", "Context Cache 未启用")
+    selected_model = model or settings.context_cache_model or settings.llm_model
+    response = _retry(
+        MultiModalConversation.call,
+        model=selected_model,
+        messages=messages,
+        api_key=_api_key(),
+        stream=False,
+        timeout=settings.llm_timeout,
+        **_base_address(),
+    )
+    text = _output_text(response.output)
+    if not text.strip():
+        raise LLMError(code="llm_empty_response", message="模型返回为空")
+    usage = context_cache_usage(response)
+    logger.info("FAQ Context Cache：model=%s cached_tokens=%s creation_tokens=%s",
+                selected_model, usage.cached_tokens, usage.cache_creation_input_tokens)
+    return text
+
+
+def chat_completion_stream_with_context_cache(
+    messages: list[dict], model: str | None = None
+) -> Iterator[str]:
+    """FAQ 专用流式显式缓存调用；产出契约与普通流式调用保持一致。"""
+    if not settings.context_cache_enabled:
+        raise LLMError("context_cache_disabled", "Context Cache 未启用")
+    selected_model = model or settings.context_cache_model or settings.llm_model
+    stream = _start_stream_with_retry(
+        lambda: MultiModalConversation.call(
+            model=selected_model,
+            messages=messages,
+            api_key=_api_key(),
+            stream=True,
+            incremental_output=True,
+            timeout=settings.llm_stream_timeout,
+            **_base_address(),
+        )
+    )
+    previous = ""
+    emitted = False
+    usage = ContextCacheUsage()
+    for chunk in stream:
+        if chunk.status_code != 200:
+            raise LLMError(
+                code="llm_stream_interrupted",
+                message=f"流式输出中断（{chunk.status_code}）：{getattr(chunk, 'message', '') or chunk.code}",
+            )
+        observed = context_cache_usage(chunk)
+        if any(value is not None for value in (
+            observed.input_tokens,
+            observed.cached_tokens,
+            observed.cache_creation_input_tokens,
+        )):
+            usage = observed
+        text = _output_text(getattr(chunk, "output", None))
+        delta = text[len(previous):] if text.startswith(previous) else text
+        previous = text
+        if delta:
+            emitted = True
+            yield delta
+    if not emitted:
+        raise LLMError(code="llm_empty_response", message="模型返回为空")
+    logger.info("FAQ Context Cache：model=%s cached_tokens=%s creation_tokens=%s",
+                selected_model, usage.cached_tokens, usage.cache_creation_input_tokens)
+
+
 def embed_texts(
     texts: list[str],
     model: str | None = None,

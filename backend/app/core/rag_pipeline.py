@@ -26,6 +26,7 @@ from app.core.retrieval.ranking.evidence_gate import EvidenceDecision, filter_ev
 from app.llm import qwen
 from app.llm.errors import LLMError
 from app.llm.prompt_templates import (
+    build_faq_answer_messages,
     build_no_context_messages,
     build_rag_answer_messages,
     format_retrieved_chunks,
@@ -137,6 +138,39 @@ class KnowledgeEvidence:
     failures: tuple[str, ...] = ()
 
 
+@dataclass
+class FaqPrepared:
+    """FAQ 命中后的稳定消息与已核验证据。"""
+
+    code: str
+    chunks: list[retriever.RetrievedChunk]
+    messages: list[dict]
+
+
+def _prepare_public_faq(
+    query: str, kb_id: str | list[str], history: str
+) -> FaqPrepared | None:
+    """仅为公开 FAQ 构造缓存 Prompt；任意异常均回退常规 RAG。"""
+    if not (settings.faq_template_enabled and settings.context_cache_enabled):
+        return None
+    readable_kb_ids = kb_id if isinstance(kb_id, list) else [kb_id]
+    try:
+        from app.core.faq.service import match_public_faq
+
+        matched = match_public_faq(query, readable_kb_ids)
+        if matched is None:
+            return None
+        bounded_history = history[-settings.faq_template_history_max_chars:]
+        return FaqPrepared(
+            code=matched.code,
+            chunks=matched.chunks,
+            messages=build_faq_answer_messages(matched.stable_prefix, query, bounded_history),
+        )
+    except Exception:
+        logger.exception("FAQ 模板校验失败，回退常规 RAG")
+        return None
+
+
 def prepare_evidence(query: str, kb_id: str | list[str], history: str = "", *,
                      strict: bool = False) -> KnowledgeEvidence:
     """只检索及核验证据，不读取个人记忆、不生成答案。"""
@@ -208,6 +242,20 @@ def _prepare(
     return chunks, messages, evidence, prepared.status
 
 
+def _faq_evidence(chunks: list[retriever.RetrievedChunk]) -> EvidenceDecision:
+    """FAQ 证据已在模板匹配阶段逐项校验，诊断中仍保留统一结构。"""
+    return EvidenceDecision(
+        accepted=True,
+        reason="faq_template_verified",
+        supporting_chunks=len(chunks),
+        total_chunks=len(chunks),
+        max_similarity=None,
+        max_lexical_coverage=1.0,
+        max_rerank_score=None,
+        judge_used=False,
+    )
+
+
 def _strip_citations(body: str, *, trim: bool = True) -> str:
     """移除模型偶发输出的引用标记，避免把内部资料名称展示给访客。"""
     body = re.sub(r"\[(?:\d+|来源:\s*[^\]]+)\]", "", body)
@@ -270,17 +318,32 @@ def answer(
     由 API 层转统一错误（不静默返回空）。
     """
     started = time.monotonic()
-    chunks, messages, evidence, status = _prepare(
-        query, kb_id, history=_get_history_context(session_id), user_id=user_id
-    )
-    retrieval_elapsed = time.monotonic() - started
-    generation_started = time.monotonic()
-    result = ({"answer": KNOWLEDGE_UNAVAILABLE, "sources": []} if status == "failed"
-              else _finalize(qwen.chat_completion(messages), chunks))
+    history = _get_history_context(session_id)
+    faq = _prepare_public_faq(query, kb_id, history)
+    answer_mode = "rag"
+    if faq is not None:
+        try:
+            chunks = faq.chunks
+            evidence = _faq_evidence(chunks)
+            status = "ok"
+            answer_mode = "faq_context_cache"
+            retrieval_elapsed = time.monotonic() - started
+            generation_started = time.monotonic()
+            result = _finalize(qwen.chat_completion_with_context_cache(faq.messages), chunks)
+        except LLMError:
+            logger.exception("FAQ 缓存调用失败，回退常规 RAG：template=%s", faq.code)
+            faq = None
+    if faq is None:
+        chunks, messages, evidence, status = _prepare(query, kb_id, history=history, user_id=user_id)
+        retrieval_elapsed = time.monotonic() - started
+        generation_started = time.monotonic()
+        result = ({"answer": KNOWLEDGE_UNAVAILABLE, "sources": []} if status == "failed"
+                  else _finalize(qwen.chat_completion(messages), chunks))
     if flags.get("include_diagnostics"):
         result["diagnostics"] = {
             "evidence": evidence.as_dict(),
             "status": status,
+            "answer_mode": answer_mode,
             "retrieval_elapsed_seconds": round(retrieval_elapsed, 4),
             "generation_elapsed_seconds": round(
                 time.monotonic() - generation_started, 4
@@ -322,9 +385,35 @@ def answer_stream(
     cancellation = flags.get("cancellation")
     if cancellation is not None and cancellation.is_set():
         return
-    chunks, messages, _evidence, status = _prepare(
-        query, kb_id, history=_get_history_context(session_id), user_id=user_id
-    )
+    history = _get_history_context(session_id)
+    faq = _prepare_public_faq(query, kb_id, history)
+    if faq is not None:
+        proc = CitationStreamProcessor(faq.chunks)
+        processed = []
+        emitted = False
+        try:
+            for delta in qwen.chat_completion_stream_with_context_cache(faq.messages):
+                if cancellation is not None and cancellation.is_set():
+                    return
+                replaced = proc.feed(delta)
+                if replaced:
+                    emitted = True
+                    processed.append(replaced)
+                    yield {"type": "delta", "text": replaced}
+            tail = proc.flush()
+            if tail:
+                emitted = True
+                processed.append(tail)
+                yield {"type": "delta", "text": tail}
+            body = _strip_citations("".join(processed))
+            yield {"type": "done", "full_text": body, "sources": _dedup_sources(faq.chunks)}
+            return
+        except LLMError:
+            if emitted:
+                raise
+            logger.exception("FAQ 缓存流式调用失败，回退常规 RAG：template=%s", faq.code)
+
+    chunks, messages, _evidence, status = _prepare(query, kb_id, history=history, user_id=user_id)
     if cancellation is not None and cancellation.is_set():
         return
     if status == "failed":

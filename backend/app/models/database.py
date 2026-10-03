@@ -335,6 +335,57 @@ class ChunkRecord(Base):
     document: Mapped[Document] = relationship(back_populates="chunks")
 
 
+class FaqTemplate(Base):
+    """高频公开问答模板：证据、版本和稳定 Prompt 均须可审计。"""
+
+    __tablename__ = "faq_templates"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    code: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(128))
+    kb_scope_json: Mapped[str] = mapped_column(Text, default="[]")
+    audience_scope: Mapped[str] = mapped_column(String(16), default="public", index=True)
+    template_version: Mapped[int] = mapped_column(Integer, default=1)
+    prompt_policy_version: Mapped[str] = mapped_column(String(64), default="faq-policy-v1")
+    knowledge_snapshot: Mapped[str] = mapped_column(String(128), index=True)
+    stable_prompt_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class FaqTemplateEvidence(Base):
+    """模板绑定的已发布证据；excerpt 是人工审核后进入稳定前缀的内容。"""
+
+    __tablename__ = "faq_template_evidences"
+    __table_args__ = (UniqueConstraint("template_id", "doc_id", "chunk_index", name="uq_faq_evidence_chunk"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    template_id: Mapped[str] = mapped_column(ForeignKey("faq_templates.id", ondelete="CASCADE"), index=True)
+    doc_id: Mapped[str] = mapped_column(String(64), index=True)
+    document_version_id: Mapped[str] = mapped_column(String(96), index=True)
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    excerpt: Mapped[str] = mapped_column(Text)
+    citation_label: Mapped[str] = mapped_column(String(255))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class FaqTemplateAlias(Base):
+    """模板路由别名：exact 为规范化全匹配，keywords 用 | 连接全部必含词。"""
+
+    __tablename__ = "faq_template_aliases"
+    __table_args__ = (UniqueConstraint("template_id", "normalized_query", name="uq_faq_alias_query"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    template_id: Mapped[str] = mapped_column(ForeignKey("faq_templates.id", ondelete="CASCADE"), index=True)
+    normalized_query: Mapped[str] = mapped_column(String(500), index=True)
+    match_mode: Mapped[str] = mapped_column(String(16), default="exact")
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class UserMemory(Base):
     """用户级长期记忆的可管理副本；向量保存在 ChromaDB user_memories 集合。"""
 
