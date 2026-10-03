@@ -1,6 +1,6 @@
 """qwen.chat_completion_stream 单测：增量/差分兜底/首块重试/中断/空响应。
 
-mock 方式与现有测试一致：patch 打在模块导入路径（app.llm.qwen.Generation.call）。
+patch 统一打在模型调用封装上，避免本地模型配置影响普通/多模态调用路径。
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from app.llm.errors import LLMError
 
 def _chunk(text: str, status: int = 200, code: str | None = None, message: str = "") -> SimpleNamespace:
     return SimpleNamespace(
-        status_code=status, code=code, message=message, output=SimpleNamespace(text=text)
+        status_code=status, code=code, message=message, output={"text": text}
     )
 
 
@@ -28,7 +28,7 @@ def test_stream_incremental_mode_yields_deltas():
     fake = _stream_resp(
         [_chunk("1"), _chunk("  \n2"), _chunk("3"), _chunk("")]
     )
-    with patch("app.llm.qwen.Generation.call", return_value=fake):
+    with patch("app.llm.qwen._model_call", return_value=fake):
         out = list(qwen.chat_completion_stream([{"role": "user", "content": "x"}]))
     assert out == ["1", "  \n2", "3"]
 
@@ -36,7 +36,7 @@ def test_stream_incremental_mode_yields_deltas():
 def test_stream_merge_mode_diffs_accumulated_text():
     """merge 形态（text 累积全文）：差分兜底只产出增量。"""
     fake = _stream_resp([_chunk("1"), _chunk("1  \n2"), _chunk("1  \n2  \n3"), _chunk("")])
-    with patch("app.llm.qwen.Generation.call", return_value=fake):
+    with patch("app.llm.qwen._model_call", return_value=fake):
         out = list(qwen.chat_completion_stream([{"role": "user", "content": "x"}]))
     assert out == ["1", "  \n2", "  \n3"]
 
@@ -44,7 +44,7 @@ def test_stream_merge_mode_diffs_accumulated_text():
 def test_stream_mid_chunk_error_raises_interrupted():
     """中途块非 200 → llm_stream_interrupted（不重试，防重复输出）。"""
     fake = _stream_resp([_chunk("好的"), _chunk("", status=500, message="boom")])
-    with patch("app.llm.qwen.Generation.call", return_value=fake):
+    with patch("app.llm.qwen._model_call", return_value=fake):
         with pytest.raises(LLMError) as ei:
             list(qwen.chat_completion_stream([{"role": "user", "content": "x"}]))
     assert ei.value.code == "llm_stream_interrupted"
@@ -60,7 +60,7 @@ def test_stream_retries_retryable_first_chunk():
             return _stream_resp([_chunk("", status=429)])
         return _stream_resp([_chunk("重试成功"), _chunk("")])
 
-    with patch("app.llm.qwen.Generation.call", side_effect=_side_effect):
+    with patch("app.llm.qwen._model_call", side_effect=_side_effect):
         out = list(qwen.chat_completion_stream([{"role": "user", "content": "x"}]))
     assert calls["n"] == 2
     assert out == ["重试成功"]
@@ -75,7 +75,7 @@ def test_stream_retry_exhausted_raises():
     def _always_429(**kwargs):
         return _stream_resp([_chunk("", status=429)])
 
-    with patch("app.llm.qwen.Generation.call", side_effect=_always_429):
+    with patch("app.llm.qwen._model_call", side_effect=_always_429):
         with pytest.raises(LLMError) as ei:
             list(qwen.chat_completion_stream([{"role": "user", "content": "x"}]))
     assert ei.value.code == "llm_status_429"
@@ -84,7 +84,7 @@ def test_stream_retry_exhausted_raises():
 def test_stream_empty_output_raises():
     """全程空块（只有流结束标记）→ llm_empty_response（与非流式口径一致）。"""
     fake = _stream_resp([_chunk(""), _chunk("")])
-    with patch("app.llm.qwen.Generation.call", return_value=fake):
+    with patch("app.llm.qwen._model_call", return_value=fake):
         with pytest.raises(LLMError) as ei:
             list(qwen.chat_completion_stream([{"role": "user", "content": "x"}]))
     assert ei.value.code == "llm_empty_response"

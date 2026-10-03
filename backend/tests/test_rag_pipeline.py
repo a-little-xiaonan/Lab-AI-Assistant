@@ -60,10 +60,28 @@ def test_answer_no_hits_no_citation(mock_chat, mock_retrieve):
 
 @patch("app.core.rag_pipeline.retriever.retrieve", side_effect=Exception("vector db down"))
 @patch("app.core.rag_pipeline.qwen.chat_completion", return_value="降级回答。")
-def test_retrieval_failure_degrades_to_plain_llm(mock_chat, mock_retrieve):
+def test_retrieval_failure_reports_service_error(mock_chat, mock_retrieve):
     result = rag_pipeline.answer("问题", "kb_default")
-    assert result["answer"] == "降级回答。"
+    assert result["answer"] == rag_pipeline.KNOWLEDGE_UNAVAILABLE
     assert result["sources"] == []
+    mock_chat.assert_not_called()
+
+
+@patch("app.core.rag_pipeline.retriever.retrieve", side_effect=Exception("vector db down"))
+def test_scope_retrieval_failure_is_not_reported_as_no_data(mock_retrieve):
+    prepared = rag_pipeline.prepare_evidence("实验室报名条件", ["kb_a", "kb_b"])
+    assert prepared.status == "failed"
+    assert "knowledge_retrieval_failed" in prepared.failures
+    assert "knowledge_retrieval_all_failed" in prepared.failures
+
+
+@patch("app.core.rag_pipeline.retriever.retrieve", side_effect=Exception("vector db down"))
+@patch("app.core.rag_pipeline.qwen.chat_completion_stream")
+def test_retrieval_failure_stream_reports_service_error(mock_stream, mock_retrieve):
+    items = list(rag_pipeline.answer_stream("实验室报名条件", ["kb_a"]))
+    assert items[-1]["full_text"] == rag_pipeline.KNOWLEDGE_UNAVAILABLE
+    assert items[-1]["sources"] == []
+    mock_stream.assert_not_called()
 
 
 @patch("app.core.rag_pipeline.retriever.retrieve", return_value=_fake_chunks())

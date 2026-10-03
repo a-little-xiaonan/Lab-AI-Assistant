@@ -33,6 +33,7 @@ from app.authorization.permissions import list_readable_kbs
 from app.authorization.session_access import require_session_owner
 from app.core.rag_pipeline import answer, answer_stream
 from app.core.agent import orchestrator as agent
+from app.core import intent_router
 from app.config import settings
 from app.llm import qwen
 from app.llm.errors import LLMError
@@ -138,7 +139,12 @@ async def _sse_stream(
     yield format_sse_event("meta", {"session_id": session.id})
 
     cancellation = threading.Event()
-    if settings.agent_enabled:
+    if settings.intent_router_enabled:
+        sync_iter = intent_router.answer_stream(
+            req.message, readable_kb_ids or [], session_id=session.id, user_id=user_id,
+            cancellation=cancellation,
+        )
+    elif settings.agent_enabled:
         sync_iter = agent.answer_stream(
             req.message, readable_kb_ids or [], session_id=session.id, user_id=user_id,
             cancellation=cancellation,
@@ -303,7 +309,10 @@ async def chat(
         return stream_response
 
     # 非流式（Phase 1 行为不变，历史由 pipeline 从短期记忆取）
-    selected_answer = agent.answer if settings.agent_enabled else answer
+    selected_answer = (
+        intent_router.answer if settings.intent_router_enabled
+        else agent.answer if settings.agent_enabled else answer
+    )
     result = await asyncio.to_thread(
         selected_answer, req.message, readable_kb_ids, session_id=session.id, user_id=user.id if user else None,
     )

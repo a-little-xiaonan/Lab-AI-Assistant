@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 KB_DEFAULT = "kb_default"
 SNIPPET_MAX = 50  # sources 片段摘要上限（文档 04 协议）
+KNOWLEDGE_UNAVAILABLE = "知识库查询暂时失败，请稍后重试。"
 
 
 def _get_history_context(session_id: str | None) -> str:
@@ -67,16 +68,17 @@ def _dedup_sources(chunks: list[retriever.RetrievedChunk]) -> list[dict]:
     return out
 
 
-def _retrieve_scope(kb_ids: list[str], query: str, history: str) -> tuple[list[retriever.RetrievedChunk], str]:
+def _retrieve_scope(kb_ids: list[str], query: str, history: str) -> tuple[list[retriever.RetrievedChunk], str, int]:
     """自动知识库范围检索：先在每库完成自身混合检索，再做跨库 RRF 融合。
 
     每个 chunk id 含 doc_id，跨库天然不冲突。每库异常只跳过该库，避免一个权限范围
     内的坏索引拖垮整个聊天请求。
     """
     if not kb_ids:
-        return [], ""
+        return [], "", 0
     answer_outline = ""
     per_kb: dict[str, list[retriever.RetrievedChunk]] = {}
+    failed_count = 0
 
     def _one(kb_id: str):
         if settings.query_planning_enabled or settings.topic_retrieval_enabled:
@@ -98,6 +100,7 @@ def _retrieve_scope(kb_ids: list[str], query: str, history: str) -> tuple[list[r
                 if outline:
                     answer_outline = outline
             except Exception:
+                failed_count += 1
                 record_failure("knowledge_retrieval_failed")
                 logger.exception("知识库检索失败，跳过：kb=%s", kb_id)
 
@@ -119,8 +122,9 @@ def _retrieve_scope(kb_ids: list[str], query: str, history: str) -> tuple[list[r
         except Exception:
             logger.exception("跨库重排失败，保留跨库 RRF 顺序")
     final = retriever.truncate_to_budget(merged[: settings.retrieval_top_k], settings.max_context_tokens)
-    logger.info("自动范围检索：可读库=%d 命中=%d", len(kb_ids), len(final))
-    return final, answer_outline
+    logger.info("自动范围检索：可读库=%d 成功库=%d 失败库=%d 命中=%d",
+                len(kb_ids), len(per_kb), failed_count, len(final))
+    return final, answer_outline, failed_count
 
 
 @dataclass
@@ -143,7 +147,11 @@ def prepare_evidence(query: str, kb_id: str | list[str], history: str = "", *,
     try:
         timeout_seconds(settings.llm_timeout)
         if isinstance(kb_id, list):
-            chunks, answer_outline = _retrieve_scope(kb_id, query, history)
+            chunks, answer_outline, failed_count = _retrieve_scope(kb_id, query, history)
+            if failed_count:
+                failures.append("knowledge_retrieval_failed")
+                failures.append("knowledge_retrieval_all_failed" if failed_count == len(kb_id)
+                                else "knowledge_retrieval_partial_failed")
         # 新编排仅在显式开启时接管；默认继续走原 retriever，保证当前稳定链路与测试契约不变。
         elif settings.query_planning_enabled or settings.topic_retrieval_enabled:
             from app.core.retrieval.retrieval_orchestrator import retrieve as orchestrated_retrieve
@@ -181,9 +189,11 @@ def prepare_evidence(query: str, kb_id: str | list[str], history: str = "", *,
 
 def _prepare(
     query: str, kb_id: str | list[str], history: str = "", user_id: str | None = None
-) -> tuple[list[retriever.RetrievedChunk], list[dict], EvidenceDecision]:
+) -> tuple[list[retriever.RetrievedChunk], list[dict], EvidenceDecision, str]:
     prepared = prepare_evidence(query, kb_id, history)
     chunks, evidence, answer_outline = prepared.chunks, prepared.decision, prepared.answer_outline
+    if prepared.status == "failed":
+        return [], [], evidence, prepared.status
     memories = format_memories(long_term_memory.recall(query, user_id)) if user_id else ""
     if chunks:
         messages = build_rag_answer_messages(
@@ -195,7 +205,7 @@ def _prepare(
         )
     else:
         messages = build_no_context_messages(query, history=history, memories=memories)
-    return chunks, messages, evidence
+    return chunks, messages, evidence, prepared.status
 
 
 def _strip_citations(body: str, *, trim: bool = True) -> str:
@@ -256,20 +266,21 @@ def answer(
 ) -> dict:
     """返回 {"answer": str, "sources": [{"source_file", "page", "snippet"}]}。
 
-    异常路径：检索失败 → 降级为纯 LLM 回答（日志标记）；LLM 失败 → 抛 LLMError，
+    异常路径：检索失败 → 明确告知服务失败；LLM 失败 → 抛 LLMError，
     由 API 层转统一错误（不静默返回空）。
     """
     started = time.monotonic()
-    chunks, messages, evidence = _prepare(
+    chunks, messages, evidence, status = _prepare(
         query, kb_id, history=_get_history_context(session_id), user_id=user_id
     )
     retrieval_elapsed = time.monotonic() - started
     generation_started = time.monotonic()
-    raw_answer = qwen.chat_completion(messages)
-    result = _finalize(raw_answer, chunks)
+    result = ({"answer": KNOWLEDGE_UNAVAILABLE, "sources": []} if status == "failed"
+              else _finalize(qwen.chat_completion(messages), chunks))
     if flags.get("include_diagnostics"):
         result["diagnostics"] = {
             "evidence": evidence.as_dict(),
+            "status": status,
             "retrieval_elapsed_seconds": round(retrieval_elapsed, 4),
             "generation_elapsed_seconds": round(
                 time.monotonic() - generation_started, 4
@@ -308,12 +319,23 @@ def answer_stream(
 
     LLM 流式失败 → 生成器向上抛 LLMError（由 API 层转 SSE error 帧）。
     """
-    chunks, messages, _evidence = _prepare(
+    cancellation = flags.get("cancellation")
+    if cancellation is not None and cancellation.is_set():
+        return
+    chunks, messages, _evidence, status = _prepare(
         query, kb_id, history=_get_history_context(session_id), user_id=user_id
     )
+    if cancellation is not None and cancellation.is_set():
+        return
+    if status == "failed":
+        yield {"type": "delta", "text": KNOWLEDGE_UNAVAILABLE}
+        yield {"type": "done", "full_text": KNOWLEDGE_UNAVAILABLE, "sources": []}
+        return
     proc = CitationStreamProcessor(chunks)
     processed = []
     for delta in qwen.chat_completion_stream(messages):
+        if cancellation is not None and cancellation.is_set():
+            return
         replaced = proc.feed(delta)
         if replaced:
             processed.append(replaced)
