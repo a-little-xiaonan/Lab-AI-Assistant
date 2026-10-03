@@ -96,10 +96,13 @@ def publish_document(doc_id: str, actor_id: str, expected_lock_version: int,
         doc.review_comment = comment
         doc.chunk_count = len(staged)
         doc.lock_version += 1
+        from app.core.faq.service import mark_templates_stale_for_document
+        stale_templates = mark_templates_stale_for_document(db, doc.id)
         append_review(db, version, actor_id, "publish", comment)
         record_in_transaction(db, db.get(User, actor_id),
                               "document.publish", "document", doc.id,
-                              detail={"version_id": version.id, "kb_id": doc.kb_id})
+                              detail={"version_id": version.id, "kb_id": doc.kb_id,
+                                      "stale_faq_template_ids": stale_templates})
         db.commit()
         try:
             from app.core.retrieval.indexing.keyword_index import keyword_index
@@ -154,8 +157,11 @@ def archive_document(doc_id: str, actor_id: str, expected_lock_version: int,
         doc.governance_status = "archived"
         doc.deleted_at = utcnow()
         doc.lock_version += 1
+        from app.core.faq.service import mark_templates_stale_for_document
+        stale_templates = mark_templates_stale_for_document(db, doc.id)
         record_in_transaction(db, db.get(User, actor_id), "document.archive", "document", doc.id,
-                              detail={"kb_id": doc.kb_id, "comment": comment})
+                              detail={"kb_id": doc.kb_id, "comment": comment,
+                                      "stale_faq_template_ids": stale_templates})
         db.commit()
         try:
             from app.core.retrieval.indexing.keyword_index import keyword_index

@@ -191,9 +191,12 @@ def update_document_governance(
     doc.expires_at = body.expires_at
     doc.last_reviewed_at = utcnow()
     doc.lock_version += 1
+    from app.core.faq.service import mark_templates_stale_for_document
+    stale_templates = mark_templates_stale_for_document(db, doc.id)
     from app.services.operations.audit import record_in_transaction
     record_in_transaction(db, user, "document.update_governance", "document", doc.id,
-                          detail={"sensitivity_level": body.sensitivity_level})
+                          detail={"sensitivity_level": body.sensitivity_level,
+                                  "stale_faq_template_ids": stale_templates})
     db.commit()
     return _document_out(db, doc, _topic_map(db, [doc.id]).get(doc.id))
 

@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     faq_template_enabled: bool = False
     context_cache_enabled: bool = False
     context_cache_model: str = ""  # 空值时复用 llm_model；应配置为已验证支持显式缓存的模型
+    context_cache_protocol_version: str = "dashscope-multimodal-v1"
+    faq_prompt_policy_version: str = "faq-policy-v1"
+    faq_tool_schema_version: str = "none-v1"
     faq_template_history_max_chars: int = Field(default=1200, ge=0, le=4000)
 
     # ----- 回答依据路由（默认开启）-----

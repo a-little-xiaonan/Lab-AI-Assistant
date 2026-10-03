@@ -18,6 +18,7 @@ from sqlalchemy import select
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # backend/
 
 from app.core.faq.service import _snapshot, normalize_query
+from app.config import settings
 from app.llm.prompt_templates import build_faq_stable_prefix
 from app.models.database import (
     ChunkRecord,
@@ -74,10 +75,13 @@ def import_template(manifest: dict, *, activate: bool) -> str:
     if not CODE_RE.fullmatch(code):
         raise ValueError("code 需为 3-64 位小写字母、数字或下划线，且以字母开头")
     scope = manifest.get("kb_scope")
+    audience_scope = manifest.get("audience_scope", "guest")
     aliases = manifest.get("aliases")
     evidences = manifest.get("evidences")
     if not isinstance(scope, list) or not scope or not all(isinstance(kb_id, str) and kb_id for kb_id in scope):
         raise ValueError("kb_scope 必须是非空知识库 ID 列表")
+    if audience_scope not in {"guest", "student", "editor", "admin"}:
+        raise ValueError("audience_scope 只能是 guest、student、editor 或 admin")
     if not isinstance(aliases, list) or not aliases or not all(isinstance(item, dict) for item in aliases):
         raise ValueError("aliases 必须是非空对象列表")
     if not isinstance(evidences, list) or not evidences or not all(isinstance(item, dict) for item in evidences):
@@ -91,14 +95,16 @@ def import_template(manifest: dict, *, activate: bool) -> str:
         if db.scalar(select(FaqTemplate.id).where(FaqTemplate.code == code)):
             raise ValueError(f"模板 code 已存在：{code}；P1 不允许脚本覆盖已有模板")
         kbs = {kb.id: kb for kb in db.scalars(select(KnowledgeBase).where(KnowledgeBase.id.in_(scope_set)))}
-        if set(kbs) != scope_set or any(kb.access_level != "guest" or kb.status != "active" for kb in kbs.values()):
-            raise ValueError("kb_scope 必须全部是 active 的 guest 公开知识库")
+        if set(kbs) != scope_set or any(
+            kb.access_level != audience_scope or kb.status != "active" for kb in kbs.values()
+        ):
+            raise ValueError("kb_scope 必须全部是与 audience_scope 相同等级的 active 知识库")
 
         now = utcnow()
         template = FaqTemplate(
             id=f"faq_{uuid4().hex[:24]}", code=code, title=title,
-            kb_scope_json=json.dumps(scope, ensure_ascii=False), audience_scope="public",
-            template_version=1, prompt_policy_version="faq-policy-v1", status="draft",
+            kb_scope_json=json.dumps(scope, ensure_ascii=False), audience_scope=audience_scope,
+            template_version=1, prompt_policy_version=settings.faq_prompt_policy_version, status="draft",
             knowledge_snapshot="pending", stable_prompt_hash="pending",
         )
         db.add(template)
@@ -123,6 +129,7 @@ def import_template(manifest: dict, *, activate: bool) -> str:
                     or document.status != "ready" or document.governance_status != "published"
                     or document.published_version_id != version_id or version.document_id != doc_id
                     or document.deleted_at is not None
+                    or document.sensitivity_level != audience_scope
                     or (document.effective_at is not None and document.effective_at > now)
                     or (document.expires_at is not None and document.expires_at <= now)
                     or excerpt not in chunk.text):
@@ -138,7 +145,12 @@ def import_template(manifest: dict, *, activate: bool) -> str:
             checked.append((evidence, document, version))
             cards.append((label, excerpt))
         template.knowledge_snapshot = _snapshot(checked)
-        prefix = build_faq_stable_prefix(code, template.template_version, template.knowledge_snapshot, cards)
+        from app.core.faq.service import cache_namespace
+
+        prefix = build_faq_stable_prefix(
+            code, template.template_version, template.knowledge_snapshot, audience_scope,
+            cache_namespace(template, kbs), cards,
+        )
         template.stable_prompt_hash = hashlib.sha256(prefix.encode()).hexdigest()
         for normalized, mode, priority in normalized_aliases:
             db.add(FaqTemplateAlias(

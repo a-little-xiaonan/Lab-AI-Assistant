@@ -57,6 +57,8 @@ def build_faq_stable_prefix(
     code: str,
     template_version: int,
     snapshot: str,
+    audience_scope: str,
+    cache_namespace: str,
     evidence_cards: list[tuple[str, str]],
 ) -> str:
     """构造可缓存的 FAQ 固定前缀；调用方负责保证证据已审核且版本有效。"""
@@ -64,7 +66,9 @@ def build_faq_stable_prefix(
     return (
         f"{FAQ_ANSWER_SYSTEM}\n\n"
         f"FAQ 模板：{code}:v{template_version}\n"
+        f"访问范围：{audience_scope}\n"
         f"知识库快照：{snapshot}\n"
+        f"缓存命名空间：{cache_namespace}\n"
         f"已审核证据卡：\n{cards}"
     )
 

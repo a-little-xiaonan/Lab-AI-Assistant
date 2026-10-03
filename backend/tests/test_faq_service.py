@@ -6,7 +6,15 @@ import json
 
 from sqlalchemy import select
 
-from app.core.faq.service import _snapshot, match_public_faq, normalize_query
+from app.api.knowledge.documents import update_document_governance
+from app.core.faq.service import (
+    _snapshot,
+    cache_namespace,
+    mark_templates_stale_for_document,
+    match_faq,
+    match_public_faq,
+    normalize_query,
+)
 from app.llm.prompt_templates import build_faq_stable_prefix
 from app.models.database import (
     ChunkRecord,
@@ -16,15 +24,19 @@ from app.models.database import (
     FaqTemplateAlias,
     FaqTemplateEvidence,
     KnowledgeBase,
+    Role,
+    User,
 )
+from app.models.schemas import DocumentGovernanceUpdate
 from scripts.knowledge import import_faq_template
 
 
-def _seed_active_template(db):
-    kb = KnowledgeBase(id="kb_public", name="公开资料", access_level="guest", status="active")
+def _seed_active_template(db, audience_scope="guest"):
+    kb = KnowledgeBase(id="kb_public", name="公开资料", access_level=audience_scope, status="active")
     document = Document(
         id="doc_recruit", kb_id=kb.id, filename="招新公告.md", file_hash="file_hash",
         file_path="/tmp/recruit.md", status="ready", governance_status="published",
+        sensitivity_level=audience_scope,
     )
     version = DocumentVersion(
         id="ver_recruit_1", document_id=document.id, version_no=1,
@@ -38,7 +50,8 @@ def _seed_active_template(db):
     )
     template = FaqTemplate(
         id="faq_recruit_deadline", code="recruit_deadline", title="招新报名截止时间",
-        kb_scope_json=json.dumps([kb.id]), status="active", knowledge_snapshot="pending",
+        kb_scope_json=json.dumps([kb.id]), audience_scope=audience_scope,
+        status="active", knowledge_snapshot="pending",
         stable_prompt_hash="pending",
     )
     evidence = FaqTemplateEvidence(
@@ -55,6 +68,7 @@ def _seed_active_template(db):
     template.knowledge_snapshot = _snapshot([(evidence, document, version)])
     prefix = build_faq_stable_prefix(
         template.code, template.template_version, template.knowledge_snapshot,
+        audience_scope, cache_namespace(template, {kb.id: kb}),
         [(evidence.citation_label, evidence.excerpt)],
     )
     template.stable_prompt_hash = hashlib.sha256(prefix.encode()).hexdigest()
@@ -81,6 +95,48 @@ def test_match_public_faq_rejects_scope_or_published_version_mismatch(db_session
     document.published_version_id = "ver_recruit_2"
     db_session.commit()
     assert match_public_faq("报名截止时间是什么时候？", ["kb_public"], db=db_session) is None
+
+
+def test_student_template_denies_guest_and_reuses_student_scope(db_session):
+    template, _document = _seed_active_template(db_session, "student")
+
+    assert match_faq("报名截止时间是什么时候？", ["kb_public"], "guest", db=db_session) is None
+    matched = match_faq("报名截止时间是什么时候？", ["kb_public"], "student", db=db_session)
+
+    assert matched is not None
+    assert matched.audience_scope == "student"
+    assert matched.cache_namespace in matched.stable_prefix
+    assert template.code in matched.stable_prefix
+
+
+def test_document_change_marks_referenced_active_template_stale(db_session):
+    template, document = _seed_active_template(db_session)
+
+    assert mark_templates_stale_for_document(db_session, document.id) == [template.id]
+    db_session.commit()
+
+    assert db_session.get(FaqTemplate, template.id).status == "stale"
+    assert match_public_faq("报名截止时间是什么时候？", ["kb_public"], db=db_session) is None
+
+
+def test_governance_update_marks_referenced_template_stale(db_session):
+    template, document = _seed_active_template(db_session)
+    role = Role(id="role_editor", code="editor", name="编辑")
+    user = User(
+        id="user_editor", username="editor", password_hash="unused", nickname="编辑", roles=[role]
+    )
+    db_session.add_all([role, user])
+    db_session.commit()
+
+    update_document_governance(
+        "kb_public", document.id,
+        DocumentGovernanceUpdate(
+            sensitivity_level="guest", content_owner="资料管理员", source_name="招新公告",
+        ),
+        db_session, user,
+    )
+
+    assert db_session.get(FaqTemplate, template.id).status == "stale"
 
 
 def test_import_script_creates_only_validated_active_template(db_session, monkeypatch):

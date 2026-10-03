@@ -162,6 +162,8 @@ def test_answer_stream_llm_error_propagates(mock_stream, mock_retrieve):
 def _faq_match():
     return FaqMatch(
         code="recruit_deadline",
+        audience_scope="guest",
+        cache_namespace="namespace",
         stable_prefix="已审核 FAQ 证据卡",
         chunks=[
             RetrievedChunk(
@@ -176,7 +178,7 @@ def test_answer_uses_verified_faq_context_cache(monkeypatch):
     """两个显式开关开启后，命中 FAQ 时不进入常规检索。"""
     monkeypatch.setattr(rag_pipeline.settings, "faq_template_enabled", True)
     monkeypatch.setattr(rag_pipeline.settings, "context_cache_enabled", True)
-    with patch("app.core.faq.service.match_public_faq", return_value=_faq_match()), patch(
+    with patch("app.core.faq.service.match_faq", return_value=_faq_match()), patch(
         "app.core.rag_pipeline.qwen.chat_completion_with_context_cache", return_value="截止时间为 10 月 20 日。"
     ) as cache_chat, patch("app.core.rag_pipeline.retriever.retrieve") as retrieve:
         result = rag_pipeline.answer("报名截止时间是什么时候？", ["kb_public"], include_diagnostics=True)
@@ -193,7 +195,7 @@ def test_faq_cache_failure_falls_back_to_regular_rag(monkeypatch):
     monkeypatch.setattr(rag_pipeline.settings, "context_cache_enabled", True)
     fallback_chunks = _fake_chunks()
     fallback_evidence = rag_pipeline.EvidenceDecision(True, "fallback", 1, 1, 0.9, 1.0, None, False)
-    with patch("app.core.faq.service.match_public_faq", return_value=_faq_match()), patch(
+    with patch("app.core.faq.service.match_faq", return_value=_faq_match()), patch(
         "app.core.rag_pipeline.qwen.chat_completion_with_context_cache",
         side_effect=LLMError("context_cache_disabled", "缓存调用失败"),
     ), patch("app.core.rag_pipeline._prepare", return_value=(
@@ -209,7 +211,7 @@ def test_faq_cache_stream_failure_before_output_falls_back(monkeypatch):
     monkeypatch.setattr(rag_pipeline.settings, "faq_template_enabled", True)
     monkeypatch.setattr(rag_pipeline.settings, "context_cache_enabled", True)
     fallback_evidence = rag_pipeline.EvidenceDecision(True, "fallback", 1, 1, 0.9, 1.0, None, False)
-    with patch("app.core.faq.service.match_public_faq", return_value=_faq_match()), patch(
+    with patch("app.core.faq.service.match_faq", return_value=_faq_match()), patch(
         "app.core.rag_pipeline.qwen.chat_completion_stream_with_context_cache",
         side_effect=LLMError("llm_call_failed", "缓存调用失败"),
     ), patch("app.core.rag_pipeline._prepare", return_value=(

@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 
 from app.api.errors import ApiError, BadRequestError, NotFoundError
 from app.auth.dependencies import get_optional_current_user
-from app.authorization.permissions import list_readable_kbs
+from app.authorization.permissions import effective_level, list_readable_kbs
 from app.authorization.session_access import require_session_owner
 from app.core.rag_pipeline import answer, answer_stream
 from app.core.agent import orchestrator as agent
@@ -126,6 +126,7 @@ async def _sse_stream(
     session: ChatSession,
     user_id: str | None = None,
     readable_kb_ids: list[str] | None = None,
+    audience_scope: str = "guest",
 ) -> None:
     """SSE 生成器：meta → delta* → done（或 error，替代 done 后正常关闭）。
 
@@ -142,7 +143,7 @@ async def _sse_stream(
     if settings.intent_router_enabled:
         sync_iter = intent_router.answer_stream(
             req.message, readable_kb_ids or [], session_id=session.id, user_id=user_id,
-            cancellation=cancellation,
+            cancellation=cancellation, audience_scope=audience_scope,
         )
     elif settings.agent_enabled:
         sync_iter = agent.answer_stream(
@@ -151,7 +152,8 @@ async def _sse_stream(
         )
     else:
         sync_iter = answer_stream(
-            req.message, readable_kb_ids or [], session_id=session.id, user_id=user_id
+            req.message, readable_kb_ids or [], session_id=session.id, user_id=user_id,
+            audience_scope=audience_scope,
         )
     try:
         while True:
@@ -295,12 +297,13 @@ async def chat(
         raise BadRequestError("empty_message", "消息不能为空")
 
     readable_kb_ids = [kb.id for kb in list_readable_kbs(db, user)]
+    audience_scope = effective_level(user)
     anonymous_id, set_anonymous = _get_anonymous_id(request)
     session = _get_or_create_session(db, req.session_id, AUTO_KB_SCOPE, user, anonymous_id)
 
     if req.stream:
         stream_response = StreamingResponse(
-            _sse_stream(req, request, db, session, user.id if user else None, readable_kb_ids),
+            _sse_stream(req, request, db, session, user.id if user else None, readable_kb_ids, audience_scope),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -315,6 +318,7 @@ async def chat(
     )
     result = await asyncio.to_thread(
         selected_answer, req.message, readable_kb_ids, session_id=session.id, user_id=user.id if user else None,
+        audience_scope=audience_scope,
     )
 
     # 消息落库（user + assistant 成对）+ 记忆窗口更新

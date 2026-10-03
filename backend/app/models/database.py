@@ -344,7 +344,7 @@ class FaqTemplate(Base):
     code: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     title: Mapped[str] = mapped_column(String(128))
     kb_scope_json: Mapped[str] = mapped_column(Text, default="[]")
-    audience_scope: Mapped[str] = mapped_column(String(16), default="public", index=True)
+    audience_scope: Mapped[str] = mapped_column(String(16), default="guest", index=True)
     template_version: Mapped[int] = mapped_column(Integer, default=1)
     prompt_policy_version: Mapped[str] = mapped_column(String(64), default="faq-policy-v1")
     knowledge_snapshot: Mapped[str] = mapped_column(String(128), index=True)

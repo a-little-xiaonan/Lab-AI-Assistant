@@ -148,16 +148,16 @@ class FaqPrepared:
 
 
 def _prepare_public_faq(
-    query: str, kb_id: str | list[str], history: str
+    query: str, kb_id: str | list[str], history: str, audience_scope: str
 ) -> FaqPrepared | None:
     """仅为公开 FAQ 构造缓存 Prompt；任意异常均回退常规 RAG。"""
     if not (settings.faq_template_enabled and settings.context_cache_enabled):
         return None
     readable_kb_ids = kb_id if isinstance(kb_id, list) else [kb_id]
     try:
-        from app.core.faq.service import match_public_faq
+        from app.core.faq.service import match_faq
 
-        matched = match_public_faq(query, readable_kb_ids)
+        matched = match_faq(query, readable_kb_ids, audience_scope)
         if matched is None:
             return None
         bounded_history = history[-settings.faq_template_history_max_chars:]
@@ -310,6 +310,7 @@ def answer(
     kb_id: str | list[str] = KB_DEFAULT,
     session_id: str | None = None,
     user_id: str | None = None,
+    audience_scope: str = "guest",
     **flags,
 ) -> dict:
     """返回 {"answer": str, "sources": [{"source_file", "page", "snippet"}]}。
@@ -319,7 +320,7 @@ def answer(
     """
     started = time.monotonic()
     history = _get_history_context(session_id)
-    faq = _prepare_public_faq(query, kb_id, history)
+    faq = _prepare_public_faq(query, kb_id, history, audience_scope)
     answer_mode = "rag"
     if faq is not None:
         try:
@@ -376,6 +377,7 @@ def answer_stream(
     kb_id: str | list[str] = KB_DEFAULT,
     session_id: str | None = None,
     user_id: str | None = None,
+    audience_scope: str = "guest",
     **flags,
 ) -> Iterator[dict]:
     """流式回答生成器：依次 yield 净化后的 delta，最后 yield done。
@@ -386,7 +388,7 @@ def answer_stream(
     if cancellation is not None and cancellation.is_set():
         return
     history = _get_history_context(session_id)
-    faq = _prepare_public_faq(query, kb_id, history)
+    faq = _prepare_public_faq(query, kb_id, history, audience_scope)
     if faq is not None:
         proc = CitationStreamProcessor(faq.chunks)
         processed = []

@@ -94,13 +94,13 @@ def _classify(query: str, history: str, cancellation: Event | None = None) -> In
 
 
 def _answer_one(route: PartRoute, query: str, kb_ids: list[str], session_id: str | None,
-                user_id: str | None, history: str) -> dict:
+                user_id: str | None, history: str, audience_scope: str) -> dict:
     if route == "general":
         text = qwen.chat_completion(build_general_answer_messages(query, history))
         return {"answer": text.strip(), "sources": []}
     if route == "knowledge":
         handler = agent.answer if settings.agent_enabled else rag_pipeline.answer
-        return handler(query, kb_ids, session_id=session_id, user_id=user_id)
+        return handler(query, kb_ids, session_id=session_id, user_id=user_id, audience_scope=audience_scope)
     if settings.agent_enabled:
         return agent.answer(query, kb_ids, session_id=session_id, user_id=user_id)
     return {"answer": TOOL_UNAVAILABLE, "sources": []}
@@ -119,16 +119,17 @@ def _merge_sources(results: list[dict], key: str) -> list[dict]:
 
 def answer(query: str, kb_ids: list[str], session_id: str | None = None,
            user_id: str | None = None, **flags) -> dict:
+    audience_scope = flags.get("audience_scope", "guest")
     history = rag_pipeline._get_history_context(session_id)
     plan = _classify(query, history)
     if plan.route == "clarify":
         return {"answer": plan.clarifying_question, "sources": []}
     if plan.route != "mixed":
-        return _answer_one(plan.route, query, kb_ids, session_id, user_id, history)
+        return _answer_one(plan.route, query, kb_ids, session_id, user_id, history, audience_scope)
     sections, results = [], []
     for index, part in enumerate(plan.parts, 1):
         try:
-            result = _answer_one(part.route, part.question, kb_ids, session_id, user_id, history)
+            result = _answer_one(part.route, part.question, kb_ids, session_id, user_id, history, audience_scope)
         except LLMError:
             logger.exception("混合问题子项回答失败：route=%s", part.route)
             result = {"answer": PART_FAILURE, "sources": []}
@@ -146,7 +147,8 @@ def _direct_stream(text: str) -> Iterator[dict]:
 
 
 def _stream_one(route: PartRoute, query: str, kb_ids: list[str], session_id: str | None,
-                user_id: str | None, history: str, cancellation: Event | None) -> Iterator[dict]:
+                user_id: str | None, history: str, cancellation: Event | None,
+                audience_scope: str) -> Iterator[dict]:
     if route == "general":
         parts = []
         for delta in qwen.chat_completion_stream(build_general_answer_messages(query, history)):
@@ -162,7 +164,7 @@ def _stream_one(route: PartRoute, query: str, kb_ids: list[str], session_id: str
                                            cancellation=cancellation)
         else:
             yield from rag_pipeline.answer_stream(query, kb_ids, session_id=session_id, user_id=user_id,
-                                                  cancellation=cancellation)
+                                                  cancellation=cancellation, audience_scope=audience_scope)
         return
     if settings.agent_enabled:
         yield from agent.answer_stream(query, kb_ids, session_id=session_id, user_id=user_id,
@@ -174,6 +176,7 @@ def _stream_one(route: PartRoute, query: str, kb_ids: list[str], session_id: str
 def answer_stream(query: str, kb_ids: list[str], session_id: str | None = None,
                   user_id: str | None = None, **flags) -> Iterator[dict]:
     cancellation = flags.get("cancellation")
+    audience_scope = flags.get("audience_scope", "guest")
     history = rag_pipeline._get_history_context(session_id)
     plan = _classify(query, history, cancellation)
     if cancellation is not None and cancellation.is_set():
@@ -182,7 +185,7 @@ def answer_stream(query: str, kb_ids: list[str], session_id: str | None = None,
         yield from _direct_stream(plan.clarifying_question)
         return
     if plan.route != "mixed":
-        yield from _stream_one(plan.route, query, kb_ids, session_id, user_id, history, cancellation)
+        yield from _stream_one(plan.route, query, kb_ids, session_id, user_id, history, cancellation, audience_scope)
         return
 
     emitted, results = [], []
@@ -196,7 +199,7 @@ def answer_stream(query: str, kb_ids: list[str], session_id: str | None = None,
         part_deltas = []
         try:
             for item in _stream_one(part.route, part.question, kb_ids, session_id, user_id,
-                                    history, cancellation):
+                                    history, cancellation, audience_scope):
                 if cancellation is not None and cancellation.is_set():
                     return
                 if item["type"] == "delta":

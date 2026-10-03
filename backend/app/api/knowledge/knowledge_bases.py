@@ -180,10 +180,12 @@ def delete_knowledge_base(
             DocumentTopic.doc_id.in_(select(Document.id).where(Document.kb_id == kb_id))
         )
     )
+    from app.core.faq.service import mark_templates_stale_for_kb
+    stale_templates = mark_templates_stale_for_kb(db, kb_id)
     db.execute(delete(Document).where(Document.kb_id == kb_id))
     from app.services.operations.audit import record_in_transaction
     record_in_transaction(db, user, "kb.delete", "knowledge_base", kb.id,
-                          detail={"name": kb.name})
+                          detail={"name": kb.name, "stale_faq_template_ids": stale_templates})
     db.delete(kb)
     db.commit()
 
