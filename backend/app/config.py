@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     llm_timeout: int = 60
     llm_stream_timeout: int = 300  # 流式超时放宽：长回答生成期间无单个块超时风险
 
+    # ----- 回答依据路由（默认开启）-----
+    intent_router_enabled: bool = True
+    intent_route_timeout_seconds: float = Field(default=8, gt=0, le=30)
+
     # ----- 轻量 Agent（M1，启用需另行验收确认）-----
     agent_enabled: bool = False
     agent_max_tool_rounds: int = Field(default=5, ge=1, le=5)
