@@ -46,6 +46,9 @@ class Settings(BaseSettings):
 
     # ----- 公开 FAQ 模板（P1：默认关闭；命中失败始终回退常规 RAG）-----
     faq_template_enabled: bool = False
+    # P3 灰度：仅 guest 模板，按 request_id 的稳定哈希放量；0 表示不进入模板分支。
+    faq_template_public_only: bool = True
+    faq_template_rollout_percent: int = Field(default=0, ge=0, le=100)
     context_cache_enabled: bool = False
     context_cache_model: str = ""  # 空值时复用 llm_model；应配置为已验证支持显式缓存的模型
     context_cache_protocol_version: str = "dashscope-multimodal-v1"

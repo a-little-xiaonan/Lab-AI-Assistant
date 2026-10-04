@@ -33,6 +33,7 @@ from app.llm.prompt_templates import (
 )
 from app.memory.long_term import format_memories, long_term_memory
 from app.memory.memory_manager import memory_manager
+from app.middleware.request_context import current_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -145,30 +146,64 @@ class FaqPrepared:
     code: str
     chunks: list[retriever.RetrievedChunk]
     messages: list[dict]
+    cache_namespace: str
+    template_version: int
+    cache_enabled: bool
 
 
 def _prepare_public_faq(
     query: str, kb_id: str | list[str], history: str, audience_scope: str
 ) -> FaqPrepared | None:
-    """仅为公开 FAQ 构造缓存 Prompt；任意异常均回退常规 RAG。"""
-    if not (settings.faq_template_enabled and settings.context_cache_enabled):
+    """构造已校验 FAQ Prompt；未放量、未命中或异常均回退常规 RAG。"""
+    if not settings.faq_template_enabled:
         return None
     readable_kb_ids = kb_id if isinstance(kb_id, list) else [kb_id]
     try:
-        from app.core.faq.service import match_faq
+        from app.core.faq.service import is_rollout_eligible, match_faq
+
+        if not is_rollout_eligible(current_request_id(), settings.faq_template_rollout_percent):
+            return None
 
         matched = match_faq(query, readable_kb_ids, audience_scope)
         if matched is None:
             return None
+        if settings.faq_template_public_only and matched.audience_scope != "guest":
+            return None
         bounded_history = history[-settings.faq_template_history_max_chars:]
+        cache_enabled = settings.context_cache_enabled
         return FaqPrepared(
             code=matched.code,
             chunks=matched.chunks,
-            messages=build_faq_answer_messages(matched.stable_prefix, query, bounded_history),
+            messages=build_faq_answer_messages(
+                matched.stable_prefix, query, bounded_history, use_context_cache=cache_enabled,
+            ),
+            cache_namespace=matched.cache_namespace,
+            template_version=matched.template_version,
+            cache_enabled=cache_enabled,
         )
     except Exception:
         logger.exception("FAQ 模板校验失败，回退常规 RAG")
         return None
+
+
+def _log_faq_observation(
+    faq: FaqPrepared, *, stage: str, route_elapsed: float, generation_elapsed: float | None = None,
+    ttft_elapsed: float | None = None,
+) -> None:
+    """记录可聚合的 FAQ 指标，严禁写入问题、证据正文和完整回答。"""
+    fields = [
+        f"template={faq.code}",
+        f"version={faq.template_version}",
+        f"namespace={faq.cache_namespace}",
+        f"cache_enabled={str(faq.cache_enabled).lower()}",
+        f"stage={stage}",
+        f"route_ms={route_elapsed * 1000:.1f}",
+    ]
+    if generation_elapsed is not None:
+        fields.append(f"generation_ms={generation_elapsed * 1000:.1f}")
+    if ttft_elapsed is not None:
+        fields.append(f"ttft_ms={ttft_elapsed * 1000:.1f}")
+    logger.info("FAQ 缓存观测：%s", " ".join(fields))
 
 
 def prepare_evidence(query: str, kb_id: str | list[str], history: str = "", *,
@@ -327,12 +362,21 @@ def answer(
             chunks = faq.chunks
             evidence = _faq_evidence(chunks)
             status = "ok"
-            answer_mode = "faq_context_cache"
+            answer_mode = "faq_context_cache" if faq.cache_enabled else "faq_template"
             retrieval_elapsed = time.monotonic() - started
             generation_started = time.monotonic()
-            result = _finalize(qwen.chat_completion_with_context_cache(faq.messages), chunks)
+            raw_answer = (
+                qwen.chat_completion_with_context_cache(faq.messages)
+                if faq.cache_enabled else qwen.chat_completion(faq.messages)
+            )
+            result = _finalize(raw_answer, chunks)
+            _log_faq_observation(
+                faq, stage="completed", route_elapsed=retrieval_elapsed,
+                generation_elapsed=time.monotonic() - generation_started,
+            )
         except LLMError:
-            logger.exception("FAQ 缓存调用失败，回退常规 RAG：template=%s", faq.code)
+            logger.exception("FAQ 模板调用失败，回退常规 RAG：template=%s", faq.code)
+            _log_faq_observation(faq, stage="fallback", route_elapsed=time.monotonic() - started)
             faq = None
     if faq is None:
         chunks, messages, evidence, status = _prepare(query, kb_id, history=history, user_id=user_id)
@@ -388,39 +432,66 @@ def answer_stream(
     if cancellation is not None and cancellation.is_set():
         return
     history = _get_history_context(session_id)
+    started = time.monotonic()
     faq = _prepare_public_faq(query, kb_id, history, audience_scope)
     if faq is not None:
         proc = CitationStreamProcessor(faq.chunks)
         processed = []
         emitted = False
+        first_token_elapsed: float | None = None
+        route_elapsed = time.monotonic() - started
+        generation_started = time.monotonic()
         try:
-            for delta in qwen.chat_completion_stream_with_context_cache(faq.messages):
+            stream = (
+                qwen.chat_completion_stream_with_context_cache(faq.messages)
+                if faq.cache_enabled else qwen.chat_completion_stream(faq.messages)
+            )
+            for delta in stream:
                 if cancellation is not None and cancellation.is_set():
                     return
                 replaced = proc.feed(delta)
                 if replaced:
+                    if first_token_elapsed is None:
+                        first_token_elapsed = time.monotonic() - started
                     emitted = True
                     processed.append(replaced)
                     yield {"type": "delta", "text": replaced}
             tail = proc.flush()
             if tail:
+                if first_token_elapsed is None:
+                    first_token_elapsed = time.monotonic() - started
                 emitted = True
                 processed.append(tail)
                 yield {"type": "delta", "text": tail}
             body = _strip_citations("".join(processed))
-            yield {"type": "done", "full_text": body, "sources": _dedup_sources(faq.chunks)}
+            _log_faq_observation(
+                faq, stage="completed", route_elapsed=route_elapsed,
+                generation_elapsed=time.monotonic() - generation_started,
+                ttft_elapsed=first_token_elapsed,
+            )
+            done = {"type": "done", "full_text": body, "sources": _dedup_sources(faq.chunks)}
+            if flags.get("include_diagnostics"):
+                done["diagnostics"] = {
+                    "answer_mode": "faq_context_cache" if faq.cache_enabled else "faq_template",
+                    "faq_template_code": faq.code,
+                }
+            yield done
             return
         except LLMError:
             if emitted:
                 raise
-            logger.exception("FAQ 缓存流式调用失败，回退常规 RAG：template=%s", faq.code)
+            logger.exception("FAQ 模板流式调用失败，回退常规 RAG：template=%s", faq.code)
+            _log_faq_observation(faq, stage="fallback", route_elapsed=time.monotonic() - started)
 
     chunks, messages, _evidence, status = _prepare(query, kb_id, history=history, user_id=user_id)
     if cancellation is not None and cancellation.is_set():
         return
     if status == "failed":
         yield {"type": "delta", "text": KNOWLEDGE_UNAVAILABLE}
-        yield {"type": "done", "full_text": KNOWLEDGE_UNAVAILABLE, "sources": []}
+        done = {"type": "done", "full_text": KNOWLEDGE_UNAVAILABLE, "sources": []}
+        if flags.get("include_diagnostics"):
+            done["diagnostics"] = {"answer_mode": "rag"}
+        yield done
         return
     proc = CitationStreamProcessor(chunks)
     processed = []
@@ -438,4 +509,7 @@ def answer_stream(
 
     body = _strip_citations("".join(processed))
     sources = _dedup_sources(chunks) if chunks else []
-    yield {"type": "done", "full_text": body, "sources": sources}
+    done = {"type": "done", "full_text": body, "sources": sources}
+    if flags.get("include_diagnostics"):
+        done["diagnostics"] = {"answer_mode": "rag"}
+    yield done

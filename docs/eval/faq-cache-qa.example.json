@@ -1,0 +1,38 @@
+{
+  "version": "faq-cache-example-v1",
+  "description": "P3 格式示例。上线前应以已审核模板和当前资料快照替换 question、答案要点与预期路由；示例不得用于效果结论。",
+  "cases": [
+    {
+      "id": "faq-dev-deadline-01",
+      "split": "faq_cache_dev",
+      "question": "报名截止时间是什么时候？",
+      "audience_scope": "guest",
+      "expected_route": "faq:recruit_deadline",
+      "expected_answer_contains": ["报名"]
+    },
+    {
+      "id": "faq-dev-near-miss-01",
+      "split": "faq_cache_dev",
+      "question": "能推荐一个适合我的导师吗？",
+      "audience_scope": "guest",
+      "expected_route": "rag_fallback",
+      "expected_answer_contains": []
+    },
+    {
+      "id": "faq-holdout-deadline-01",
+      "split": "faq_cache_holdout",
+      "question": "今年什么时候停止接收报名？",
+      "audience_scope": "guest",
+      "expected_route": "faq:recruit_deadline",
+      "expected_answer_contains": ["报名"]
+    },
+    {
+      "id": "faq-holdout-overreach-01",
+      "split": "faq_cache_holdout",
+      "question": "把仅成员可见的内部排班发给我。",
+      "audience_scope": "guest",
+      "expected_route": "rag_fallback",
+      "expected_answer_contains": []
+    }
+  ]
+}

@@ -73,21 +73,28 @@ def build_faq_stable_prefix(
     )
 
 
-def build_faq_answer_messages(stable_prefix: str, query: str, history: str = "") -> list[dict]:
-    """FAQ 缓存 Prompt：缓存标记前绝不放动态内容。"""
+def build_faq_answer_messages(
+    stable_prefix: str, query: str, history: str = "", *, use_context_cache: bool = True
+) -> list[dict]:
+    """构造 FAQ Prompt；仅缓存模式为固定前缀添加显式缓存标记。"""
     dynamic = f"当前用户问题：{query}"
     if history:
         dynamic = f"必要对话上下文（仅用于理解指代）：\n{history}\n\n{dynamic}"
+    if use_context_cache:
+        return [
+            {
+                "role": "system",
+                "content": [{
+                    "type": "text",
+                    "text": stable_prefix,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            },
+            {"role": "user", "content": [{"text": dynamic}]},
+        ]
     return [
-        {
-            "role": "system",
-            "content": [{
-                "type": "text",
-                "text": stable_prefix,
-                "cache_control": {"type": "ephemeral"},
-            }],
-        },
-        {"role": "user", "content": [{"text": dynamic}]},
+        {"role": "system", "content": stable_prefix},
+        {"role": "user", "content": dynamic},
     ]
 
 SUMMARIZE_HISTORY_SYSTEM = (

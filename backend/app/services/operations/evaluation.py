@@ -45,6 +45,11 @@ def safe_config_snapshot() -> dict:
         "evidence_gate_enabled": settings.evidence_gate_enabled,
         "query_planning_enabled": settings.query_planning_enabled,
         "topic_retrieval_enabled": settings.topic_retrieval_enabled,
+        "faq_template_enabled": settings.faq_template_enabled,
+        "faq_template_public_only": settings.faq_template_public_only,
+        "faq_template_rollout_percent": settings.faq_template_rollout_percent,
+        "context_cache_enabled": settings.context_cache_enabled,
+        "context_cache_protocol_version": settings.context_cache_protocol_version,
     }
 
 

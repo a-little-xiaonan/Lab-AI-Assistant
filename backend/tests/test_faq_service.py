@@ -10,6 +10,7 @@ from app.api.knowledge.documents import update_document_governance
 from app.core.faq.service import (
     _snapshot,
     cache_namespace,
+    is_rollout_eligible,
     mark_templates_stale_for_document,
     match_faq,
     match_public_faq,
@@ -85,6 +86,15 @@ def test_match_public_faq_returns_verified_evidence(db_session):
     assert matched.code == template.code
     assert matched.chunks[0].text.startswith("本期招新面向")
     assert "FAQ 模板：recruit_deadline:v1" in matched.stable_prefix
+
+
+def test_rollout_is_stable_and_missing_request_id_fails_closed():
+    """同一请求始终落到同一灰度桶，后台任务缺少上下文时不误放量。"""
+    request_id = "p3-rollout-request-0001"
+    assert is_rollout_eligible(request_id, 0) is False
+    assert is_rollout_eligible(request_id, 100) is True
+    assert is_rollout_eligible(None, 50) is False
+    assert is_rollout_eligible(request_id, 37) == is_rollout_eligible(request_id, 37)
 
 
 def test_match_public_faq_rejects_scope_or_published_version_mismatch(db_session):

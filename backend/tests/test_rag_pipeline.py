@@ -178,6 +178,7 @@ def test_answer_uses_verified_faq_context_cache(monkeypatch):
     """两个显式开关开启后，命中 FAQ 时不进入常规检索。"""
     monkeypatch.setattr(rag_pipeline.settings, "faq_template_enabled", True)
     monkeypatch.setattr(rag_pipeline.settings, "context_cache_enabled", True)
+    monkeypatch.setattr(rag_pipeline.settings, "faq_template_rollout_percent", 100)
     with patch("app.core.faq.service.match_faq", return_value=_faq_match()), patch(
         "app.core.rag_pipeline.qwen.chat_completion_with_context_cache", return_value="截止时间为 10 月 20 日。"
     ) as cache_chat, patch("app.core.rag_pipeline.retriever.retrieve") as retrieve:
@@ -193,6 +194,7 @@ def test_answer_uses_verified_faq_context_cache(monkeypatch):
 def test_faq_cache_failure_falls_back_to_regular_rag(monkeypatch):
     monkeypatch.setattr(rag_pipeline.settings, "faq_template_enabled", True)
     monkeypatch.setattr(rag_pipeline.settings, "context_cache_enabled", True)
+    monkeypatch.setattr(rag_pipeline.settings, "faq_template_rollout_percent", 100)
     fallback_chunks = _fake_chunks()
     fallback_evidence = rag_pipeline.EvidenceDecision(True, "fallback", 1, 1, 0.9, 1.0, None, False)
     with patch("app.core.faq.service.match_faq", return_value=_faq_match()), patch(
@@ -210,6 +212,7 @@ def test_faq_cache_failure_falls_back_to_regular_rag(monkeypatch):
 def test_faq_cache_stream_failure_before_output_falls_back(monkeypatch):
     monkeypatch.setattr(rag_pipeline.settings, "faq_template_enabled", True)
     monkeypatch.setattr(rag_pipeline.settings, "context_cache_enabled", True)
+    monkeypatch.setattr(rag_pipeline.settings, "faq_template_rollout_percent", 100)
     fallback_evidence = rag_pipeline.EvidenceDecision(True, "fallback", 1, 1, 0.9, 1.0, None, False)
     with patch("app.core.faq.service.match_faq", return_value=_faq_match()), patch(
         "app.core.rag_pipeline.qwen.chat_completion_stream_with_context_cache",
@@ -221,3 +224,18 @@ def test_faq_cache_stream_failure_before_output_falls_back(monkeypatch):
 
     assert "".join(item["text"] for item in items if item["type"] == "delta") == "常规回答"
     assert items[-1]["type"] == "done"
+
+
+def test_answer_uses_template_without_context_cache(monkeypatch):
+    """B 组仅启用 FAQ 模板，仍应跳过常规检索且不发送缓存标记。"""
+    monkeypatch.setattr(rag_pipeline.settings, "faq_template_enabled", True)
+    monkeypatch.setattr(rag_pipeline.settings, "context_cache_enabled", False)
+    monkeypatch.setattr(rag_pipeline.settings, "faq_template_rollout_percent", 100)
+    with patch("app.core.faq.service.match_faq", return_value=_faq_match()), patch(
+        "app.core.rag_pipeline.qwen.chat_completion", return_value="模板回答"
+    ) as normal_chat, patch("app.core.rag_pipeline.retriever.retrieve") as retrieve:
+        result = rag_pipeline.answer("报名截止时间是什么时候？", ["kb_public"], include_diagnostics=True)
+
+    assert result["diagnostics"]["answer_mode"] == "faq_template"
+    assert normal_chat.call_args.args[0][0]["content"] == "已审核 FAQ 证据卡"
+    retrieve.assert_not_called()

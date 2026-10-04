@@ -37,6 +37,20 @@ class FaqMatch:
     cache_namespace: str
     stable_prefix: str
     chunks: list[RetrievedChunk]
+    template_version: int = 0
+    knowledge_snapshot: str = ""
+
+
+def is_rollout_eligible(request_id: str | None, rollout_percent: int) -> bool:
+    """按请求 ID 稳定分桶；缺少请求上下文时保守不进入线上灰度。"""
+    if rollout_percent <= 0:
+        return False
+    if rollout_percent >= 100:
+        return True
+    if not request_id:
+        return False
+    bucket = int(hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:8], 16) % 100
+    return bucket < rollout_percent
 
 
 def normalize_query(query: str) -> str:
@@ -198,7 +212,10 @@ def match_faq(
                 )
                 for evidence, document, _version, chunk in checked
             ]
-            return FaqMatch(template.code, template.audience_scope, namespace, stable_prefix, chunks)
+            return FaqMatch(
+                template.code, template.audience_scope, namespace, stable_prefix, chunks,
+                template.template_version, template.knowledge_snapshot,
+            )
         return None
     finally:
         if owns_session:
