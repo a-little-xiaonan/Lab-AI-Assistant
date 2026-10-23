@@ -56,8 +56,7 @@ class Settings(BaseSettings):
     faq_tool_schema_version: str = "none-v1"
     faq_template_history_max_chars: int = Field(default=1200, ge=0, le=4000)
 
-    # ----- 回答依据路由（默认开启）-----
-    intent_router_enabled: bool = True
+    # ----- 回答依据路由（所有聊天请求统一经过意图识别）-----
     intent_route_timeout_seconds: float = Field(default=8, gt=0, le=30)
 
     # ----- 轻量 Agent（M1，启用需另行验收确认）-----

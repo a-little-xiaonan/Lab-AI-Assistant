@@ -151,12 +151,19 @@ def test_mixed_stream_discards_incomplete_part_and_keeps_other_part(monkeypatch)
     assert items[-1]["full_text"] == shown
 
 
-def test_api_router_general_stream_and_nonstream(client, monkeypatch):
+@pytest.mark.parametrize("agent_enabled", [False, True])
+def test_api_router_general_stream_and_nonstream(client, monkeypatch, agent_enabled):
     from app.api.conversation import chat
-    monkeypatch.setattr(settings, "intent_router_enabled", True)
-    monkeypatch.setattr(settings, "agent_enabled", False)
+    monkeypatch.setattr(settings, "agent_enabled", agent_enabled)
     monkeypatch.setattr(chat, "_schedule_auto_name", lambda *a: None)
-    monkeypatch.setattr(intent_router, "_classify", lambda *a, **k: _plan("general"))
+    classifier = Mock(return_value=_plan("general"))
+    monkeypatch.setattr(intent_router, "_classify", classifier)
+    knowledge = Mock(side_effect=AssertionError("通用问题不应进入知识检索"))
+    agent = Mock(side_effect=AssertionError("通用问题不应进入工具循环"))
+    monkeypatch.setattr(intent_router.rag_pipeline, "answer", knowledge)
+    monkeypatch.setattr(intent_router.rag_pipeline, "answer_stream", knowledge)
+    monkeypatch.setattr(intent_router.agent, "answer", agent)
+    monkeypatch.setattr(intent_router.agent, "answer_stream", agent)
     monkeypatch.setattr(intent_router.qwen, "chat_completion", Mock(return_value="先学会持续学习。"))
     stream_model = Mock(return_value=iter(["先学会", "持续学习。"]))
     monkeypatch.setattr(intent_router.qwen, "chat_completion_stream", stream_model)
@@ -168,12 +175,20 @@ def test_api_router_general_stream_and_nonstream(client, monkeypatch):
     assert [frame["event"] for frame in frames] == ["meta", "delta", "delta", "done"]
     assert frames[-1]["data"]["full_text"] == "先学会持续学习。"
     assert frames[-1]["data"]["sources"] == []
+    assert classifier.call_count == 2
+    knowledge.assert_not_called()
+    agent.assert_not_called()
 
 
-def test_api_route_failure_is_error_not_no_context(client, monkeypatch):
+@pytest.mark.parametrize("agent_enabled", [False, True])
+def test_api_route_failure_is_error_not_no_context(client, monkeypatch, agent_enabled):
     from app.api.conversation import chat
-    monkeypatch.setattr(settings, "intent_router_enabled", True)
+    monkeypatch.setattr(settings, "agent_enabled", agent_enabled)
     monkeypatch.setattr(chat, "_schedule_auto_name", lambda *a: None)
+    fallback = Mock(side_effect=AssertionError("分类失败不能绕过意图识别"))
+    for module in (intent_router.rag_pipeline, intent_router.agent):
+        monkeypatch.setattr(module, "answer", fallback)
+        monkeypatch.setattr(module, "answer_stream", fallback)
     def fail(*args, **kwargs):
         raise LLMError("intent_route_failed", "问题分类暂时失败，请稍后重试。")
     monkeypatch.setattr(intent_router, "_classify", fail)
@@ -184,3 +199,56 @@ def test_api_route_failure_is_error_not_no_context(client, monkeypatch):
         frames = _frames(stream)
     assert frames[-1]["event"] == "error"
     assert frames[-1]["data"]["code"] == "intent_route_failed"
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_api_followup_keeps_history_for_intent_and_answer(client, monkeypatch, streaming):
+    """同一会话的第二问继续向意图识别和回答模型提供上一轮历史。"""
+    from app.api.conversation import chat
+    from app.memory.short_term import ShortTermMemory
+
+    memories = {}
+
+    def get_memory(session_id):
+        return memories.setdefault(session_id, ShortTermMemory(session_id))
+
+    monkeypatch.setattr(chat.memory_manager, "get", get_memory)
+    monkeypatch.setattr(chat.memory_manager, "persist_summary", lambda *a: None)
+    monkeypatch.setattr(chat, "_schedule_auto_name", lambda *a: None)
+    classifier = Mock(return_value=_plan("general"))
+    monkeypatch.setattr(intent_router, "_classify", classifier)
+    generator = Mock(side_effect=["实验室经历可以积累项目经验。", "刚才提供的是一般性建议。"])
+    stream_generator = Mock(side_effect=[
+        iter(["实验室经历可以积累项目经验。"]), iter(["刚才提供的是一般性建议。"]),
+    ])
+    monkeypatch.setattr(intent_router.qwen, "chat_completion", generator)
+    monkeypatch.setattr(intent_router.qwen, "chat_completion_stream", stream_generator)
+
+    if streaming:
+        with client.stream("POST", "/api/chat", json={"message": "实验室经历对就业有什么帮助？", "stream": True}) as response:
+            frames = _frames(response)
+        session_id = frames[0]["data"]["session_id"]
+    else:
+        response = client.post("/api/chat", json={"message": "实验室经历对就业有什么帮助？"})
+        assert response.status_code == 200
+        session_id = client.get("/api/chat/sessions").json()[0]["id"]
+
+    followup = {"message": "这是自己想的，还是知识库里面就有呢？", "session_id": session_id}
+    if streaming:
+        with client.stream("POST", "/api/chat", json={**followup, "stream": True}) as response:
+            frames = _frames(response)
+        assert frames[-1]["data"]["full_text"] == "刚才提供的是一般性建议。"
+        messages = stream_generator.call_args.args[0]
+    else:
+        response = client.post("/api/chat", json=followup)
+        assert response.json()["answer"] == "刚才提供的是一般性建议。"
+        messages = generator.call_args.args[0]
+
+    assert classifier.call_count == 2
+    history = classifier.call_args.args[1]
+    assert "user: 实验室经历对就业有什么帮助？" in history
+    assert "assistant: 实验室经历可以积累项目经验。" in history
+    assert "assistant: 实验室经历可以积累项目经验。" in messages[1]["content"]
+    saved = client.get(f"/api/chat/sessions/{session_id}").json()["messages"]
+    assert [message["role"] for message in saved] == ["user", "assistant", "user", "assistant"]

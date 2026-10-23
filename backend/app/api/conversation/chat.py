@@ -31,8 +31,6 @@ from app.api.errors import ApiError, BadRequestError, NotFoundError
 from app.auth.dependencies import get_optional_current_user
 from app.authorization.permissions import effective_level, list_readable_kbs
 from app.authorization.session_access import require_session_owner
-from app.core.rag_pipeline import answer, answer_stream
-from app.core.agent import orchestrator as agent
 from app.core import intent_router
 from app.config import settings
 from app.llm import qwen
@@ -140,21 +138,10 @@ async def _sse_stream(
     yield format_sse_event("meta", {"session_id": session.id})
 
     cancellation = threading.Event()
-    if settings.intent_router_enabled:
-        sync_iter = intent_router.answer_stream(
-            req.message, readable_kb_ids or [], session_id=session.id, user_id=user_id,
-            cancellation=cancellation, audience_scope=audience_scope,
-        )
-    elif settings.agent_enabled:
-        sync_iter = agent.answer_stream(
-            req.message, readable_kb_ids or [], session_id=session.id, user_id=user_id,
-            cancellation=cancellation,
-        )
-    else:
-        sync_iter = answer_stream(
-            req.message, readable_kb_ids or [], session_id=session.id, user_id=user_id,
-            audience_scope=audience_scope,
-        )
+    sync_iter = intent_router.answer_stream(
+        req.message, readable_kb_ids or [], session_id=session.id, user_id=user_id,
+        cancellation=cancellation, audience_scope=audience_scope,
+    )
     try:
         while True:
             if await request.is_disconnected():
@@ -177,7 +164,7 @@ async def _sse_stream(
             if item["type"] == "delta":
                 yield format_sse_event("delta", {"text": item["text"]})
             elif item["type"] == "status":
-                yield format_sse_event("status", {"message": item["message"]})
+                logger.debug("回答生成状态：session=%s message=%s", session.id, item["message"])
             elif item["type"] == "done":
                 # 先落库成功再发 done 帧：客户端收到 done 时数据已持久化
                 assistant_message = Message(
@@ -311,13 +298,9 @@ async def chat(
             _set_anonymous_cookie(stream_response, anonymous_id)
         return stream_response
 
-    # 非流式（Phase 1 行为不变，历史由 pipeline 从短期记忆取）
-    selected_answer = (
-        intent_router.answer if settings.intent_router_enabled
-        else agent.answer if settings.agent_enabled else answer
-    )
+    # 非流式与流式统一先识别意图，再由路由器选择回答能力。
     result = await asyncio.to_thread(
-        selected_answer, req.message, readable_kb_ids, session_id=session.id, user_id=user.id if user else None,
+        intent_router.answer, req.message, readable_kb_ids, session_id=session.id, user_id=user.id if user else None,
         audience_scope=audience_scope,
     )
 

@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from app.config import settings
-from app.core import rag_pipeline
+from app.core import intent_router, rag_pipeline
 from app.core.agent import orchestrator
 from app.core.agent.models import ToolContext
 from app.core.agent.runtime import ExecutionBudget, run_bounded
@@ -286,18 +286,21 @@ def test_stream_and_nonstream_equivalence(monkeypatch):
     assert items[-1]["full_text"] == "".join(i["text"] for i in items if i["type"] == "delta")
 
 
-def test_api_switch_and_scope(client, monkeypatch):
+def test_api_agent_route_and_scope(client, monkeypatch):
     from app.api.conversation import chat
     monkeypatch.setattr(settings, "agent_enabled", True)
     monkeypatch.setattr(chat, "_schedule_auto_name", lambda *a: None)
     agent = Mock(return_value={"answer": "日期", "sources": [], "tool_sources": []})
-    monkeypatch.setattr(chat.agent, "answer", agent)
+    classifier = Mock(return_value=intent_router.IntentPlan(route="tool"))
+    monkeypatch.setattr(intent_router, "_classify", classifier)
+    monkeypatch.setattr(orchestrator, "answer", agent)
     legacy = Mock(side_effect=AssertionError("legacy called"))
-    monkeypatch.setattr(chat, "answer", legacy)
+    monkeypatch.setattr(rag_pipeline, "answer", legacy)
     response = client.post("/api/chat", json={"message": "今天？"})
     assert response.status_code == 200
     assert "tool_sources" in response.json()
     assert agent.call_args.args[1] == ["kb_default"]
+    classifier.assert_called_once()
     legacy.assert_not_called()
 
 
@@ -354,10 +357,11 @@ def test_context_cache_does_not_cross_requests():
     assert not registry.execute(call(), two).cache_hit
 
 
-def test_api_agent_status_and_sources(client, monkeypatch):
+def test_api_agent_returns_answer_without_internal_status(client, monkeypatch):
     from app.api.conversation import chat
     monkeypatch.setattr(settings, "agent_enabled", True)
     monkeypatch.setattr(chat, "_schedule_auto_name", lambda *a: None)
+    monkeypatch.setattr(intent_router, "_classify", lambda *a, **kw: intent_router.IntentPlan(route="tool"))
 
     def stream(*args, **kwargs):
         yield {"type": "status", "message": "正在读取时钟"}
@@ -365,16 +369,19 @@ def test_api_agent_status_and_sources(client, monkeypatch):
         yield {"type": "done", "full_text": "日期结果", "sources": [],
                "tool_sources": [{"type": "datetime", "provider": "server_clock"}]}
 
-    monkeypatch.setattr(chat.agent, "answer_stream", stream)
+    monkeypatch.setattr(orchestrator, "answer_stream", stream)
     with client.stream("POST", "/api/chat", json={"message": "今天？", "stream": True}) as response:
         text = "\n".join(response.iter_lines())
-    assert text.index("event: meta") < text.index("event: status") < text.index("event: delta") < text.index("event: done")
+    assert text.index("event: meta") < text.index("event: delta") < text.index("event: done")
+    assert "event: status" not in text
+    assert "正在读取时钟" not in text
+    assert "日期结果" in text
     assert '"tool_sources"' in text
 
 
 def test_empty_stream_becomes_error(client, monkeypatch):
     from app.api.conversation import chat
-    monkeypatch.setattr(chat, "answer_stream", lambda *a, **kw: iter([]))
+    monkeypatch.setattr(intent_router, "answer_stream", lambda *a, **kw: iter([]))
     with client.stream("POST", "/api/chat", json={"message": "今天？", "stream": True}) as response:
         text = "\n".join(response.iter_lines())
     assert "incomplete_stream" in text
