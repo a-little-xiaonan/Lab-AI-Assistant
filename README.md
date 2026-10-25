@@ -4,8 +4,7 @@
 
 - 后端：FastAPI + 通义千问（DashScope qwen-plus / text-embedding-v3）+ ChromaDB + MySQL/SQLite
 - 前端：Vite + Vue 3 + TypeScript + Element Plus（聊天界面）
-- 项目目录与代码入口：[docs/README.md](docs/README.md)
-- 技术设计文档：`docs/RAG-AI-Assistant-技术设计文档.md`；分阶段开发文档：`docs/development/`
+- 本地项目资料：`docs/` 仅保留在本地，不随仓库提交或推送；本地导航为 `docs/README.md`。
 - 当前进度：**Phase 3 全部完成**；并已完成多用户基础能力：登录认证、角色权限、知识库授权、会话归属与用户级记忆隔离。
 
 ## 快速开始
@@ -85,9 +84,11 @@ TOPIC_RETRIEVAL_ENABLED=true
 
 ## 验证
 
+单元测试和以下解析样例使用仓库自带的测试文件。评测脚本默认读取本地 `docs/eval/` 数据，该目录不随 Git 仓库分发；新克隆环境需要自行准备评测数据，或通过脚本的 `--samples` / `--dataset` 参数指定本地数据文件。
+
 ```bash
 # 无 key 也能玩的：解析预览（看任意文件切出多少块、元数据对不对）
-../.venv/bin/python scripts/knowledge/parse_preview.py ../docs/RAG-AI-Assistant-技术设计文档.md
+../.venv/bin/python scripts/knowledge/parse_preview.py tests/fixtures/sample.md
 
 # 有 key 后：冒烟测试（对话 + embedding 1024 维）
 ../.venv/bin/python scripts/smoke/smoke_test.py
@@ -173,7 +174,7 @@ backend/app/
 backend/scripts/         # administration / evaluation / knowledge / smoke
 backend/tests/           # 单测（无需 API key）
 frontend/src/            # api / views / components 均按业务域分目录
-docs/eval/               # QA 评估样例集 + 基线结果
+docs/                    # 本地项目资料与评测数据（gitignore，不随仓库分发）
 data/                    # 运行时数据（gitignore）：chroma/、uploads/、app.db
 ```
 
@@ -191,6 +192,6 @@ data/                    # 运行时数据（gitignore）：chroma/、uploads/�
 - **长期记忆**（Phase 3-03）：每轮对话后台提取（LLM → 置信度过滤 → 向量入库 `kb_{kb_id}_memory`），提问时召回相关记忆拼入 prompt（参考资料 → 相关记忆 → 对话历史 → 问题）；按知识库隔离、跨会话共享；清理入口 `DELETE /api/memory/{session_id}`
 - **上传异步化**：Phase 2 起上传立即返回 202 + processing，后台处理完成后 status=ready/failed（失败带 error_message），前端轮询列表
 - **引用规范**：正文 `[来源: 文件名 P页码]` + 末尾「参考来源：」汇总段（同源合并、snippet ≤50 字）；幻觉防护（越界引用剔除、直写不存在的来源剔除）
-- **评估基线**：`docs/eval/qa-samples.md` 18 条样例 + `scripts/evaluation/eval_run.py`，Phase 3 每个增强跑同一批对比
+- **评估基线**：本地 `docs/eval/qa-samples.md` 样例 + `scripts/evaluation/eval_run.py`，每次增强使用同一批数据对比；数据文件需自行准备，不随仓库分发。
 - **并发**：ChromaDB 写入进程内锁串行（单进程 uvicorn 前提，`--workers >1` 需升级锁方案）
 - Phase 3：Query Rewrite / Re-ranking / 长期记忆 / 混合检索 / 文档重索引 / 前端知识库管理
