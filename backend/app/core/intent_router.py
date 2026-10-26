@@ -16,6 +16,7 @@ from app.core.agent.runtime import ExecutionBudget, run_bounded
 from app.llm import qwen
 from app.llm.errors import LLMError
 from app.llm.prompt_templates import build_general_answer_messages, build_intent_route_messages
+from app.observability.tracing import stage, traced_stream
 
 logger = logging.getLogger(__name__)
 PartRoute = Literal["general", "knowledge", "tool"]
@@ -35,6 +36,20 @@ class IntentPlan:
     route: Route
     parts: tuple[IntentPart, ...] = ()
     clarifying_question: str = ""
+
+
+def _provenance_for(route: PartRoute) -> dict:
+    answer_kind = "unavailable" if route == "tool" and not settings.agent_enabled else route
+    return {
+        "action": "answer",
+        "answer_kind": answer_kind,
+        "basis_status": (
+            "not_applicable" if route == "general"
+            else "unknown" if answer_kind == "unavailable"
+            else "recorded"
+        ),
+        "parts": [],
+    }
 
 
 def _parse_plan(output: str) -> IntentPlan:
@@ -78,6 +93,13 @@ def _parse_plan(output: str) -> IntentPlan:
 
 
 def _classify(query: str, history: str, cancellation: Event | None = None) -> IntentPlan:
+    with stage("intent.classify", query_chars=len(query), history_chars=len(history[-2000:])) as observed:
+        plan = _classify_impl(query, history, cancellation)
+        observed.set_attributes(route=plan.route, parts_count=len(plan.parts))
+        return plan
+
+
+def _classify_impl(query: str, history: str, cancellation: Event | None = None) -> IntentPlan:
     started = time.monotonic()
     budget = ExecutionBudget(started + settings.intent_route_timeout_seconds)
     if cancellation is not None:
@@ -94,15 +116,34 @@ def _classify(query: str, history: str, cancellation: Event | None = None) -> In
 
 
 def _answer_one(route: PartRoute, query: str, kb_ids: list[str], session_id: str | None,
-                user_id: str | None, history: str, audience_scope: str) -> dict:
+                user_id: str | None, history: str, audience_scope: str,
+                cancellation: Event | None = None, include_provenance: bool = False) -> dict:
+    with stage("answer.execute", route=route) as observed:
+        result = _answer_one_impl(
+            route, query, kb_ids, session_id, user_id, history, audience_scope,
+            cancellation, include_provenance,
+        )
+        observed.set_attributes(source_count=len(result.get("sources", [])),
+                                tool_source_count=len(result.get("tool_sources", [])))
+        return result
+
+
+def _answer_one_impl(route: PartRoute, query: str, kb_ids: list[str], session_id: str | None,
+                     user_id: str | None, history: str, audience_scope: str,
+                     cancellation: Event | None = None,
+                     include_provenance: bool = False) -> dict:
     if route == "general":
         text = qwen.chat_completion(build_general_answer_messages(query, history))
         return {"answer": text.strip(), "sources": []}
     if route == "knowledge":
         handler = agent.answer if settings.agent_enabled else rag_pipeline.answer
-        return handler(query, kb_ids, session_id=session_id, user_id=user_id, audience_scope=audience_scope)
+        return handler(query, kb_ids, session_id=session_id, user_id=user_id,
+                       audience_scope=audience_scope, history_context=history,
+                       cancellation=cancellation, include_provenance=include_provenance)
     if settings.agent_enabled:
-        return agent.answer(query, kb_ids, session_id=session_id, user_id=user_id)
+        return agent.answer(query, kb_ids, session_id=session_id, user_id=user_id,
+                            history_context=history, cancellation=cancellation,
+                            include_provenance=include_provenance)
     return {"answer": TOOL_UNAVAILABLE, "sources": []}
 
 
@@ -120,24 +161,54 @@ def _merge_sources(results: list[dict], key: str) -> list[dict]:
 def answer(query: str, kb_ids: list[str], session_id: str | None = None,
            user_id: str | None = None, **flags) -> dict:
     audience_scope = flags.get("audience_scope", "guest")
-    history = rag_pipeline._get_history_context(session_id)
-    plan = _classify(query, history)
+    history = flags.get("history_context")
+    if history is None:
+        history = rag_pipeline._get_history_context(session_id)
+    plan = _classify(query, history, flags.get("cancellation"))
+    with stage("intent.selected", route=plan.route, parts_count=len(plan.parts)):
+        pass
     if plan.route == "clarify":
-        return {"answer": plan.clarifying_question, "sources": []}
+        result = {"answer": plan.clarifying_question, "sources": []}
+        if flags.get("include_provenance"):
+            result["_provenance"] = {
+                "action": "clarify", "answer_kind": "clarification",
+                "basis_status": "not_applicable", "parts": [],
+            }
+        return result
     if plan.route != "mixed":
-        return _answer_one(plan.route, query, kb_ids, session_id, user_id, history, audience_scope)
-    sections, results = [], []
+        result = _answer_one(
+            plan.route, query, kb_ids, session_id, user_id, history, audience_scope,
+            flags.get("cancellation"), flags.get("include_provenance", False),
+        )
+        if flags.get("include_provenance"):
+            result["_provenance"] = _provenance_for(plan.route)
+        return result
+    sections, results, part_records = [], [], []
     for index, part in enumerate(plan.parts, 1):
         try:
-            result = _answer_one(part.route, part.question, kb_ids, session_id, user_id, history, audience_scope)
+            result = _answer_one(
+                part.route, part.question, kb_ids, session_id, user_id, history,
+                audience_scope, flags.get("cancellation"),
+                flags.get("include_provenance", False),
+            )
+            part_status = "completed"
         except LLMError:
             logger.exception("混合问题子项回答失败：route=%s", part.route)
             result = {"answer": PART_FAILURE, "sources": []}
+            part_status = "failed"
         results.append(result)
+        part_records.append({"answer_kind": _provenance_for(part.route)["answer_kind"],
+                             "status": part_status})
         sections.append(f"{index}. {part.question}\n{result['answer']}")
     merged = {"answer": "\n\n".join(sections), "sources": _merge_sources(results, "sources")}
     if any("tool_sources" in result for result in results):
         merged["tool_sources"] = _merge_sources(results, "tool_sources")
+    if flags.get("include_provenance"):
+        merged["_evidence_refs"] = _merge_sources(results, "_evidence_refs")
+        merged["_provenance"] = {
+            "action": "answer", "answer_kind": "mixed", "basis_status": "recorded",
+            "parts": part_records,
+        }
     return merged
 
 
@@ -148,7 +219,17 @@ def _direct_stream(text: str) -> Iterator[dict]:
 
 def _stream_one(route: PartRoute, query: str, kb_ids: list[str], session_id: str | None,
                 user_id: str | None, history: str, cancellation: Event | None,
-                audience_scope: str) -> Iterator[dict]:
+                audience_scope: str, include_provenance: bool = False) -> Iterator[dict]:
+    yield from traced_stream(
+        _stream_one_impl(route, query, kb_ids, session_id, user_id, history, cancellation,
+                         audience_scope, include_provenance),
+        route=route,
+    )
+
+
+def _stream_one_impl(route: PartRoute, query: str, kb_ids: list[str], session_id: str | None,
+                     user_id: str | None, history: str, cancellation: Event | None,
+                     audience_scope: str, include_provenance: bool = False) -> Iterator[dict]:
     if route == "general":
         parts = []
         for delta in qwen.chat_completion_stream(build_general_answer_messages(query, history)):
@@ -161,14 +242,18 @@ def _stream_one(route: PartRoute, query: str, kb_ids: list[str], session_id: str
     if route == "knowledge":
         if settings.agent_enabled:
             yield from agent.answer_stream(query, kb_ids, session_id=session_id, user_id=user_id,
-                                           cancellation=cancellation)
+                                           cancellation=cancellation, history_context=history,
+                                           include_provenance=include_provenance)
         else:
             yield from rag_pipeline.answer_stream(query, kb_ids, session_id=session_id, user_id=user_id,
-                                                  cancellation=cancellation, audience_scope=audience_scope)
+                                                  cancellation=cancellation, audience_scope=audience_scope,
+                                                  history_context=history,
+                                                  include_provenance=include_provenance)
         return
     if settings.agent_enabled:
         yield from agent.answer_stream(query, kb_ids, session_id=session_id, user_id=user_id,
-                                       cancellation=cancellation)
+                                       cancellation=cancellation, history_context=history,
+                                       include_provenance=include_provenance)
     else:
         yield from _direct_stream(TOOL_UNAVAILABLE)
 
@@ -177,18 +262,33 @@ def answer_stream(query: str, kb_ids: list[str], session_id: str | None = None,
                   user_id: str | None = None, **flags) -> Iterator[dict]:
     cancellation = flags.get("cancellation")
     audience_scope = flags.get("audience_scope", "guest")
-    history = rag_pipeline._get_history_context(session_id)
+    history = flags.get("history_context")
+    if history is None:
+        history = rag_pipeline._get_history_context(session_id)
     plan = _classify(query, history, cancellation)
+    with stage("intent.selected", route=plan.route, parts_count=len(plan.parts)):
+        pass
     if cancellation is not None and cancellation.is_set():
         return
     if plan.route == "clarify":
-        yield from _direct_stream(plan.clarifying_question)
+        for item in _direct_stream(plan.clarifying_question):
+            if item["type"] == "done" and flags.get("include_provenance"):
+                item["_provenance"] = {
+                    "action": "clarify", "answer_kind": "clarification",
+                    "basis_status": "not_applicable", "parts": [],
+                }
+            yield item
         return
     if plan.route != "mixed":
-        yield from _stream_one(plan.route, query, kb_ids, session_id, user_id, history, cancellation, audience_scope)
+        for item in _stream_one(plan.route, query, kb_ids, session_id, user_id, history,
+                                cancellation, audience_scope,
+                                flags.get("include_provenance", False)):
+            if item["type"] == "done" and flags.get("include_provenance"):
+                item["_provenance"] = _provenance_for(plan.route)
+            yield item
         return
 
-    emitted, results = [], []
+    emitted, results, part_records = [], [], []
     for index, part in enumerate(plan.parts, 1):
         if cancellation is not None and cancellation.is_set():
             return
@@ -199,7 +299,8 @@ def answer_stream(query: str, kb_ids: list[str], session_id: str | None = None,
         part_deltas = []
         try:
             for item in _stream_one(part.route, part.question, kb_ids, session_id, user_id,
-                                    history, cancellation, audience_scope):
+                                    history, cancellation, audience_scope,
+                                    flags.get("include_provenance", False)):
                 if cancellation is not None and cancellation.is_set():
                     return
                 if item["type"] == "delta":
@@ -216,14 +317,24 @@ def answer_stream(query: str, kb_ids: list[str], session_id: str | None = None,
             if part_text:
                 emitted.append(part_text)
                 yield {"type": "delta", "text": part_text}
+            part_status = "completed"
         except LLMError:
             logger.exception("混合问题子项流式回答失败：route=%s", part.route)
             emitted.append(PART_FAILURE)
             yield {"type": "delta", "text": PART_FAILURE}
             completion = {"sources": []}
+            part_status = "failed"
         results.append(completion)
+        part_records.append({"answer_kind": _provenance_for(part.route)["answer_kind"],
+                             "status": part_status})
     done = {"type": "done", "full_text": "".join(emitted),
             "sources": _merge_sources(results, "sources")}
     if any("tool_sources" in result for result in results):
         done["tool_sources"] = _merge_sources(results, "tool_sources")
+    if flags.get("include_provenance"):
+        done["_evidence_refs"] = _merge_sources(results, "_evidence_refs")
+        done["_provenance"] = {
+            "action": "answer", "answer_kind": "mixed", "basis_status": "recorded",
+            "parts": part_records,
+        }
     yield done

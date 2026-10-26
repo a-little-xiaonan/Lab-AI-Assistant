@@ -40,6 +40,23 @@ cd backend
 
 启动后：接口文档 http://localhost:8100/docs ，健康检查 `GET /api/health`。
 
+## 统一聊天回合与服务端追踪（P1–P2）
+
+重启后端后，默认将聊天请求的阶段元数据写入本地 `data/logs/traces/`。记录包含请求、会话和保存后的消息 ID、历史长度、意图选择、回答与工具执行、消息保存，以及响应成功、错误或断连状态。问题、回答、Prompt 和工具正文不写入这套 JSONL 追踪；诊断信息不进入用户回答或新增的响应字段。
+
+从项目根目录按已有消息或请求编号查询：
+
+```bash
+.venv/bin/python backend/scripts/diagnostics/inspect_chat_trace.py --message-id 123
+.venv/bin/python backend/scripts/diagnostics/inspect_chat_trace.py --request-id request-example
+```
+
+可在 `.env` 设置 `OBSERVABILITY_ENABLED=false` 后重启以关闭。队列默认最多 4096 条，每个进程独立滚动文件默认 5 MiB、保留 3 个滚动备份，7 天前的日志在后续写入时清理；导出故障只产生限频告警和丢弃统计，不阻断回答。目录位于已忽略的 `data/` 下，不上传 GitHub。
+
+P2 已将流式与非流式请求收口到统一 `ChatService`：同一会话同时只允许一个生成中回合，冲突返回 `409 session_busy`；多轮上下文只读取数据库中已完成的完整回合，失败、取消和崩溃遗留回合不会混入历史。助手消息、回答依据、回合完成状态和历史版本在同一事务提交，诊断 ID 与依据明细仍不进入用户响应。
+
+数据库启动迁移会新增 `chat_turns`、`answer_provenance` 及会话租约字段，并把历史上相邻的 user/assistant 消息配成来源未知的完整回合；不会为旧回答补造知识库或工具来源。租约默认 120 秒、每 30 秒续租，可通过 `CHAT_TURN_LEASE_SECONDS` 和 `CHAT_TURN_RENEW_INTERVAL_SECONDS` 调整。P3 的来源追问、改写和澄清续答尚未实现；P4 的逐候选检索、模型调用和用量观测也尚未实现。
+
 ## 前端
 
 ```bash

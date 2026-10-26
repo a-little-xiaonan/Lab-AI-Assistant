@@ -304,15 +304,14 @@ def test_api_agent_route_and_scope(client, monkeypatch):
     legacy.assert_not_called()
 
 
-def test_agent_turn_never_extracts_tool_answer(monkeypatch):
+def test_agent_turn_extracts_only_user_statement(monkeypatch):
     from app.api.conversation import chat
     monkeypatch.setattr(settings, "agent_enabled", True)
     extraction = Mock()
     monkeypatch.setattr(chat, "_schedule_memory_extract", extraction)
     monkeypatch.setattr(chat, "_schedule_auto_name", lambda *a: None)
-    monkeypatch.setattr(chat.memory_manager, "persist_summary", lambda *a: None)
-    chat._remember_turn("session", "kb", "今天？", "2026-09-17", "user")
-    extraction.assert_not_called()
+    chat._remember_turn("session", "kb", "今天？", "user")
+    extraction.assert_called_once_with("user", "session", "kb", "今天？")
 
 
 def test_cancel_during_route_starts_no_tool(monkeypatch):

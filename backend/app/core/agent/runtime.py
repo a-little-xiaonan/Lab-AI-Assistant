@@ -57,7 +57,7 @@ def run_bounded(budget: ExecutionBudget, fn, *args):
             current_budget.reset(token)
 
     try:
-        future = _POOL.submit(run)
+        future = submit_context(_POOL, run)
     except BaseException:
         _SLOTS.release()
         raise

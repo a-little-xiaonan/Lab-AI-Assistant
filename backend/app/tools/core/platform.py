@@ -15,6 +15,7 @@ from pydantic import BaseModel, ValidationError
 from app.config import settings
 from app.core.agent.models import ToolContext, ToolError, ToolResult
 from app.core.agent.runtime import run_bounded
+from app.observability.tracing import stage
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,15 @@ class ToolPlatform:
         return [tool.schema() for tool in self._definitions.values() if tool.policy.enabled()]
 
     def execute(self, call: dict, ctx: ToolContext) -> ToolResult:
+        with stage("tool.execute", tool=call["function"]["name"], call_id=call["id"]) as observed:
+            result = self._execute(call, ctx)
+            attributes = {"outcome": result.status, "cache_hit": result.cache_hit}
+            if result.error:
+                attributes["error_code"] = result.error.code
+            observed.finish("error" if result.status == "failed" else "ok", **attributes)
+            return result
+
+    def _execute(self, call: dict, ctx: ToolContext) -> ToolResult:
         started = time.monotonic()
         name, call_id = call["function"]["name"], call["id"]
 

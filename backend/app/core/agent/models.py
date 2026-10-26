@@ -38,6 +38,7 @@ class ToolContext:
     anonymous_id: str | None = None
     session_id: str | None = None
     request_id: str = field(default_factory=lambda: uuid4().hex)
+    trace_id: str | None = None
     current_query: str = ""
     history: str = ""
     calls: int = 0

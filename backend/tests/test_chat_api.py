@@ -15,6 +15,7 @@ from app.api.conversation.chat import _sse_stream
 from app.llm.errors import LLMError
 from app.models.database import ChatSession, Message
 from app.models.schemas import ChatRequest
+from app.services.conversation.chat_service import ChatService
 
 
 @pytest.fixture(autouse=True)
@@ -127,8 +128,10 @@ def test_chat_stream_disconnect_keeps_no_partial_message(db_session):
     db_session.commit()
 
     req = ChatRequest(message="你好", stream=True)
+    service = ChatService(db_session, session, req.message, [], None, "guest")
+    service.start()
     with patch("app.core.intent_router.answer_stream", side_effect=lambda *a, **k: fake_stream()):
-        frames = asyncio.run(_collect_frames(_sse_stream(req, FakeRequest(), db_session, session)))
+        frames = asyncio.run(_collect_frames(_sse_stream(req, FakeRequest(), service)))
 
     assert frames[0].startswith("event: meta")
     assert not any("event: done" in f for f in frames)  # 未到达 done
@@ -157,3 +160,9 @@ def test_chat_empty_message_rejected(client):
     r = client.post("/api/chat", json={"message": "   "})
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "empty_message"
+
+
+def test_target_message_requires_session(client):
+    r = client.post("/api/chat", json={"message": "解释上一条", "target_message_id": 1})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "target_requires_session"

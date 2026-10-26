@@ -103,6 +103,20 @@ def test_tool_disabled_and_clarification_do_not_claim_knowledge(monkeypatch):
     assert intent_router.answer("那个什么时候开始？", ["kb_default"])["answer"] == "请问你指的是哪场活动？"
 
 
+def test_internal_provenance_marks_disabled_tool_unavailable(monkeypatch):
+    monkeypatch.setattr(settings, "agent_enabled", False)
+    monkeypatch.setattr(intent_router, "_classify", lambda *a, **k: _plan("tool"))
+    result = intent_router.answer(
+        "今天北京天气如何？", ["kb_default"], include_provenance=True
+    )
+    assert result["_provenance"] == {
+        "action": "answer",
+        "answer_kind": "unavailable",
+        "basis_status": "unknown",
+        "parts": [],
+    }
+
+
 def test_tool_enabled_delegates_to_agent(monkeypatch):
     monkeypatch.setattr(settings, "agent_enabled", True)
     monkeypatch.setattr(intent_router, "_classify", lambda *a, **k: _plan("tool"))
@@ -206,15 +220,6 @@ def test_api_route_failure_is_error_not_no_context(client, monkeypatch, agent_en
 def test_api_followup_keeps_history_for_intent_and_answer(client, monkeypatch, streaming):
     """同一会话的第二问继续向意图识别和回答模型提供上一轮历史。"""
     from app.api.conversation import chat
-    from app.memory.short_term import ShortTermMemory
-
-    memories = {}
-
-    def get_memory(session_id):
-        return memories.setdefault(session_id, ShortTermMemory(session_id))
-
-    monkeypatch.setattr(chat.memory_manager, "get", get_memory)
-    monkeypatch.setattr(chat.memory_manager, "persist_summary", lambda *a: None)
     monkeypatch.setattr(chat, "_schedule_auto_name", lambda *a: None)
     classifier = Mock(return_value=_plan("general"))
     monkeypatch.setattr(intent_router, "_classify", classifier)

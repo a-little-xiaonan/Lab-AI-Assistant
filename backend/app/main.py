@@ -33,6 +33,9 @@ from app.config import ensure_data_dirs, settings
 from app.core.session_cleanup import cleanup_expired_sessions
 from app.llm.errors import LLMError
 from app.middleware.request_context import RequestContextMiddleware, RequestIdFilter
+from app.observability.exporter import start_exporter, stop_exporter
+from app.observability.middleware import ChatTraceMiddleware
+from app.observability.tracing import mark_error
 from app.store.db import init_db
 
 logger = logging.getLogger(__name__)
@@ -63,13 +66,19 @@ async def lifespan(_app: FastAPI):
         recovery = {"stale": 0, "recovered": 0, "failed": 1}
     cleanup_task = asyncio.create_task(_periodic_cleanup())
     logger.info("服务启动：数据库就绪，恢复任务=%s，过期会话清理已启动", recovery)
-    yield
-    cleanup_task.cancel()
+    start_exporter()
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        await asyncio.to_thread(stop_exporter)
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="RAG AI Assistant", version="0.1.0", lifespan=lifespan)
 
+    # 请求 ID 位于追踪中间件外层，供响应生成和线程任务共同继承。
+    app.add_middleware(ChatTraceMiddleware)
     app.add_middleware(RequestContextMiddleware)
 
     # 开发期放开前端本地端口；生产收敛白名单（Phase 4）
@@ -85,6 +94,7 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(ApiError)
     async def api_error_handler(req: Request, exc: ApiError):
+        mark_error(exc.code)
         if exc.status in {401, 403}:
             from app.services.operations.audit import record_best_effort
             record_best_effort(
@@ -97,6 +107,7 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(LLMError)
     async def llm_error_handler(_req: Request, exc: LLMError):
+        mark_error(exc.code)
         return JSONResponse(status_code=502, content={"detail": {"code": exc.code, "message": exc.message}})
 
     @app.exception_handler(Exception)

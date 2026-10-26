@@ -34,6 +34,7 @@ from app.llm.prompt_templates import (
 from app.memory.long_term import format_memories, long_term_memory
 from app.memory.memory_manager import memory_manager
 from app.middleware.request_context import current_request_id
+from app.observability.tracing import stage
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +45,23 @@ KNOWLEDGE_UNAVAILABLE = "知识库查询暂时失败，请稍后重试。"
 
 def _get_history_context(session_id: str | None) -> str:
     """从短期记忆取历史上下文（无 session_id → 空；记忆异常 → 降级为空不中断）。"""
-    if not session_id:
-        return ""
-    try:
-        mem = memory_manager.get(session_id)
-        mem.trim_to_token_budget(settings.history_max_tokens)
-        return mem.get_context()
-    except Exception:
-        logger.exception("短期记忆读取失败，本次不带历史：session=%s", session_id)
-        return ""
+    with stage("history.load") as observed:
+        if not session_id:
+            observed.finish("skipped", reason="no_session")
+            return ""
+        try:
+            mem = memory_manager.get(session_id)
+            before = mem.get_context()
+            dropped = mem.trim_to_token_budget(settings.history_max_tokens)
+            history = mem.get_context()
+            observed.set_attributes(history_before_chars=len(before), history_chars=len(history),
+                                    history_dropped_messages=dropped,
+                                    history_messages=len(mem.messages), history_summary_present=bool(mem.summary))
+            return history
+        except Exception:
+            observed.finish("degraded", error_code="history_read_failed")
+            logger.exception("短期记忆读取失败，本次不带历史：session=%s", session_id)
+            return ""
 
 
 def _dedup_sources(chunks: list[retriever.RetrievedChunk]) -> list[dict]:
@@ -68,6 +77,22 @@ def _dedup_sources(chunks: list[retriever.RetrievedChunk]) -> list[dict]:
             {"source_file": c.source_file, "page": c.page, "snippet": c.text[:SNIPPET_MAX]}
         )
     return out
+
+
+def _provenance_refs(chunks: list[retriever.RetrievedChunk]) -> list[dict]:
+    """只供服务端依据持久化；不含正文、Prompt 或临时资源句柄。"""
+    return [
+        {
+            "type": "knowledge",
+            "knowledge_base_id": chunk.metadata.get("knowledge_base_id"),
+            "doc_id": chunk.metadata.get("doc_id"),
+            "document_version_id": chunk.metadata.get("document_version_id"),
+            "chunk_id": chunk.chunk_id,
+            "chunk_index": chunk.metadata.get("chunk_index"),
+            "page": chunk.page,
+        }
+        for chunk in chunks
+    ]
 
 
 def _retrieve_scope(kb_ids: list[str], query: str, history: str) -> tuple[list[retriever.RetrievedChunk], str, int]:
@@ -230,6 +255,9 @@ def prepare_evidence(query: str, kb_id: str | list[str], history: str = "", *,
             answer_outline = result.answer_outline
         else:
             chunks = retriever.retrieve(kb_id, query)
+        if isinstance(kb_id, str):
+            for chunk in chunks:
+                chunk.metadata = {**chunk.metadata, "knowledge_base_id": kb_id}
         if strict:
             # 编排中的主题路也必须终检，不能仅依赖全局路过滤。
             scope = kb_id if isinstance(kb_id, list) else [kb_id]
@@ -354,7 +382,9 @@ def answer(
     由 API 层转统一错误（不静默返回空）。
     """
     started = time.monotonic()
-    history = _get_history_context(session_id)
+    history = flags.get("history_context")
+    if history is None:
+        history = _get_history_context(session_id)
     faq = _prepare_public_faq(query, kb_id, history, audience_scope)
     answer_mode = "rag"
     if faq is not None:
@@ -413,6 +443,8 @@ def answer(
                 for index, chunk in enumerate(chunks, 1)
             ],
         }
+    if flags.get("include_provenance"):
+        result["_evidence_refs"] = _provenance_refs(chunks)
     return result
 
 
@@ -431,7 +463,9 @@ def answer_stream(
     cancellation = flags.get("cancellation")
     if cancellation is not None and cancellation.is_set():
         return
-    history = _get_history_context(session_id)
+    history = flags.get("history_context")
+    if history is None:
+        history = _get_history_context(session_id)
     started = time.monotonic()
     faq = _prepare_public_faq(query, kb_id, history, audience_scope)
     if faq is not None:
@@ -475,6 +509,8 @@ def answer_stream(
                     "answer_mode": "faq_context_cache" if faq.cache_enabled else "faq_template",
                     "faq_template_code": faq.code,
                 }
+            if flags.get("include_provenance"):
+                done["_evidence_refs"] = _provenance_refs(faq.chunks)
             yield done
             return
         except LLMError:
@@ -512,4 +548,6 @@ def answer_stream(
     done = {"type": "done", "full_text": body, "sources": sources}
     if flags.get("include_diagnostics"):
         done["diagnostics"] = {"answer_mode": "rag"}
+    if flags.get("include_provenance"):
+        done["_evidence_refs"] = _provenance_refs(chunks)
     yield done

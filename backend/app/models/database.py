@@ -84,6 +84,11 @@ class ChatSession(Base):
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     name_source: Mapped[str] = mapped_column(String(16), default="ai")  # ai / user / system
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary_through_turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    summary_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    history_revision: Mapped[int] = mapped_column(Integer, default=0)
+    active_turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
@@ -97,14 +102,60 @@ class Message(Base):
     """聊天消息：user 与 assistant 都落库（短期记忆/长期记忆的数据源）。"""
 
     __tablename__ = "messages"
+    __table_args__ = (UniqueConstraint("turn_id", "role", name="uq_messages_turn_role"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
+    # 兼容历史消息，暂不设置数据库外键；新消息必须由 ChatService 绑定回合。
+    turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     role: Mapped[str] = mapped_column(String(16))  # user / assistant
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     session: Mapped[ChatSession] = relationship(back_populates="messages")
+
+
+class ChatTurn(Base):
+    """一次聊天请求的持久生命周期；只有 completed 回合可进入多轮历史。"""
+
+    __tablename__ = "chat_turns"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    parent_turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    history_revision: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="processing", index=True)
+    action: Mapped[str] = mapped_column(String(24), default="answer")
+    target_message_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    plan_version: Mapped[str] = mapped_column(String(32), default="intent-v1")
+    pending_clarification_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AnswerProvenance(Base):
+    """回答时实际提供给生成阶段的依据摘要；不保存 Prompt、密钥或工具正文。"""
+
+    __tablename__ = "answer_provenance"
+
+    assistant_message_id: Mapped[int] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    turn_id: Mapped[str] = mapped_column(ForeignKey("chat_turns.id", ondelete="CASCADE"), unique=True)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    schema_version: Mapped[str] = mapped_column(String(32), default="answer-provenance-v1")
+    pipeline_version: Mapped[str] = mapped_column(String(32), default="intent-history-p2")
+    planner_version: Mapped[str] = mapped_column(String(32), default="intent-v1")
+    prompt_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    answer_kind: Mapped[str] = mapped_column(String(24), index=True)
+    basis_status: Mapped[str] = mapped_column(String(24), default="recorded")
+    derived_from_message_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    parts_json: Mapped[str] = mapped_column(Text, default="[]")
+    evidence_refs_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class KnowledgeBase(Base):

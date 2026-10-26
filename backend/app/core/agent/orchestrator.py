@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import time
+from uuid import uuid4
 
 from app.config import settings
 from app.core import rag_pipeline
@@ -11,6 +12,8 @@ from app.core.agent.runtime import ExecutionBudget, run_bounded
 from app.llm import qwen
 from app.llm.errors import LLMError
 from app.tools import registry
+from app.middleware.request_context import current_request_id
+from app.observability.tracing import current_trace
 
 SYSTEM = """你是实验室问答助手。工具目录会根据当前开关提供可调用能力；只能调用目录中的工具。
 天气尚未上线，不能声称使用该能力。只有工具目录中出现 web_search/read_webpage 时才可使用联网能力。
@@ -23,16 +26,20 @@ SYSTEM = """你是实验室问答助手。工具目录会根据当前开关提�
 不要输出内部推理。"""
 
 
-def _prepare(query, kb_ids, session_id, user_id, cancellation=None):
+def _prepare(query, kb_ids, session_id, user_id, cancellation=None, history_context=None):
     budget = ExecutionBudget(time.monotonic() + settings.agent_prepare_timeout_seconds)
     if cancellation is not None:
         budget.cancelled = cancellation
+    trace = current_trace()
     ctx = ToolContext(tuple(kb_ids), budget, settings.tools_timezone,
-                      user_id=user_id, session_id=session_id, current_query=query)
+                      user_id=user_id, session_id=session_id, current_query=query,
+                      request_id=current_request_id() or uuid4().hex,
+                      trace_id=trace.id if trace else None)
     results = []
     notice = ""
     try:
-        ctx.history = run_bounded(budget, rag_pipeline._get_history_context, session_id)
+        ctx.history = (run_bounded(budget, rag_pipeline._get_history_context, session_id)
+                       if history_context is None else history_context)
         messages = [{"role": "system", "content": SYSTEM},
                     {"role": "user", "content": json.dumps({"history": ctx.history, "question": query}, ensure_ascii=False)}]
         used_ids = set()
@@ -95,16 +102,50 @@ def _sources(results):
     return sources, tool_sources
 
 
+def _provenance_refs(results):
+    """从工具结果投影服务端依据引用，不保存工具正文和临时句柄。"""
+    refs = []
+    for result in results:
+        if result.status != "ok":
+            continue
+        if result.tool == "search_knowledge":
+            for chunk in result.data.get("chunks", []):
+                refs.append({
+                    "type": "knowledge",
+                    "knowledge_base_id": chunk.get("knowledge_base_id"),
+                    "doc_id": chunk.get("doc_id"),
+                    "document_version_id": chunk.get("document_version_id"),
+                    "chunk_id": chunk.get("chunk_id"),
+                    "chunk_index": chunk.get("chunk_index"),
+                    "page": chunk.get("page"),
+                })
+        else:
+            refs.append({
+                "type": result.tool,
+                "evidence_refs": result.evidence_refs[:20],
+            })
+    return refs
+
+
 def answer(query, kb_ids, session_id=None, user_id=None, **flags):
-    _, results, direct, messages = _prepare(query, kb_ids, session_id, user_id)
+    _, results, direct, messages = _prepare(
+        query, kb_ids, session_id, user_id, flags.get("cancellation"),
+        flags.get("history_context"),
+    )
     text = direct if direct is not None else rag_pipeline._strip_citations(qwen.chat_completion(messages))
     sources, tool_sources = _sources(results)
-    return {"answer": text, "sources": sources, "tool_sources": tool_sources}
+    response = {"answer": text, "sources": sources, "tool_sources": tool_sources}
+    if flags.get("include_provenance"):
+        response["_evidence_refs"] = _provenance_refs(results)
+    return response
 
 
 def answer_stream(query, kb_ids, session_id=None, user_id=None, **flags):
     yield {"type": "status", "message": "正在确认所需能力并获取依据"}
-    _, results, direct, messages = _prepare(query, kb_ids, session_id, user_id, flags.get("cancellation"))
+    _, results, direct, messages = _prepare(
+        query, kb_ids, session_id, user_id, flags.get("cancellation"),
+        flags.get("history_context"),
+    )
     if flags.get("cancellation") is not None and flags["cancellation"].is_set():
         return
     parts = []
@@ -121,4 +162,8 @@ def answer_stream(query, kb_ids, session_id=None, user_id=None, **flags):
         parts.append(tail)
         yield {"type": "delta", "text": tail}
     sources, tool_sources = _sources(results)
-    yield {"type": "done", "full_text": "".join(parts).strip(), "sources": sources, "tool_sources": tool_sources}
+    done = {"type": "done", "full_text": "".join(parts).strip(),
+            "sources": sources, "tool_sources": tool_sources}
+    if flags.get("include_provenance"):
+        done["_evidence_refs"] = _provenance_refs(results)
+    yield done

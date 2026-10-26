@@ -45,6 +45,13 @@ def db_session():
 
 
 @pytest.fixture(autouse=True)
+def _disable_real_trace_files(monkeypatch):
+    """普通测试不写运行目录；追踪测试单独启用临时导出器。"""
+    from app.config import settings
+    monkeypatch.setattr(settings, "observability_enabled", False)
+
+
+@pytest.fixture(autouse=True)
 def _fake_memory_manager(monkeypatch):
     """测试环境隔离：短期记忆打桩为进程内空实现（不触发 load_from_db 连真实库）。"""
     from app.memory.memory_manager import memory_manager
@@ -86,6 +93,10 @@ def client(monkeypatch):
         db.close()
     monkeypatch.setattr("app.main.init_db", lambda: None)  # 不连真实 MySQL
     monkeypatch.setattr("app.main.cleanup_expired_sessions", lambda: 0)  # 清理不碰真实库
+    monkeypatch.setattr(
+        "app.services.jobs.job_recovery.recover_stale_jobs",
+        lambda: {"stale": 0, "recovered": 0, "failed": 0},
+    )
     app.dependency_overrides[get_db] = _override_get_db
     with TestClient(app) as c:
         yield c

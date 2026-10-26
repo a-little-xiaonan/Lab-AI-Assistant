@@ -59,6 +59,17 @@ class Settings(BaseSettings):
     # ----- 回答依据路由（所有聊天请求统一经过意图识别）-----
     intent_route_timeout_seconds: float = Field(default=8, gt=0, le=30)
 
+    # ----- 会话回合租约（同一会话只允许一个生成中的回合）-----
+    chat_turn_lease_seconds: int = Field(default=120, ge=30, le=900)
+    chat_turn_renew_interval_seconds: int = Field(default=30, ge=5, le=300)
+
+    # ----- 服务端聊天追踪（只记录结构元数据，不向用户展示）-----
+    observability_enabled: bool = True
+    trace_queue_size: int = Field(default=4096, ge=1, le=100000)
+    trace_max_file_bytes: int = Field(default=5 * 1024 * 1024, ge=16384, le=100 * 1024 * 1024)
+    trace_backup_count: int = Field(default=3, ge=1, le=20)
+    trace_retention_days: int = Field(default=7, ge=1, le=90)
+
     # ----- 轻量 Agent（M1，启用需另行验收确认）-----
     agent_enabled: bool = False
     agent_max_tool_rounds: int = Field(default=5, ge=1, le=5)

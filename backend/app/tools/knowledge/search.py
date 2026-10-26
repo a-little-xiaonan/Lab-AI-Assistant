@@ -35,6 +35,9 @@ def search_knowledge(args: KnowledgeArgs, ctx: ToolContext) -> ToolResult:
         handle = issue_handle(chunk)
         chunks.append({"text": chunk.text, "source_file": chunk.source_file, "page": chunk.page,
                        "chunk_id": chunk.chunk_id, "knowledge_base_id": chunk.metadata.get("knowledge_base_id"),
+                       "doc_id": chunk.metadata.get("doc_id"),
+                       "document_version_id": chunk.metadata.get("document_version_id"),
+                       "chunk_index": chunk.metadata.get("chunk_index"),
                        "document_handle": handle})
     supported_ids = {chunk.chunk_id for chunk in result.chunks}
     expandable = []

@@ -8,11 +8,9 @@ SSE 事件协议（前后端契约，Phase 2-01 定死）：
 
 约定：
 - session_id 由后端生成（sess_ 前缀）；未知 session_id 自动创建（行为固定并记录）
-- user 消息在请求开始即落库；assistant 消息流结束后落库（避免中途写脏数据）
-- 客户端断开 → 生成器提前结束，不写半条消息（CancelledError/GeneratorExit 不捕获）
-- 短期记忆（Phase 2-03）：prompt 历史由 pipeline 经 memory_manager 产出；
-  本层回合收尾将 user+assistant 写入内存窗口（回合原子：都成功才更新；
-  流式 error/断连轮不更新，DB 里的孤儿 user 由 load_from_db 剔除规则兜底）
+- ChatService 在生成前保存 processing 回合与 user，完成时原子保存 assistant 与回答依据
+- 多轮历史只读取 completed 回合；失败、取消和遗留 processing 回合不会进入上文
+- 客户端断开 → 生成器提前结束，不写半条 assistant，并释放当前会话租约
 """
 from __future__ import annotations
 
@@ -27,18 +25,16 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.errors import ApiError, BadRequestError, NotFoundError
+from app.api.errors import ApiError, BadRequestError, ConflictError, NotFoundError
 from app.auth.dependencies import get_optional_current_user
 from app.authorization.permissions import effective_level, list_readable_kbs
 from app.authorization.session_access import require_session_owner
-from app.core import intent_router
 from app.config import settings
 from app.llm import qwen
 from app.llm.errors import LLMError
 from app.llm.prompt_templates import build_session_name_messages
 from app.memory.long_term import long_term_memory
-from app.memory.memory_manager import memory_manager
-from app.models.database import ChatSession, Message, User, utcnow
+from app.models.database import ChatSession, ChatTurn, Message, User, utcnow
 from app.models.schemas import (
     ChatRequest,
     SessionBatchDelete,
@@ -47,6 +43,10 @@ from app.models.schemas import (
     SessionOut,
     SessionRename,
 )
+from app.observability.tracing import (
+    bind_session, mark_disconnected, mark_error, mark_first_delta, stage,
+)
+from app.services.conversation.chat_service import ChatService, TurnOwnershipLost
 from app.store.db import SessionLocal, get_db
 
 logger = logging.getLogger(__name__)
@@ -120,60 +120,58 @@ def format_sse_event(event: str, data: dict) -> str:
 async def _sse_stream(
     req: ChatRequest,
     request: Request,
-    db: Session,
-    session: ChatSession,
-    user_id: str | None = None,
-    readable_kb_ids: list[str] | None = None,
-    audience_scope: str = "guest",
+    service: ChatService,
 ) -> None:
     """SSE 生成器：meta → delta* → done（或 error，替代 done 后正常关闭）。
 
-    - user 消息先落库（请求开始时，spec）；assistant 消息在流结束后落库
+    - processing 回合与 user 已由 ChatService.start 原子落库
     - 每块前后检查 is_disconnected，断连即停、不写 assistant（DB 无半条消息）
     - LLMError/ApiError/未知异常 → error 帧后正常结束（SSE 的 HTTP 状态码不可靠）
     - CancelledError/GeneratorExit（BaseException）不捕获，自然传播
     """
-    db.add(Message(session_id=session.id, role="user", content=req.message))
-    db.commit()
-    yield format_sse_event("meta", {"session_id": session.id})
+    yield format_sse_event("meta", {"session_id": service.session.id})
 
-    cancellation = threading.Event()
-    sync_iter = intent_router.answer_stream(
-        req.message, readable_kb_ids or [], session_id=session.id, user_id=user_id,
-        cancellation=cancellation, audience_scope=audience_scope,
-    )
+    sync_iter = service.answer_stream()
     try:
         while True:
             if await request.is_disconnected():
-                logger.info("客户端断开，终止流式回答：session=%s", session.id)
+                mark_disconnected()
+                service.cancel("client_disconnected")
+                logger.info("客户端断开，终止流式回答：session=%s", service.session.id)
                 return
             # next(..., None) 避免 StopIteration 跨 asyncio Future 传播。
             pending = asyncio.create_task(asyncio.to_thread(next, sync_iter, None))
             while not pending.done():
                 await asyncio.wait({pending}, timeout=0.2)
                 if await request.is_disconnected():
-                    cancellation.set()
+                    mark_disconnected()
+                    service.cancel("client_disconnected")
                     pending.cancel()
                     return
             item = await pending
             if await request.is_disconnected():
+                mark_disconnected()
                 return
             if item is None:
+                if service.ownership_lost:
+                    raise TurnOwnershipLost("聊天回合租约已丢失")
+                mark_error("incomplete_stream")
+                service.fail("incomplete_stream")
                 yield format_sse_event("error", {"code": "incomplete_stream", "message": "回答未完整生成，请重试。"})
                 return
             if item["type"] == "delta":
+                if item["text"]:
+                    mark_first_delta()
                 yield format_sse_event("delta", {"text": item["text"]})
             elif item["type"] == "status":
-                logger.debug("回答生成状态：session=%s message=%s", session.id, item["message"])
+                logger.debug("回答生成状态：session=%s message=%s", service.session.id, item["message"])
             elif item["type"] == "done":
                 # 先落库成功再发 done 帧：客户端收到 done 时数据已持久化
-                assistant_message = Message(
-                    session_id=session.id, role="assistant", content=item["full_text"]
+                with stage("message.persist", role="assistant"):
+                    assistant_message = service.complete(item)
+                _remember_turn(
+                    service.session.id, AUTO_KB_SCOPE, req.message, service.user_id
                 )
-                db.add(assistant_message)
-                db.commit()
-                db.refresh(assistant_message)
-                _remember_turn(session.id, AUTO_KB_SCOPE, req.message, item["full_text"], user_id)
                 yield format_sse_event(
                     "done",
                     {"full_text": item["full_text"], "sources": item["sources"],
@@ -182,35 +180,42 @@ async def _sse_stream(
                 )
                 return
     except StopIteration:
+        mark_error("incomplete_stream")
+        service.fail("incomplete_stream")
         # answer_stream 未产出 done 即结束（理论不发生）：不落库 assistant
-        logger.warning("流式回答意外结束（无 done 帧）：session=%s", session.id)
+        logger.warning("流式回答意外结束（无 done 帧）：session=%s", service.session.id)
     except LLMError as exc:
+        mark_error(exc.code)
+        service.fail(exc.code)
         logger.error("流式回答失败：%s（%s）", exc.message, exc.code)
         yield format_sse_event("error", {"code": exc.code, "message": exc.message})
     except ApiError as exc:
+        mark_error(exc.code)
+        service.fail(exc.code)
         logger.error("流式回答业务错误：%s（%s）", exc.message, exc.code)
         yield format_sse_event("error", {"code": exc.code, "message": exc.message})
+    except TurnOwnershipLost:
+        mark_error("turn_ownership_lost")
+        service.fail("turn_ownership_lost")
+        yield format_sse_event(
+            "error", {"code": "session_state_changed", "message": "会话状态已变化，请刷新后重试"}
+        )
     except Exception as exc:
-        logger.exception("流式回答未知异常：session=%s", session.id)
+        mark_error("internal_error")
+        service.fail("internal_error")
+        logger.exception("流式回答未知异常：session=%s", service.session.id)
         yield format_sse_event("error", {"code": "internal_error", "message": "服务内部错误"})
     finally:
-        cancellation.set()
+        if not service.closed:
+            service.cancel()
 
 
 def _remember_turn(
-    session_id: str, kb_id: str, user_content: str, assistant_content: str, user_id: str | None
+    session_id: str, kb_id: str, user_content: str, user_id: str | None
 ) -> None:
-    """回合收尾：短期记忆窗口更新 + 长期记忆后台提取（都失败不影响主链路）。"""
-    try:
-        mem = memory_manager.get(session_id)
-        mem.add_message("user", user_content)
-        mem.add_message("assistant", assistant_content)
-        memory_manager.persist_summary(session_id, mem.summary)
-    except Exception:
-        logger.exception("短期记忆更新失败：session=%s", session_id)
-    if user_id is not None and not settings.agent_enabled:
-        # M1 保守禁止工具回合的长期提取；稳定偏好提取在 M5 单独验收。
-        _schedule_memory_extract(user_id, session_id, kb_id, user_content, assistant_content)
+    """已完成回合的后台任务；历史缓存由 ChatService 提交后失效。"""
+    if user_id is not None:
+        _schedule_memory_extract(user_id, session_id, kb_id, user_content)
     _schedule_auto_name(session_id)  # 首轮后为未命名会话生成标题
 
 
@@ -224,13 +229,14 @@ def _schedule_background(fn) -> None:
 
 
 def _schedule_memory_extract(
-    user_id: str, session_id: str, kb_id: str, user_content: str, assistant_content: str
+    user_id: str, session_id: str, kb_id: str, user_content: str
 ) -> None:
     """长期记忆提取放后台线程（Fire-and-forget：每轮多一次 LLM 调用，不阻塞回答）。"""
 
     def _run() -> None:
+        # 只从用户原话提取稳定偏好，避免把工具正文或助手推测写成用户事实。
         long_term_memory.extract_and_store(
-            user_id, session_id, kb_id, [("user", user_content), ("assistant", assistant_content)]
+            user_id, session_id, kb_id, [("user", user_content)]
         )
 
     _schedule_background(_run)
@@ -249,7 +255,12 @@ def _auto_name_session(session_id: str) -> None:
                 return
             first = db.scalar(
                 select(Message)
-                .where(Message.session_id == session_id, Message.role == "user")
+                .join(ChatTurn, Message.turn_id == ChatTurn.id)
+                .where(
+                    Message.session_id == session_id,
+                    Message.role == "user",
+                    ChatTurn.status == "completed",
+                )
                 .order_by(Message.id)
                 .limit(1)
             )
@@ -282,15 +293,31 @@ async def chat(
 ) -> Response:
     if not req.message.strip():
         raise BadRequestError("empty_message", "消息不能为空")
+    if req.target_message_id is not None and req.session_id is None:
+        raise BadRequestError("target_requires_session", "引用历史回答时必须提供会话编号")
 
-    readable_kb_ids = [kb.id for kb in list_readable_kbs(db, user)]
-    audience_scope = effective_level(user)
-    anonymous_id, set_anonymous = _get_anonymous_id(request)
-    session = _get_or_create_session(db, req.session_id, AUTO_KB_SCOPE, user, anonymous_id)
+    with stage("request.context", stream=req.stream, query_chars=len(req.message)) as observed:
+        readable_kb_ids = [kb.id for kb in list_readable_kbs(db, user)]
+        audience_scope = effective_level(user)
+        anonymous_id, set_anonymous = _get_anonymous_id(request)
+        session = _get_or_create_session(db, req.session_id, AUTO_KB_SCOPE, user, anonymous_id)
+        bind_session(session.id, stream=req.stream, readable_kb_count=len(readable_kb_ids))
+        observed.set_attributes(readable_kb_count=len(readable_kb_ids))
+
+    service = ChatService(
+        db=db,
+        session=session,
+        query=req.message,
+        readable_kb_ids=readable_kb_ids,
+        user_id=user.id if user else None,
+        audience_scope=audience_scope,
+        target_message_id=req.target_message_id,
+    )
+    service.start()
 
     if req.stream:
         stream_response = StreamingResponse(
-            _sse_stream(req, request, db, session, user.id if user else None, readable_kb_ids, audience_scope),
+            _sse_stream(req, request, service),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -299,16 +326,19 @@ async def chat(
         return stream_response
 
     # 非流式与流式统一先识别意图，再由路由器选择回答能力。
-    result = await asyncio.to_thread(
-        intent_router.answer, req.message, readable_kb_ids, session_id=session.id, user_id=user.id if user else None,
-        audience_scope=audience_scope,
-    )
-
-    # 消息落库（user + assistant 成对）+ 记忆窗口更新
-    assistant_message = Message(session_id=session.id, role="assistant", content=result["answer"])
-    db.add_all([Message(session_id=session.id, role="user", content=req.message), assistant_message])
-    db.commit()
-    _remember_turn(session.id, AUTO_KB_SCOPE, req.message, result["answer"], user.id if user else None)
+    try:
+        result = await asyncio.to_thread(service.answer)
+        with stage("message.persist", role="turn"):
+            service.complete(result)
+    except TurnOwnershipLost as exc:
+        mark_error(exc.code)
+        service.fail(exc.code)
+        raise ConflictError("session_state_changed", "会话状态已变化，请刷新后重试") from exc
+    except BaseException as exc:
+        service.fail(getattr(exc, "code", type(exc).__name__),
+                     status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed")
+        raise
+    _remember_turn(session.id, AUTO_KB_SCOPE, req.message, user.id if user else None)
     # 非流式响应保持 Phase 1 契约；消息 ID 可从会话详情读取。
     response = JSONResponse({"answer": result["answer"], "sources": result["sources"],
                              **({"tool_sources": result["tool_sources"]} if "tool_sources" in result else {})})

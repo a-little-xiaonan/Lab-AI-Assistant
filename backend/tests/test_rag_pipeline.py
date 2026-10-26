@@ -29,7 +29,9 @@ def _fake_chunks():
 @patch("app.core.rag_pipeline.retriever.retrieve", return_value=_fake_chunks())
 @patch("app.core.rag_pipeline.qwen.chat_completion", return_value="qwen-plus 按 token 计费。")
 def test_answer_returns_internal_sources_without_visible_citations(mock_chat, mock_retrieve):
-    result = rag_pipeline.answer("qwen-plus 怎么收费？", "kb_default")
+    result = rag_pipeline.answer(
+        "qwen-plus 怎么收费？", "kb_default", include_provenance=True
+    )
 
     # 来源仅作为接口内部数据保留，回答正文不展示文件名或来源汇总。
     assert "参考来源：" not in result["answer"]
@@ -38,6 +40,9 @@ def test_answer_returns_internal_sources_without_visible_citations(mock_chat, mo
     assert result["sources"][0]["page"] == 3
     assert len(result["sources"]) == 2
     assert all(len(s["snippet"]) <= 50 for s in result["sources"])  # snippet ≤50 协议
+    assert result["_evidence_refs"][0]["chunk_id"] == "c1"
+    assert result["_evidence_refs"][0]["doc_id"] == "d1"
+    assert result["_evidence_refs"][0]["knowledge_base_id"] == "kb_default"
 
     # LLM 收到的 prompt 结构：system / user 含参考资料与问题
     messages = mock_chat.call_args.args[0]

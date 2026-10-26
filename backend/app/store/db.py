@@ -10,7 +10,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -18,10 +18,13 @@ from app.config import settings
 from app.auth.password import hash_password
 from app.models.database import (
     Base,
+    ChatSession,
+    ChatTurn,
     ChunkRecord,
     Document,
     DocumentVersion,
     KnowledgeBase,
+    Message,
     Role,
     SuggestedQuestion,
     User,
@@ -322,6 +325,8 @@ def _migrate_multi_user_columns() -> None:
     _add_column_if_missing("sessions", "user_id", "VARCHAR(64) NULL")
     _add_column_if_missing("sessions", "anonymous_id", "VARCHAR(64) NULL")
     _add_column_if_missing("sessions", "summary", "TEXT NULL")
+    _add_column_if_missing("sessions", "summary_through_turn_id", "VARCHAR(64) NULL")
+    _add_column_if_missing("sessions", "summary_version", "VARCHAR(32) NULL")
     _add_column_if_missing("sessions", "name_source", "VARCHAR(16) NOT NULL DEFAULT 'ai'")
     _add_column_if_missing("knowledge_bases", "visibility", "VARCHAR(16) NOT NULL DEFAULT 'public'")
     _add_column_if_missing("knowledge_bases", "access_level", "VARCHAR(16) NOT NULL DEFAULT 'guest'")
@@ -351,6 +356,46 @@ def _migrate_document_topic_review() -> None:
         db.commit()
 
 
+def _backfill_chat_turns() -> None:
+    """把相邻的历史 user/assistant 消息配成已完成回合；不补造回答依据。"""
+    with SessionLocal() as db:
+        sessions = list(db.scalars(select(ChatSession)))
+        for session in sessions:
+            rows = list(db.scalars(
+                select(Message)
+                .where(Message.session_id == session.id, Message.turn_id.is_(None))
+                .order_by(Message.id)
+            ))
+            index = 0
+            while index + 1 < len(rows):
+                user_message, assistant_message = rows[index], rows[index + 1]
+                if user_message.role != "user" or assistant_message.role != "assistant":
+                    index += 1
+                    continue
+                turn_id = f"turn_legacy_{session.id[-12:]}_{assistant_message.id}"
+                if db.get(ChatTurn, turn_id) is None:
+                    db.add(ChatTurn(
+                        id=turn_id,
+                        session_id=session.id,
+                        status="completed",
+                        action="answer",
+                        plan_version="legacy-unknown",
+                        started_at=user_message.created_at,
+                        finished_at=assistant_message.created_at,
+                    ))
+                user_message.turn_id = turn_id
+                assistant_message.turn_id = turn_id
+                index += 2
+            # SessionLocal 关闭了 autoflush；计数前必须显式写入本轮新增回合。
+            db.flush()
+            completed_count = db.scalar(
+                select(func.count(ChatTurn.id))
+                .where(ChatTurn.session_id == session.id, ChatTurn.status == "completed")
+            ) or 0
+            session.history_revision = max(session.history_revision or 0, completed_count)
+        db.commit()
+
+
 def init_db() -> None:
     _ensure_mysql_database()
     # 兼容既有无迁移数据库：先补建缺失表，再由 Alembic 负责已有表的增量结构。
@@ -361,6 +406,7 @@ def init_db() -> None:
     _migrate_add_deleted_at()
     _migrate_multi_user_columns()
     _migrate_document_topic_review()
+    _backfill_chat_turns()
     _seed_roles()
     _seed_suggested_questions()
     _seed_initial_admin()

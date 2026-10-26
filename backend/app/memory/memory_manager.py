@@ -50,6 +50,11 @@ class MemoryManager:
             self._memories[session_id] = (mem, now)
         return mem
 
+    def invalidate(self, session_id: str) -> None:
+        """完成回合提交后清除旧缓存，下次读取从数据库重建。"""
+        with self._lock:
+            self._memories.pop(session_id, None)
+
     def _evict(self, now: float) -> None:
         """过期淘汰 + 超容量 LRU（最久未访问先淘汰，至少保留最近一个）。"""
         expired = [sid for sid, (_, ts) in self._memories.items() if now - ts > self._idle_ttl_seconds]
