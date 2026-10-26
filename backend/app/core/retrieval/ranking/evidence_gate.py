@@ -18,7 +18,8 @@ from dataclasses import dataclass
 from app.config import settings
 from app.core.retrieval.retriever import RetrievedChunk
 from app.llm import qwen
-from app.llm.prompt_templates import build_evidence_judge_messages
+from app.llm.prompt_templates import EVIDENCE_JUDGE_VERSION, build_evidence_judge_messages
+from app.observability.prompt import record_prompt_build
 
 logger = logging.getLogger(__name__)
 
@@ -163,9 +164,16 @@ def _judge_gray_zone(
     limit = max(1, settings.evidence_judge_max_chunks)
     ranked_indexes = sorted(range(len(chunks)), key=lambda index: scores[index], reverse=True)[:limit]
     selected = [chunks[index].text for index in ranked_indexes]
+    messages = build_evidence_judge_messages(query, selected)
+    record_prompt_build(
+        "evidence_judge", messages,
+        template_version=EVIDENCE_JUDGE_VERSION,
+        evidence_ids=[chunks[index].chunk_id for index in ranked_indexes],
+    )
     output = qwen.chat_completion(
-        build_evidence_judge_messages(query, selected),
+        messages,
         model=settings.evidence_judge_model or settings.llm_model,
+        purpose="evidence_judge",
     )
     judged = _parse_judge_output(output, len(selected))
     if judged is None:

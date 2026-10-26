@@ -167,8 +167,10 @@ async def _sse_stream(
                 logger.debug("回答生成状态：session=%s message=%s", service.session.id, item["message"])
             elif item["type"] == "done":
                 # 先落库成功再发 done 帧：客户端收到 done 时数据已持久化
-                with stage("message.persist", role="assistant"):
+                with stage("message.persist", role="assistant") as observed:
                     assistant_message = service.complete(item)
+                    observed.set_attributes(assistant_message_id=assistant_message.id,
+                                            outcome="saved")
                 _remember_turn(
                     service.session.id, AUTO_KB_SCOPE, req.message, service.user_id
                 )
@@ -266,7 +268,8 @@ def _auto_name_session(session_id: str) -> None:
             )
             if first is None:
                 return
-            title = qwen.chat_completion(build_session_name_messages(first.content))
+            title = qwen.chat_completion(build_session_name_messages(first.content),
+                                         purpose="session_name")
             title = title.strip().strip('"\'"').strip("「」").strip()[:20]
             if not title:
                 return
@@ -328,8 +331,9 @@ async def chat(
     # 非流式与流式统一先识别意图，再由路由器选择回答能力。
     try:
         result = await asyncio.to_thread(service.answer)
-        with stage("message.persist", role="turn"):
-            service.complete(result)
+        with stage("message.persist", role="turn") as observed:
+            assistant = service.complete(result)
+            observed.set_attributes(assistant_message_id=assistant.id, outcome="saved")
     except TurnOwnershipLost as exc:
         mark_error(exc.code)
         service.fail(exc.code)

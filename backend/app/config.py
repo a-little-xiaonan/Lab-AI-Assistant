@@ -59,6 +59,14 @@ class Settings(BaseSettings):
     # ----- 回答依据路由（所有聊天请求统一经过意图识别）-----
     intent_route_timeout_seconds: float = Field(default=8, gt=0, le=30)
 
+    # ----- 多轮动作规划（P3；关闭后只保留 P2 的 answer 行为）-----
+    conversation_plan_enabled: bool = True
+    conversation_plan_timeout_seconds: float = Field(default=8, gt=0, le=30)
+    conversation_target_max_chars: int = Field(default=4000, ge=200, le=12000)
+    transform_target_max_chars: int = Field(default=8000, ge=500, le=20000)
+    clarification_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
+    clarification_max_turns: int = Field(default=2, ge=1, le=5)
+
     # ----- 会话回合租约（同一会话只允许一个生成中的回合）-----
     chat_turn_lease_seconds: int = Field(default=120, ge=30, le=900)
     chat_turn_renew_interval_seconds: int = Field(default=30, ge=5, le=300)
@@ -69,6 +77,13 @@ class Settings(BaseSettings):
     trace_max_file_bytes: int = Field(default=5 * 1024 * 1024, ge=16384, le=100 * 1024 * 1024)
     trace_backup_count: int = Field(default=3, ge=1, le=20)
     trace_retention_days: int = Field(default=7, ge=1, le=90)
+    trace_max_total_bytes: int = Field(default=512 * 1024 * 1024, ge=1024 * 1024,
+                                       le=10 * 1024 * 1024 * 1024)
+    trace_cleanup_interval_seconds: int = Field(default=3600, ge=60, le=86400)
+    trace_candidate_limit: int = Field(default=20, ge=1, le=100)
+    trace_retrieval_enabled: bool = True
+    trace_model_enabled: bool = True
+    trace_tool_enabled: bool = True
 
     # ----- 轻量 Agent（M1，启用需另行验收确认）-----
     agent_enabled: bool = False

@@ -49,8 +49,8 @@ def _rerank_dashscope(
         out.append(c)
     out.extend(by_idx.values())  # 未返回项兜底（理论上不出现）
     logger.info(
-        "重排完成（dashscope）：%d 条 → 前 %d 条（query=%s）",
-        len(candidates), len(out), query[:30],
+        "重排完成（dashscope）：%d 条 → 前 %d 条",
+        len(candidates), len(out),
     )
     return out
 

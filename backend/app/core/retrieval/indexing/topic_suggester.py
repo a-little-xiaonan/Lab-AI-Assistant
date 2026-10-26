@@ -54,7 +54,8 @@ def suggest_topics(db: Session, doc: Document, chunks: list) -> list[str]:
         return []
     text = "\n".join(chunk.text for chunk in chunks[:12])
     try:
-        raw = qwen.chat_completion(build_document_topic_messages(text, topics))
+        raw = qwen.chat_completion(build_document_topic_messages(text, topics),
+                                   purpose="document_topic")
         parsed = _parse(raw)
         valid = retrieval_topics.valid_codes([code for code, _ in parsed])
         confidence_by_code = dict(parsed)

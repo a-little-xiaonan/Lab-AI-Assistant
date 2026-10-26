@@ -1,8 +1,13 @@
-"""请求内阶段记录与线程安全关联；只接受明确允许的元数据。"""
+"""请求内阶段记录与线程安全关联；只接受明确允许的元数据。
+
+P4 起按 retrieval / model / tool 分类开关；默认不记录任何正文、Prompt、
+工具内容或鉴权材料。列表字段只允许稳定 ID 与枚举，并在入队前截断。
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 import time
 from contextlib import contextmanager
@@ -15,24 +20,122 @@ from app.middleware.request_context import current_request_id
 from app.observability.exporter import get_exporter
 
 logger = logging.getLogger(__name__)
+
+PIPELINE_VERSION = "intent-history-p4"
+SCHEMA_VERSION = "chat-trace-v1"
+
 _CURRENT: ContextVar[Trace | None] = ContextVar("chat_trace", default=None)
 _PARENT: ContextVar[tuple[str, str] | None] = ContextVar("chat_span", default=None)
 _FIELDS = frozenset({
+    # 请求与回合
     "stream", "http_status", "transport_complete", "disconnected", "assistant_saved",
-    "route", "parts_count", "handler", "role", "outcome", "error_code", "reason",
-    "query_chars", "history_chars", "history_before_chars", "history_messages",
-    "history_dropped_messages", "history_summary_present", "readable_kb_count",
-    "source_count", "tool_source_count", "tool", "call_id", "cache_hit",
-    "dropped_events", "write_failures", "elapsed_ms", "part_id",
+    "transport_status", "business_outcome", "outcome", "error_code", "reason",
     "history_revision", "history_turns", "history_dropped_turns", "turn_status",
-    "lease_acquired", "answer_kind", "basis_status",
+    "lease_acquired", "incomplete", "late_result", "assistant_message_id",
+    # 规划与来源
+    "route", "parts_count", "handler", "role", "answer_kind", "basis_status",
+    "plan_version", "action", "basis", "reference_message_ids", "target_message_ids",
+    "target_count", "clarification_reason", "resolved_question_chars",
+    "derived_from_message_ids", "derivation_depth", "provenance_exists",
+    "permission_projected", "transform_kind",
+    # 历史与上下文
+    "query_chars", "history_chars", "history_before_chars", "history_messages",
+    "history_dropped_messages", "history_summary_present", "history_message_ids",
+    "answer_ref_count", "pending_clarification",
+    "readable_kb_count", "kb_id", "kb_ids", "part_id", "subquery_id",
+    # 检索
+    "candidate_ids", "candidate_count", "candidate_ranks", "excluded_count",
+    "previous_candidate_ids",
+    "truncated", "executed", "skip_reason", "fallback_reason", "query_count",
+    "subquery_count", "rewrite_count", "vector_similarity", "bm25_score",
+    "rrf_score", "rerank_score", "threshold", "accepted_count", "source_count",
+    "tool_source_count", "answer_mode", "path_count", "top_k", "mode",
+    # 证据门槛
+    "evidence_ids", "evidence_count", "judge_used", "fail_open", "fail_closed",
+    "accepted", "gate_reason", "supporting_chunks", "total_chunks",
+    "max_similarity", "max_lexical_coverage", "max_rerank_score",
+    # 工具
+    "tool", "tool_version", "adapter", "call_id", "cache_hit", "arg_bytes",
+    "tool_count", "tool_names", "round",
+    # 模型与 Prompt
+    "purpose", "model", "provider_request_id", "attempt", "max_attempts",
+    "retry_count", "first_text_ms", "input_tokens", "output_tokens",
+    "cached_tokens", "cache_creation_tokens", "total_tokens", "usage_present",
+    "template_version", "prompt_fingerprint", "message_roles", "message_count",
+    "input_chars", "output_chars", "budget_tokens", "trimmed",
+    "processor_version", "normalized",
+    # 导出与容量
+    "dropped_events", "write_failures", "disk_capped", "export_incomplete",
+    "elapsed_ms",
 })
+_MAX_STRING = 160
+_MAX_LIST = 50
+# 白名单之外的纵深防御：即使未来误把字段加入白名单，也不落正文/凭据。
+_SENSITIVE_KEYS = frozenset({
+    "prompt", "question", "answer", "content", "text", "query", "history",
+    "snippet", "body", "authorization", "cookie", "api_key", "token", "secret",
+    "url", "html", "system_prompt", "model_output",
+})
+_CATEGORY_SWITCHES = {
+    "retrieval": "trace_retrieval_enabled",
+    "model": "trace_model_enabled",
+    "tool": "trace_tool_enabled",
+}
+
+
+def _safe_value(value):
+    """只保留可序列化且不含正文的标量/ID 列表；其他类型整字段丢弃。"""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return value[:_MAX_STRING]
+    if isinstance(value, (list, tuple)):
+        items = []
+        for item in value[:_MAX_LIST]:
+            if isinstance(item, bool):
+                items.append(item)
+            elif isinstance(item, int):
+                items.append(item)
+            elif isinstance(item, float):
+                if math.isfinite(item):
+                    items.append(item)
+            elif isinstance(item, str):
+                items.append(item[:_MAX_STRING])
+        return items
+    return None
 
 
 def _safe(values: dict) -> dict:
-    return {key: (value[:128] if isinstance(value, str) else value)
-            for key, value in values.items() if key in _FIELDS
-            and (value is None or isinstance(value, (str, bool, int)))}
+    safe = {}
+    for key, value in values.items():
+        if key not in _FIELDS or key.casefold() in _SENSITIVE_KEYS:
+            continue
+        projected = _safe_value(value)
+        if projected is not None or value is None:
+            safe[key] = projected
+    return safe
+
+
+def bounded_ids(values, limit: int | None = None) -> list:
+    """候选/证据 ID 统一截断；调用方可同时记录 truncated 属性。"""
+    if not values:
+        return []
+    maximum = limit if limit is not None else settings.trace_candidate_limit
+    return list(values)[: max(1, maximum)]
+
+
+def is_truncated(values, limit: int | None = None) -> bool:
+    maximum = limit if limit is not None else settings.trace_candidate_limit
+    return bool(values) and len(values) > max(1, maximum)
+
+
+def category_enabled(category: str) -> bool:
+    field = _CATEGORY_SWITCHES.get(category)
+    return bool(getattr(settings, field, True)) if field else True
 
 
 def exception_status(exc: BaseException) -> str:
@@ -107,7 +210,7 @@ class Trace:
         with self.lock:
             self.sequence += 1
             record = {
-                "schema_version": "chat-trace-v1", "pipeline_version": "intent-history-p2",
+                "schema_version": SCHEMA_VERSION, "pipeline_version": PIPELINE_VERSION,
                 "timestamp": datetime.now(timezone.utc).isoformat(), "trace_id": self.id,
                 "request_id": self.request_id, "session_id": self.session_id,
                 "turn_id": self.turn_id, "message_id": self.message_id, "sequence": self.sequence,
@@ -143,8 +246,15 @@ class Trace:
                             reason="request_finished_before_stage")
             try:
                 stats = self.exporter.stats()
+                capacity = getattr(self.exporter, "capacity_stats", None)
+                if capacity is not None:
+                    stats = {**stats, **capacity()}
             except Exception:
                 stats = {}
+            stats["export_incomplete"] = bool(
+                stats.get("dropped_events") or stats.get("write_failures") or stats.get("disk_capped")
+            )
+            stats["incomplete"] = stats["export_incomplete"]
             final = {**self.attributes, **stats, **attributes, "assistant_saved": self.saved,
                      "disconnected": self.disconnected}
             if self.error_code:
@@ -177,6 +287,13 @@ def bind_trace(trace: Trace):
 def stage(name: str, **attributes) -> Span:
     trace = current_trace()
     return trace.start_span(name, **attributes) if trace else Span(None, name, "", {})
+
+
+def stage_for(category: str, name: str, **attributes) -> Span:
+    """按 retrieval/model/tool 分类开关记录阶段；关闭时返回空 Span。"""
+    if not category_enabled(category):
+        return Span(None, name, "", {})
+    return stage(name, **attributes)
 
 
 def bind_session(session_id: str, **attributes) -> None:
@@ -223,6 +340,14 @@ def mark_first_delta() -> None:
                 trace.first_delta = True
                 trace.emit("answer.first_delta", "event", trace.root_id, None,
                            attributes={"elapsed_ms": int((time.monotonic() - trace.started) * 1000)})
+
+
+def mark_business_outcome(outcome: str) -> None:
+    """业务终态与传输状态分开记录；不因 HTTP 200 推断业务成功。"""
+    if trace := current_trace():
+        with trace.lock:
+            if not trace.closed:
+                trace.attributes.update(_safe({"business_outcome": outcome}))
 
 
 def traced_stream(iterator, **attributes):

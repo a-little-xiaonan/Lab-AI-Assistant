@@ -16,6 +16,7 @@ from sqlalchemy import or_, select
 from app.config import settings
 from app.core.agent.runtime import record_failure, timeout_seconds
 from app.llm.qwen import embed_query
+from app.observability.tracing import bounded_ids, is_truncated, stage_for
 from app.store.vector_store import vector_store
 
 logger = logging.getLogger(__name__)
@@ -59,29 +60,46 @@ def truncate_to_budget(
 
 def filter_published(kb_id: str, chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
     """进入 Prompt 前终检发布状态；数据库异常时 fail closed，不泄露候选正文。"""
-    if not chunks or not settings.document_governance_enabled:
-        return chunks
-    doc_ids = {chunk.metadata.get("doc_id") for chunk in chunks if chunk.metadata.get("doc_id")}
-    if not doc_ids:
-        return []
-    try:
-        from app.models.database import Document, utcnow
-        from app.store.db import SessionLocal
+    with stage_for("retrieval", "retrieval.publication", kb_id=kb_id,
+                   candidate_count=len(chunks)) as observed:
+        observed.set_attributes(previous_candidate_ids=bounded_ids(
+            [chunk.chunk_id for chunk in chunks]
+        ))
+        if not chunks or not settings.document_governance_enabled:
+            observed.set_attributes(accepted_count=len(chunks), excluded_count=0,
+                                    skip_reason="disabled_or_empty",
+                                    candidate_ids=bounded_ids([chunk.chunk_id for chunk in chunks]))
+            return chunks
+        doc_ids = {chunk.metadata.get("doc_id") for chunk in chunks if chunk.metadata.get("doc_id")}
+        if not doc_ids:
+            observed.set_attributes(accepted_count=0, excluded_count=len(chunks),
+                                    skip_reason="missing_doc_id")
+            return []
+        try:
+            from app.models.database import Document, utcnow
+            from app.store.db import SessionLocal
 
-        now = utcnow()
-        with SessionLocal() as db:
-            allowed = set(db.scalars(select(Document.id).where(
-                Document.id.in_(doc_ids), Document.kb_id == kb_id,
-                Document.status == "ready", Document.governance_status == "published",
-                Document.deleted_at.is_(None),
-                or_(Document.effective_at.is_(None), Document.effective_at <= now),
-                or_(Document.expires_at.is_(None), Document.expires_at > now),
-            )).all())
-        return [chunk for chunk in chunks if chunk.metadata.get("doc_id") in allowed]
-    except Exception:
-        record_failure("publication_check_failed")
-        logger.exception("文档发布状态终检失败，拒绝本轮候选：kb=%s", kb_id)
-        return []
+            now = utcnow()
+            with SessionLocal() as db:
+                allowed = set(db.scalars(select(Document.id).where(
+                    Document.id.in_(doc_ids), Document.kb_id == kb_id,
+                    Document.status == "ready", Document.governance_status == "published",
+                    Document.deleted_at.is_(None),
+                    or_(Document.effective_at.is_(None), Document.effective_at <= now),
+                    or_(Document.expires_at.is_(None), Document.expires_at > now),
+                )).all())
+            result = [chunk for chunk in chunks if chunk.metadata.get("doc_id") in allowed]
+            observed.set_attributes(accepted_count=len(result),
+                                    excluded_count=len(chunks) - len(result),
+                                    candidate_ids=bounded_ids(
+                                        [chunk.chunk_id for chunk in result]
+                                    ))
+            return result
+        except Exception:
+            record_failure("publication_check_failed")
+            observed.finish("degraded", error_code="publication_check_failed")
+            logger.exception("文档发布状态终检失败，拒绝本轮候选：kb=%s", kb_id)
+            return []
 
 
 def retrieve(
@@ -111,7 +129,15 @@ def retrieve(
 
     query_embedding = embed_query(query_text)
     timeout_seconds(settings.llm_timeout)
-    hits = vector_store.query(kb_id, query_embedding, top_k)
+    with stage_for("retrieval", "retrieval.vector", kb_id=kb_id, top_k=top_k,
+                   executed=True) as observed:
+        hits = vector_store.query(kb_id, query_embedding, top_k)
+        observed.set_attributes(
+            candidate_count=len(hits),
+            candidate_ids=bounded_ids([chunk_id for chunk_id, *_ in hits]),
+            truncated=is_truncated(hits),
+            vector_similarity=[round(1.0 - distance, 6) for _, _, _, distance in hits][:20],
+        )
 
     filtered: list[RetrievedChunk] = []
     for chunk_id, text, metadata, distance in hits:
@@ -120,9 +146,13 @@ def retrieve(
             filtered.append(RetrievedChunk(chunk_id=chunk_id, text=text, score=score, metadata=metadata))
 
     filtered.sort(key=lambda c: c.score, reverse=True)
-
-    kept = truncate_to_budget(filtered, max_tokens)
+    with stage_for("retrieval", "retrieval.truncate", kb_id=kb_id,
+                   candidate_count=len(filtered), threshold=threshold) as observed:
+        kept = truncate_to_budget(filtered, max_tokens)
+        observed.set_attributes(accepted_count=len(kept),
+                                excluded_count=len(filtered) - len(kept),
+                                budget_tokens=max_tokens)
 
     if not filtered:
-        logger.info("检索无命中（阈值 %s 过滤）：kb=%s query=%s", threshold, kb_id, query_text[:40])
+        logger.info("检索无命中（阈值 %s 过滤）：kb=%s", threshold, kb_id)
     return filter_published(kb_id, kept)

@@ -13,12 +13,16 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.api.errors import BadRequestError, ConflictError
 from app.config import settings
 from app.core import intent_router
+from app.llm.prompt_templates import CONVERSATION_PLAN_VERSION
 from app.memory.memory_manager import memory_manager
 from app.middleware.request_context import current_request_id
 from app.models.database import (
     AnswerProvenance, ChatSession, ChatTurn, Message, utcnow,
 )
-from app.observability.tracing import bind_turn, current_trace, mark_saved, stage
+from app.observability.tracing import (
+    PIPELINE_VERSION, bind_turn, current_trace, mark_business_outcome, mark_saved, stage,
+)
+from app.services.conversation.context import ConversationContext
 from app.services.conversation.history import HistorySnapshot, build_history_snapshot
 
 logger = logging.getLogger(__name__)
@@ -103,6 +107,7 @@ class ChatService:
         self.target_message_id = target_message_id
         self.turn_id = f"turn_{uuid4().hex[:20]}"
         self.snapshot: HistorySnapshot | None = None
+        self.db_factory = None
         self.completed = False
         self.closed = False
         self.cancellation = threading.Event()
@@ -161,6 +166,10 @@ class ChatService:
                 status="processing",
                 action="answer",
                 target_message_ids_json=json.dumps(target_ids),
+                plan_version=(
+                    CONVERSATION_PLAN_VERSION
+                    if settings.conversation_plan_enabled else "intent-v1"
+                ),
             ))
             self.db.add(Message(
                 session_id=self.session.id,
@@ -176,11 +185,23 @@ class ChatService:
         self.snapshot = build_history_snapshot(self.db, self.session)
         # 请求数据库绑定用于独立续租；expire_on_commit=False 避免触碰请求对象。
         factory = sessionmaker(bind=self.db.get_bind(), autoflush=False, expire_on_commit=False)
+        self.db_factory = factory
         self._lease = TurnLeaseKeeper(
             factory, self.session.id, self.turn_id, self.cancellation
         )
         self._lease.start()
         return self.snapshot
+
+    def _conversation_context(self) -> ConversationContext:
+        if self.snapshot is None or self.db_factory is None:
+            raise RuntimeError("聊天回合尚未开始")
+        return ConversationContext(
+            session_id=self.session.id,
+            snapshot=self.snapshot,
+            target_message_id=self.target_message_id,
+            db_factory=self.db_factory,
+            readable_kb_ids=tuple(self.readable_kb_ids),
+        )
 
     def answer(self) -> dict:
         self._ensure_started()
@@ -193,6 +214,7 @@ class ChatService:
             history_context=self.snapshot.text,
             cancellation=self.cancellation,
             include_provenance=True,
+            conversation_context=self._conversation_context(),
         )
 
     def answer_stream(self):
@@ -206,6 +228,7 @@ class ChatService:
             history_context=self.snapshot.text,
             cancellation=self.cancellation,
             include_provenance=True,
+            conversation_context=self._conversation_context(),
         )
 
     @property
@@ -226,6 +249,10 @@ class ChatService:
             role="assistant",
             content=result["answer"] if "answer" in result else result["full_text"],
         )
+        reference_ids = self._reference_ids(result)
+        derived_ids = self._derived_ids(result)
+        clarification = result.get("_clarification")
+        business_outcome = self._business_outcome(provenance, result)
         with stage("turn.finish", turn_status="completed") as observed:
             try:
                 self.db.add(assistant)
@@ -234,11 +261,13 @@ class ChatService:
                     assistant_message_id=assistant.id,
                     turn_id=self.turn_id,
                     trace_id=(current_trace().id if current_trace() else None),
+                    pipeline_version=PIPELINE_VERSION,
+                    planner_version=provenance.get(
+                        "planner_version", result.get("_plan_version", "intent-v1")
+                    ),
                     answer_kind=provenance.get("answer_kind", "unknown"),
                     basis_status=provenance.get("basis_status", "unknown"),
-                    derived_from_message_ids_json=json.dumps(
-                        [self.target_message_id] if self.target_message_id else []
-                    ),
+                    derived_from_message_ids_json=json.dumps(derived_ids),
                     parts_json=json.dumps(provenance.get("parts", []), ensure_ascii=False),
                     evidence_refs_json=json.dumps(self._evidence_refs(result), ensure_ascii=False),
                 ))
@@ -246,7 +275,14 @@ class ChatService:
                 if turn is None or turn.status != "processing":
                     raise TurnOwnershipLost("聊天回合已不再处理中")
                 turn.status = "completed"
-                turn.action = provenance.get("action", "answer")
+                turn.action = provenance.get("action", result.get("_plan_action", "answer"))
+                turn.plan_version = result.get("_plan_version", turn.plan_version)
+                turn.target_message_ids_json = json.dumps(reference_ids)
+                if clarification:
+                    turn.pending_clarification_json = json.dumps(
+                        self._clarification_state(clarification, now),
+                        ensure_ascii=False,
+                    )
                 turn.finished_at = now
                 released = self.db.execute(
                     update(ChatSession)
@@ -265,6 +301,7 @@ class ChatService:
                 if released.rowcount != 1:
                     raise TurnOwnershipLost("聊天回合租约或历史版本已变化")
                 self.db.commit()
+                mark_business_outcome(business_outcome)
             except Exception:
                 self.db.rollback()
                 observed.finish("error", error_code="turn_commit_failed")
@@ -311,6 +348,64 @@ class ChatService:
     def _ensure_started(self) -> None:
         if self.snapshot is None:
             raise RuntimeError("聊天回合尚未开始")
+
+    @staticmethod
+    def _business_outcome(provenance: dict, result: dict) -> str:
+        action = provenance.get("action")
+        kind = provenance.get("answer_kind")
+        parts = provenance.get("parts") or []
+        if action == "clarify":
+            return "needs_input"
+        if kind == "unavailable":
+            return "insufficient_evidence"
+        if any(isinstance(part, dict) and part.get("status") == "failed" for part in parts):
+            return "partial"
+        sources = result.get("sources") or []
+        refs = result.get("_evidence_refs") or []
+        if kind == "knowledge" and not sources and not refs:
+            return "no_data"
+        return "answered"
+
+    def _reference_ids(self, result: dict) -> list[int]:
+        if "_plan_action" in result:
+            values = result.get("_reference_message_ids") or []
+            return [value for value in values if isinstance(value, int)][:3]
+        return [self.target_message_id] if self.target_message_id else []
+
+    def _derived_ids(self, result: dict) -> list[int]:
+        if "_plan_action" in result:
+            values = result.get("_derived_from_message_ids") or []
+            return [value for value in values if isinstance(value, int)][:3]
+        # P2 兼容：显式引用目标只作为派生关系保存，P3 由计划明确给出。
+        return [self.target_message_id] if self.target_message_id else []
+
+    def _clarification_state(self, clarification: dict, now) -> dict:
+        missing = clarification.get("missing_parameters")
+        references = clarification.get("reference_message_ids")
+        draft = clarification.get("safe_draft")
+        try:
+            remaining = max(0, int(clarification.get("remaining_turns", 0)))
+        except (TypeError, ValueError):
+            remaining = 0
+        return {
+            "version": "clarification-v1",
+            "original_question": self.query[:4000],
+            "question": str(clarification.get("question", ""))[:200],
+            "missing_parameters": [
+                str(item)[:64] for item in missing[:3]
+            ] if isinstance(missing, list) else [],
+            "safe_draft": draft if isinstance(draft, dict) else {},
+            "reference_message_ids": [
+                item for item in references[:3]
+                if isinstance(item, int)
+            ] if isinstance(references, list) else [],
+            "created_turn_id": self.turn_id,
+            "created_at": now.isoformat(),
+            "expires_at": (
+                now + timedelta(seconds=settings.clarification_ttl_seconds)
+            ).isoformat(),
+            "remaining_turns": remaining,
+        }
 
     @staticmethod
     def _evidence_refs(result: dict) -> list[dict]:

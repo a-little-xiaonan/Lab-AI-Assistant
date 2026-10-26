@@ -25,7 +25,7 @@ SUMMARIZE_MAX_TOKENS = 300
 def summarize_messages(messages: list[tuple[str, str]]) -> str | None:
     """LLM 摘要一段对话。失败返回 None（调用方降级：丢最旧 + 日志），不抛异常。"""
     try:
-        text = qwen.chat_completion(build_summarize_history_messages(messages))
+        text = qwen.chat_completion(build_summarize_history_messages(messages), purpose="summary")
         if estimate_tokens(text) > SUMMARIZE_MAX_TOKENS:
             logger.warning("摘要超过 %d token，截断处理", SUMMARIZE_MAX_TOKENS)
             text = text[: SUMMARIZE_MAX_TOKENS * 2]  # 中文粗截断（1字≈1token 的宽松上限）

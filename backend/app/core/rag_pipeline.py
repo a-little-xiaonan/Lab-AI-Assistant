@@ -26,6 +26,7 @@ from app.core.retrieval.ranking.evidence_gate import EvidenceDecision, filter_ev
 from app.llm import qwen
 from app.llm.errors import LLMError
 from app.llm.prompt_templates import (
+    RAG_PROMPT_VERSION,
     build_faq_answer_messages,
     build_no_context_messages,
     build_rag_answer_messages,
@@ -34,12 +35,14 @@ from app.llm.prompt_templates import (
 from app.memory.long_term import format_memories, long_term_memory
 from app.memory.memory_manager import memory_manager
 from app.middleware.request_context import current_request_id
-from app.observability.tracing import stage
+from app.observability.prompt import record_prompt_build
+from app.observability.tracing import bounded_ids, is_truncated, stage, stage_for
 
 logger = logging.getLogger(__name__)
 
 KB_DEFAULT = "kb_default"
 SNIPPET_MAX = 50  # sources 片段摘要上限（文档 04 协议）
+NORMALIZE_VERSION = "citation-strip-v1"
 KNOWLEDGE_UNAVAILABLE = "知识库查询暂时失败，请稍后重试。"
 
 
@@ -273,7 +276,26 @@ def prepare_evidence(query: str, kb_id: str | list[str], history: str = "", *,
     timeout_seconds(settings.llm_timeout)
     # 已通过 ACL、发布状态与有效期终检的候选可仅作为“展开定位”，不能直接回答。
     candidates = list(chunks)
-    chunks, evidence = filter_evidence(query, chunks)
+    candidate_ids = [chunk.chunk_id for chunk in candidates]
+    with stage_for(
+        "retrieval", "evidence.gate",
+        candidate_count=len(candidates),
+        candidate_ids=bounded_ids(candidate_ids),
+        truncated=is_truncated(candidate_ids),
+    ) as observed:
+        chunks, evidence = filter_evidence(query, chunks)
+        reason = evidence.reason
+        observed.set_attributes(
+            **evidence.as_dict(),
+            accepted=evidence.accepted,
+            gate_reason=reason,
+            supporting_chunks=evidence.supporting_chunks,
+            total_chunks=evidence.total_chunks,
+            judge_used=evidence.judge_used,
+            fail_open="open" in reason,
+            fail_closed="closed" in reason,
+            evidence_ids=bounded_ids([chunk.chunk_id for chunk in chunks]),
+        )
     if "failed" in evidence.reason:
         failures.append("evidence_verification_failed")
         if strict:
@@ -285,7 +307,8 @@ def prepare_evidence(query: str, kb_id: str | list[str], history: str = "", *,
 
 
 def _prepare(
-    query: str, kb_id: str | list[str], history: str = "", user_id: str | None = None
+    query: str, kb_id: str | list[str], history: str = "", user_id: str | None = None,
+    history_message_ids=(),
 ) -> tuple[list[retriever.RetrievedChunk], list[dict], EvidenceDecision, str]:
     prepared = prepare_evidence(query, kb_id, history)
     chunks, evidence, answer_outline = prepared.chunks, prepared.decision, prepared.answer_outline
@@ -302,6 +325,14 @@ def _prepare(
         )
     else:
         messages = build_no_context_messages(query, history=history, memories=memories)
+    record_prompt_build(
+        "answer_rag",
+        messages,
+        template_version=RAG_PROMPT_VERSION,
+        history_message_ids=history_message_ids,
+        evidence_ids=[chunk.chunk_id for chunk in chunks],
+        budget_tokens=settings.max_context_tokens,
+    )
     return chunks, messages, evidence, prepared.status
 
 
@@ -362,9 +393,13 @@ class CitationStreamProcessor:
 
 
 def _finalize(
-    raw_answer: str, chunks: list[retriever.RetrievedChunk]
+    raw_answer: str, chunks: list[retriever.RetrievedChunk], answer_mode: str = "rag"
 ) -> dict:
-    body, sources = _normalize_citations(raw_answer, chunks)
+    with stage("output.normalize", input_chars=len(raw_answer),
+               processor_version=NORMALIZE_VERSION) as observed:
+        body, sources = _normalize_citations(raw_answer, chunks)
+        observed.set_attributes(output_chars=len(body), normalized=body != raw_answer,
+                                source_count=len(sources), answer_mode=answer_mode)
     return {"answer": body, "sources": sources}
 
 
@@ -383,6 +418,7 @@ def answer(
     """
     started = time.monotonic()
     history = flags.get("history_context")
+    history_message_ids = flags.get("history_message_ids", ())
     if history is None:
         history = _get_history_context(session_id)
     faq = _prepare_public_faq(query, kb_id, history, audience_scope)
@@ -393,13 +429,19 @@ def answer(
             evidence = _faq_evidence(chunks)
             status = "ok"
             answer_mode = "faq_context_cache" if faq.cache_enabled else "faq_template"
+            record_prompt_build(
+                "answer_faq", faq.messages,
+                template_version=f"faq-v{faq.template_version}",
+                history_message_ids=history_message_ids,
+                evidence_ids=[chunk.chunk_id for chunk in chunks],
+            )
             retrieval_elapsed = time.monotonic() - started
             generation_started = time.monotonic()
             raw_answer = (
                 qwen.chat_completion_with_context_cache(faq.messages)
-                if faq.cache_enabled else qwen.chat_completion(faq.messages)
+                if faq.cache_enabled else qwen.chat_completion(faq.messages, purpose="answer")
             )
-            result = _finalize(raw_answer, chunks)
+            result = _finalize(raw_answer, chunks, answer_mode=answer_mode)
             _log_faq_observation(
                 faq, stage="completed", route_elapsed=retrieval_elapsed,
                 generation_elapsed=time.monotonic() - generation_started,
@@ -409,11 +451,14 @@ def answer(
             _log_faq_observation(faq, stage="fallback", route_elapsed=time.monotonic() - started)
             faq = None
     if faq is None:
-        chunks, messages, evidence, status = _prepare(query, kb_id, history=history, user_id=user_id)
+        chunks, messages, evidence, status = _prepare(
+            query, kb_id, history=history, user_id=user_id,
+            history_message_ids=history_message_ids,
+        )
         retrieval_elapsed = time.monotonic() - started
         generation_started = time.monotonic()
         result = ({"answer": KNOWLEDGE_UNAVAILABLE, "sources": []} if status == "failed"
-                  else _finalize(qwen.chat_completion(messages), chunks))
+                  else _finalize(qwen.chat_completion(messages, purpose="answer"), chunks))
     if flags.get("include_diagnostics"):
         result["diagnostics"] = {
             "evidence": evidence.as_dict(),
@@ -464,11 +509,18 @@ def answer_stream(
     if cancellation is not None and cancellation.is_set():
         return
     history = flags.get("history_context")
+    history_message_ids = flags.get("history_message_ids", ())
     if history is None:
         history = _get_history_context(session_id)
     started = time.monotonic()
     faq = _prepare_public_faq(query, kb_id, history, audience_scope)
     if faq is not None:
+        record_prompt_build(
+            "answer_faq", faq.messages,
+            template_version=f"faq-v{faq.template_version}",
+            history_message_ids=history_message_ids,
+            evidence_ids=[chunk.chunk_id for chunk in faq.chunks],
+        )
         proc = CitationStreamProcessor(faq.chunks)
         processed = []
         emitted = False
@@ -478,7 +530,7 @@ def answer_stream(
         try:
             stream = (
                 qwen.chat_completion_stream_with_context_cache(faq.messages)
-                if faq.cache_enabled else qwen.chat_completion_stream(faq.messages)
+                if faq.cache_enabled else qwen.chat_completion_stream(faq.messages, purpose="answer")
             )
             for delta in stream:
                 if cancellation is not None and cancellation.is_set():
@@ -497,7 +549,14 @@ def answer_stream(
                 emitted = True
                 processed.append(tail)
                 yield {"type": "delta", "text": tail}
-            body = _strip_citations("".join(processed))
+            raw_body = "".join(processed)
+            with stage("output.normalize", input_chars=len(raw_body),
+                       processor_version=NORMALIZE_VERSION) as observed:
+                body = _strip_citations(raw_body)
+                observed.set_attributes(
+                    output_chars=len(body), normalized=body != raw_body,
+                    answer_mode="faq_context_cache" if faq.cache_enabled else "faq_template",
+                )
             _log_faq_observation(
                 faq, stage="completed", route_elapsed=route_elapsed,
                 generation_elapsed=time.monotonic() - generation_started,
@@ -519,7 +578,10 @@ def answer_stream(
             logger.exception("FAQ 模板流式调用失败，回退常规 RAG：template=%s", faq.code)
             _log_faq_observation(faq, stage="fallback", route_elapsed=time.monotonic() - started)
 
-    chunks, messages, _evidence, status = _prepare(query, kb_id, history=history, user_id=user_id)
+    chunks, messages, _evidence, status = _prepare(
+        query, kb_id, history=history, user_id=user_id,
+        history_message_ids=history_message_ids,
+    )
     if cancellation is not None and cancellation.is_set():
         return
     if status == "failed":
@@ -531,7 +593,7 @@ def answer_stream(
         return
     proc = CitationStreamProcessor(chunks)
     processed = []
-    for delta in qwen.chat_completion_stream(messages):
+    for delta in qwen.chat_completion_stream(messages, purpose="answer"):
         if cancellation is not None and cancellation.is_set():
             return
         replaced = proc.feed(delta)
@@ -543,7 +605,12 @@ def answer_stream(
         processed.append(tail)
         yield {"type": "delta", "text": tail}
 
-    body = _strip_citations("".join(processed))
+    raw_body = "".join(processed)
+    with stage("output.normalize", input_chars=len(raw_body),
+               processor_version=NORMALIZE_VERSION) as observed:
+        body = _strip_citations(raw_body)
+        observed.set_attributes(output_chars=len(body), normalized=body != raw_body,
+                                answer_mode="rag")
     sources = _dedup_sources(chunks) if chunks else []
     done = {"type": "done", "full_text": body, "sources": sources}
     if flags.get("include_diagnostics"):

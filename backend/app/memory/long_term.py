@@ -68,7 +68,7 @@ class LongTermMemory:
     ) -> int:
         """后台提取并写入用户自己的记忆；失败绝不阻塞聊天主链路。"""
         try:
-            text = qwen.chat_completion(build_memory_extract_messages(messages))
+            text = qwen.chat_completion(build_memory_extract_messages(messages), purpose="memory_extract")
             items = _parse_extraction(text)
         except Exception:
             logger.exception("记忆提取失败（user=%s，session=%s）", user_id, session_id)

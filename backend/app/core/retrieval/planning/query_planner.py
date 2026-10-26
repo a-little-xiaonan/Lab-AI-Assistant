@@ -12,6 +12,8 @@ from app.config import settings
 from app.core.retrieval.indexing.retrieval_topics import retrieval_topics
 from app.llm import qwen
 from app.llm.prompt_templates import build_query_plan_messages
+from app.observability.prompt import record_prompt_build
+from app.observability.tracing import stage_for
 
 logger = logging.getLogger(__name__)
 
@@ -72,16 +74,26 @@ def _parse(query: str, output: str) -> QueryPlan | None:
 def plan_query(query: str, history_context: str = "") -> QueryPlan:
     """返回单/多问题计划；关闭、规则未命中或任意失败时均返回单问题。"""
     fallback = _single(query)
-    if not settings.query_planning_enabled or not _might_be_complex(query):
-        return fallback
-    try:
-        output = qwen.chat_completion(build_query_plan_messages(query, history_context))
-        plan = _parse(query, output)
-        if plan is None:
-            logger.warning("查询规划结果不可信，回退单问题")
+    with stage_for("retrieval", "query.plan", enabled=settings.query_planning_enabled) as observed:
+        if not settings.query_planning_enabled or not _might_be_complex(query):
+            observed.set_attributes(executed=False, skip_reason="disabled_or_simple",
+                                    subquery_count=1)
             return fallback
-        logger.info("查询规划：mode=%s sub_count=%d topics=%s", plan.mode, len(plan.sub_queries), plan.topic_hints)
-        return plan
-    except Exception:
-        logger.exception("查询规划失败，回退单问题")
-        return fallback
+        try:
+            messages = build_query_plan_messages(query, history_context)
+            record_prompt_build("query_plan", messages, template_version="query-plan-v1")
+            output = qwen.chat_completion(messages, purpose="query_plan")
+            plan = _parse(query, output)
+            if plan is None:
+                logger.warning("查询规划结果不可信，回退单问题")
+                observed.set_attributes(executed=True, fallback_reason="invalid_output",
+                                        subquery_count=1)
+                return fallback
+            observed.set_attributes(executed=True, subquery_count=len(plan.sub_queries))
+            logger.info("查询规划：mode=%s sub_count=%d topics=%s", plan.mode, len(plan.sub_queries), plan.topic_hints)
+            return plan
+        except Exception:
+            logger.exception("查询规划失败，回退单问题")
+            observed.set_attributes(executed=True, fallback_reason="llm_failed",
+                                    subquery_count=1)
+            return fallback

@@ -11,9 +11,11 @@ from app.core.agent.models import ToolContext
 from app.core.agent.runtime import ExecutionBudget, run_bounded
 from app.llm import qwen
 from app.llm.errors import LLMError
+from app.llm.prompt_templates import AGENT_PROMPT_VERSION
 from app.tools import registry
 from app.middleware.request_context import current_request_id
-from app.observability.tracing import current_trace
+from app.observability.prompt import record_prompt_build
+from app.observability.tracing import current_trace, stage, stage_for
 
 SYSTEM = """你是实验室问答助手。工具目录会根据当前开关提供可调用能力；只能调用目录中的工具。
 天气尚未上线，不能声称使用该能力。只有工具目录中出现 web_search/read_webpage 时才可使用联网能力。
@@ -26,7 +28,8 @@ SYSTEM = """你是实验室问答助手。工具目录会根据当前开关提�
 不要输出内部推理。"""
 
 
-def _prepare(query, kb_ids, session_id, user_id, cancellation=None, history_context=None):
+def _prepare(query, kb_ids, session_id, user_id, cancellation=None, history_context=None,
+             history_message_ids=(), plan_context=None):
     budget = ExecutionBudget(time.monotonic() + settings.agent_prepare_timeout_seconds)
     if cancellation is not None:
         budget.cancelled = cancellation
@@ -41,9 +44,16 @@ def _prepare(query, kb_ids, session_id, user_id, cancellation=None, history_cont
         ctx.history = (run_bounded(budget, rag_pipeline._get_history_context, session_id)
                        if history_context is None else history_context)
         messages = [{"role": "system", "content": SYSTEM},
-                    {"role": "user", "content": json.dumps({"history": ctx.history, "question": query}, ensure_ascii=False)}]
+                    {"role": "user", "content": json.dumps(
+                        {"history": ctx.history, "question": query,
+                         "plan": plan_context or None},
+                        ensure_ascii=False)}]
+        record_prompt_build(
+            "agent_decision", messages, template_version=AGENT_PROMPT_VERSION,
+            history_message_ids=history_message_ids,
+        )
         used_ids = set()
-        for _ in range(settings.agent_max_tool_rounds):
+        for round_index in range(settings.agent_max_tool_rounds):
             budget.remaining()
             message = run_bounded(budget, lambda: qwen.tool_completion(
                 messages, registry.schemas(), timeout=min(settings.llm_timeout, budget.remaining())))
@@ -51,6 +61,13 @@ def _prepare(query, kb_ids, session_id, user_id, cancellation=None, history_cont
             if not calls:
                 # 模型普通文本不作为事实答案，统一走受限最终回答。
                 break
+            with stage_for(
+                "tool", "tool.select",
+                round=round_index + 1,
+                tool_count=len(calls),
+                tool_names=[call["function"]["name"][:64] for call in calls][:8],
+            ):
+                pass
             messages.append(message)
             for call in calls:
                 if call["id"] in used_ids:
@@ -75,7 +92,17 @@ def _prepare(query, kb_ids, session_id, user_id, cancellation=None, history_cont
         return ctx, results, text or notice or "尚未获得回答所需的事实依据。请明确要查询的日期时间、实验室知识问题或已启用的公开信息能力。", None
     payload = [r.model_dump() for r in results]
     final_messages = [{"role": "system", "content": SYSTEM + "\n现在只根据工具结果回答，不再调用工具。逐项说明成功、缺资料、缺参数和失败。展示时间和时区。不要输出内部文件名、引用编号或未经核实的链接。"},
-                      {"role": "user", "content": json.dumps({"question": query, "results": payload, "notice": notice}, ensure_ascii=False)}]
+                      {"role": "user", "content": json.dumps(
+                          {"question": query, "results": payload, "notice": notice,
+                           "plan": plan_context or None},
+                          ensure_ascii=False)}]
+    record_prompt_build(
+        "answer_agent", final_messages, template_version=AGENT_PROMPT_VERSION,
+        history_message_ids=history_message_ids,
+        evidence_ids=[
+            ref for result in results for ref in result.evidence_refs
+        ],
+    )
     return ctx, results, None, final_messages
 
 
@@ -131,8 +158,17 @@ def answer(query, kb_ids, session_id=None, user_id=None, **flags):
     _, results, direct, messages = _prepare(
         query, kb_ids, session_id, user_id, flags.get("cancellation"),
         flags.get("history_context"),
+        flags.get("history_message_ids", ()),
+        flags.get("conversation_plan"),
     )
-    text = direct if direct is not None else rag_pipeline._strip_citations(qwen.chat_completion(messages))
+    text = direct if direct is not None else rag_pipeline._strip_citations(
+        qwen.chat_completion(messages, purpose="answer")
+    )
+    with stage("output.normalize", input_chars=len(text),
+               processor_version="agent-strip-v1") as observed:
+        text = text.strip()
+        observed.set_attributes(output_chars=len(text), normalized=True,
+                                answer_mode="agent")
     sources, tool_sources = _sources(results)
     response = {"answer": text, "sources": sources, "tool_sources": tool_sources}
     if flags.get("include_provenance"):
@@ -145,12 +181,16 @@ def answer_stream(query, kb_ids, session_id=None, user_id=None, **flags):
     _, results, direct, messages = _prepare(
         query, kb_ids, session_id, user_id, flags.get("cancellation"),
         flags.get("history_context"),
+        flags.get("history_message_ids", ()),
+        flags.get("conversation_plan"),
     )
     if flags.get("cancellation") is not None and flags["cancellation"].is_set():
         return
     parts = []
     proc = rag_pipeline.CitationStreamProcessor([])
-    for delta in ([direct] if direct is not None else qwen.chat_completion_stream(messages)):
+    for delta in ([direct] if direct is not None else qwen.chat_completion_stream(
+        messages, purpose="answer"
+    )):
         if flags.get("cancellation") is not None and flags["cancellation"].is_set():
             return
         text = proc.feed(delta)
@@ -162,7 +202,13 @@ def answer_stream(query, kb_ids, session_id=None, user_id=None, **flags):
         parts.append(tail)
         yield {"type": "delta", "text": tail}
     sources, tool_sources = _sources(results)
-    done = {"type": "done", "full_text": "".join(parts).strip(),
+    raw = "".join(parts)
+    with stage("output.normalize", input_chars=len(raw),
+               processor_version="agent-strip-v1") as observed:
+        final_text = raw.strip()
+        observed.set_attributes(output_chars=len(final_text), normalized=final_text != raw,
+                                answer_mode="agent")
+    done = {"type": "done", "full_text": final_text,
             "sources": sources, "tool_sources": tool_sources}
     if flags.get("include_provenance"):
         done["_evidence_refs"] = _provenance_refs(results)

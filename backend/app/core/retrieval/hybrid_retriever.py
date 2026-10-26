@@ -21,6 +21,7 @@ from app.core.retrieval import retriever
 from app.core.retrieval.indexing.keyword_index import keyword_index
 from app.core.retrieval.retriever import RetrievedChunk
 from app.llm import qwen
+from app.observability.tracing import bounded_ids, is_truncated, stage_for
 from app.store.vector_store import vector_store
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,7 @@ def _merge_query_results(
         except Exception:
             if q == queries[0]:
                 raise
-            logger.warning("改写查询检索失败，丢弃该路：%s", q[:40])
+            logger.warning("改写查询检索失败，丢弃该路")
             continue
         for chunk_id, (sim, text, metadata) in hits.items():
             prev = merged.get(chunk_id)
@@ -123,9 +124,20 @@ def retrieve(
             queries = [query_text]
     if max_queries is not None:
         queries = queries[:max(1, max_queries)]
+    with stage_for("retrieval", "query.rewrite", kb_id=kb_id,
+                   query_count=len(queries), executed=len(queries) > 1) as observed:
+        observed.set_attributes(rewrite_count=max(0, len(queries) - 1))
 
     # 向量侧（多查询并发合并）
-    vector_list = _merge_query_results(kb_id, queries, vector_top_k)
+    with stage_for("retrieval", "retrieval.vector", kb_id=kb_id,
+                   top_k=vector_top_k, query_count=len(queries)) as observed:
+        vector_list = _merge_query_results(kb_id, queries, vector_top_k)
+        observed.set_attributes(
+            candidate_count=len(vector_list),
+            candidate_ids=bounded_ids([cid for cid, *_ in vector_list]),
+            vector_similarity=[round(sim, 6) for _, sim, *_ in vector_list][:20],
+            truncated=is_truncated(vector_list),
+        )
     vector_ids = {cid for cid, *_ in vector_list}
 
     # 关键词侧查询：默认 原问题 + 术语展开变体（Phase 3-01 补强：口语→标准术语的
@@ -140,26 +152,45 @@ def retrieve(
         except Exception:
             logger.exception("术语展开失败，关键词侧降级为原问题")
             kw_queries = [query_text]
-    kw_list = _keyword_hits(kb_id, kw_queries, kw_top_k)
+    with stage_for("retrieval", "retrieval.keyword", kb_id=kb_id,
+                   top_k=kw_top_k, query_count=len(kw_queries)) as observed:
+        kw_list = _keyword_hits(kb_id, kw_queries, kw_top_k)
+        observed.set_attributes(
+            candidate_count=len(kw_list),
+            candidate_ids=bounded_ids([cid for cid, *_ in kw_list]),
+            bm25_score=[round(score, 6) for _, score, *_ in kw_list][:20],
+            truncated=is_truncated(kw_list),
+        )
 
     # RRF 融合（按 chunk_id 去重）
-    rrf: dict[str, tuple[float, RetrievedChunk]] = {}
-    for rank, (cid, sim, text, md) in enumerate(vector_list):
-        s = 1.0 / (RRF_K + rank)
-        rrf[cid] = (s, RetrievedChunk(
-            chunk_id=cid, text=text, score=s, metadata=md, similarity=sim
-        ))
-    for rank, (cid, bm25_score, text, md) in enumerate(kw_list):
-        s = 1.0 / (RRF_K + rank)
-        prev = rrf.get(cid)
-        if prev is None:
-            rrf[cid] = (s, RetrievedChunk(chunk_id=cid, text=text, score=s, metadata=md))
-        else:
-            rrf[cid] = (prev[0] + s, prev[1])
-            prev[1].score = prev[0] + s
+    with stage_for("retrieval", "retrieval.fuse", kb_id=kb_id,
+                   candidate_count=len(vector_list) + len(kw_list)) as observed:
+        rrf: dict[str, tuple[float, RetrievedChunk]] = {}
+        for rank, (cid, sim, text, md) in enumerate(vector_list):
+            s = 1.0 / (RRF_K + rank)
+            rrf[cid] = (s, RetrievedChunk(
+                chunk_id=cid, text=text, score=s, metadata=md, similarity=sim
+            ))
+        for rank, (cid, bm25_score, text, md) in enumerate(kw_list):
+            s = 1.0 / (RRF_K + rank)
+            prev = rrf.get(cid)
+            if prev is None:
+                rrf[cid] = (s, RetrievedChunk(chunk_id=cid, text=text, score=s, metadata=md))
+            else:
+                rrf[cid] = (prev[0] + s, prev[1])
+                prev[1].score = prev[0] + s
 
-    candidates = sorted(rrf.values(), key=lambda kv: kv[0], reverse=True)[:candidates_n]
-    chunks = [c for _, c in candidates]
+        candidates = sorted(rrf.values(), key=lambda kv: kv[0], reverse=True)[:candidates_n]
+        chunks = [c for _, c in candidates]
+        all_ids = [cid for cid, *_ in vector_list] + [cid for cid, *_ in kw_list]
+        observed.set_attributes(
+            accepted_count=len(chunks),
+            excluded_count=len(rrf) - len(chunks),
+            previous_candidate_ids=bounded_ids(all_ids),
+            truncated=is_truncated(all_ids),
+            candidate_ids=bounded_ids([chunk.chunk_id for chunk in chunks]),
+            rrf_score=[round(chunk.score, 6) for chunk in chunks][:20],
+        )
 
     # 观测日志：阈值不再硬过滤（关键词独有命中统计）
     kw_only = [c for c in chunks if c.chunk_id not in vector_ids]
@@ -173,9 +204,34 @@ def retrieve(
     if settings.rerank_enabled and apply_rerank:
         from app.core.retrieval.ranking.reranker import rerank  # 函数内导入：02 前文件不存在
 
-        chunks = rerank(query_text, chunks)
+        with stage_for("retrieval", "retrieval.rerank", kb_id=kb_id,
+                       candidate_count=len(chunks)) as observed:
+            previous_ids = [chunk.chunk_id for chunk in chunks]
+            chunks = rerank(query_text, chunks)
+            observed.set_attributes(
+                accepted_count=len(chunks),
+                previous_candidate_ids=bounded_ids(previous_ids),
+                candidate_ids=bounded_ids([chunk.chunk_id for chunk in chunks]),
+                rerank_score=[
+                    round(chunk.rerank_score, 6) for chunk in chunks
+                    if chunk.rerank_score is not None
+                ][:20],
+            )
         final_n = settings.rerank_top_n
     else:
         final_n = top_k if top_k is not None else settings.retrieval_top_k
 
-    return retriever.truncate_to_budget(chunks[:final_n], max_tokens or settings.max_context_tokens)
+    selected = chunks[:final_n]
+    with stage_for("retrieval", "retrieval.truncate", kb_id=kb_id,
+                   candidate_count=len(selected),
+                   budget_tokens=max_tokens or settings.max_context_tokens) as observed:
+        result = retriever.truncate_to_budget(selected, max_tokens or settings.max_context_tokens)
+        observed.set_attributes(accepted_count=len(result),
+                                excluded_count=len(selected) - len(result),
+                                previous_candidate_ids=bounded_ids(
+                                    [chunk.chunk_id for chunk in selected]
+                                ),
+                                candidate_ids=bounded_ids(
+                                    [chunk.chunk_id for chunk in result]
+                                ))
+    return result

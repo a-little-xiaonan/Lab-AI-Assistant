@@ -8,6 +8,7 @@ from app.core.agent.models import ToolContext, ToolError, ToolResult
 from app.core.retrieval.ranking.evidence_gate import filter_evidence
 from app.core.retrieval.retriever import RetrievedChunk
 from app.models.database import ChunkRecord, Document, utcnow
+from app.observability.tracing import bounded_ids, stage_for
 from app.store.db import SessionLocal
 
 
@@ -53,7 +54,17 @@ def read_document_section(args: DocumentReadArgs, ctx: ToolContext) -> ToolResul
     chunks = [RetrievedChunk(row.id, row.text, 1.0, {"doc_id": row.doc_id,
         "knowledge_base_id": row.kb_id, "source_file": document.filename, "page": row.page,
         "document_version_id": row.document_version_id, "chunk_index": row.chunk_index}) for row in rows]
-    supported, decision = filter_evidence(args.question, chunks)
+    with stage_for("retrieval", "evidence.gate", purpose="document_expand",
+                   candidate_count=len(chunks),
+                   candidate_ids=bounded_ids([chunk.chunk_id for chunk in chunks])) as observed:
+        supported, decision = filter_evidence(args.question, chunks)
+        observed.set_attributes(
+            accepted=decision.accepted, gate_reason=decision.reason,
+            supporting_chunks=decision.supporting_chunks,
+            total_chunks=decision.total_chunks, judge_used=decision.judge_used,
+            fail_open="open" in decision.reason, fail_closed="closed" in decision.reason,
+            evidence_ids=bounded_ids([chunk.chunk_id for chunk in supported]),
+        )
     return ToolResult(status="ok" if supported else "no_data", data={
         "evidence_status": "supported" if supported else "insufficient",
         "decision": decision.as_dict(), "document_version_id": handle["document_version_id"],

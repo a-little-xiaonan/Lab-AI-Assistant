@@ -13,6 +13,8 @@ import re
 from app.config import settings
 from app.llm import qwen
 from app.llm.prompt_templates import build_query_rewrite_messages
+from app.observability.prompt import record_prompt_build
+from app.observability.tracing import stage_for
 
 logger = logging.getLogger(__name__)
 
@@ -36,18 +38,32 @@ def _parse(text: str) -> list[str]:
 
 def rewrite(query: str) -> list[str]:
     """返回 [原查询, *改写]。任何失败 → [原查询]。"""
-    if not settings.rewrite_enabled:
-        return [query]
-    try:
-        text = qwen.chat_completion(
-            build_query_rewrite_messages(query),
-            model=settings.rewrite_model or None,  # 空 → 主模型
-        )
-        rewritten = _parse(text)
-    except Exception:
-        logger.exception("查询改写失败，降级为原查询：%s", query[:40])
-        return [query]
-    if not rewritten:
-        return [query]
-    logger.info("查询改写：%s → %d 条", query[:30], len(rewritten) + 1)
-    return [query, *rewritten[: max(0, settings.rewrite_query_count - 1)]]
+    with stage_for("retrieval", "query.rewrite", enabled=settings.rewrite_enabled) as observed:
+        if not settings.rewrite_enabled:
+            observed.set_attributes(executed=False, skip_reason="disabled",
+                                    query_count=1, rewrite_count=0)
+            return [query]
+        try:
+            messages = build_query_rewrite_messages(query)
+            record_prompt_build("query_rewrite", messages,
+                                template_version="query-rewrite-v1")
+            text = qwen.chat_completion(
+                messages,
+                model=settings.rewrite_model or None,  # 空 → 主模型
+                purpose="query_rewrite",
+            )
+            rewritten = _parse(text)
+        except Exception:
+            logger.exception("查询改写失败，降级为原查询")
+            observed.set_attributes(executed=True, fallback_reason="llm_failed",
+                                    query_count=1, rewrite_count=0)
+            return [query]
+        if not rewritten:
+            observed.set_attributes(executed=True, fallback_reason="empty_output",
+                                    query_count=1, rewrite_count=0)
+            return [query]
+        queries = [query, *rewritten[: max(0, settings.rewrite_query_count - 1)]]
+        observed.set_attributes(executed=True, query_count=len(queries),
+                                rewrite_count=len(queries) - 1)
+        logger.info("查询改写：生成 %d 条查询", len(queries))
+        return queries

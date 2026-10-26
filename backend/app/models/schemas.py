@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class ChatRequest(BaseModel):
     session_id: str | None = None      # 不传则后端自动创建会话
-    target_message_id: int | None = Field(default=None, ge=1)  # 后续来源追问/改写使用
+    target_message_id: int | None = Field(default=None, ge=1)  # 可选引用某条历史 assistant 回答
     # 不再由客户端选择知识库；保留字段仅兼容旧客户端，服务端会忽略其值。
     knowledge_base_id: str | None = None
     message: str

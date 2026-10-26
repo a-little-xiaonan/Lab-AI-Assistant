@@ -14,6 +14,7 @@ from app.core.agent.runtime import record_failure, submit_context
 from app.core.retrieval import retriever
 from app.core.retrieval.planning.query_planner import QueryPlan, plan_query
 from app.core.retrieval.retriever import RetrievedChunk
+from app.observability.tracing import bounded_ids, is_truncated, stage_for
 
 logger = logging.getLogger(__name__)
 RRF_K = 60
@@ -68,24 +69,45 @@ def _query_limit_for_sub(index: int, count: int) -> int:
 
 def _retrieve_one(kb_id: str, sub_query: str, topics: list[str], sub_index: int, sub_count: int) -> list[RetrievedChunk]:
     # 全局路是可靠主路径；局部主题路失败时 topic_retriever 自己返回空。
-    global_chunks = retriever.retrieve(
-        kb_id,
-        sub_query,
-        top_k=settings.hybrid_fusion_candidates,
-        max_tokens=settings.max_context_tokens * 4,
-        apply_rerank=False,
-        max_queries=_query_limit_for_sub(sub_index, sub_count),
-    )
+    with stage_for("retrieval", "retrieval.vector", kb_id=kb_id,
+                   subquery_id=sub_index, query_count=_query_limit_for_sub(sub_index, sub_count)) as observed:
+        global_chunks = retriever.retrieve(
+            kb_id,
+            sub_query,
+            top_k=settings.hybrid_fusion_candidates,
+            max_tokens=settings.max_context_tokens * 4,
+            apply_rerank=False,
+            max_queries=_query_limit_for_sub(sub_index, sub_count),
+        )
+        observed.set_attributes(
+            candidate_count=len(global_chunks),
+            candidate_ids=bounded_ids([chunk.chunk_id for chunk in global_chunks]),
+            truncated=is_truncated(global_chunks),
+        )
     topic_chunks: list[RetrievedChunk] = []
     if settings.topic_retrieval_enabled and topics:
         try:
             from app.core.retrieval.topic_retriever import retrieve as topic_retrieve
 
-            topic_chunks = topic_retrieve(kb_id, sub_query, topics)
+            with stage_for("retrieval", "retrieval.topic", kb_id=kb_id,
+                           subquery_id=sub_index, query_count=len(topics)) as observed:
+                topic_chunks = topic_retrieve(kb_id, sub_query, topics)
+                observed.set_attributes(
+                    candidate_count=len(topic_chunks),
+                    candidate_ids=bounded_ids([chunk.chunk_id for chunk in topic_chunks]),
+                )
         except Exception:
             record_failure("topic_retrieval_failed")
-            logger.exception("主题路异常，保留全局路：sub=%s", sub_query[:40])
-    return _fuse_two_routes(global_chunks, topic_chunks, sub_index)
+            logger.exception("主题路异常，保留全局路：subquery_id=%d", sub_index)
+    with stage_for("retrieval", "retrieval.fuse", kb_id=kb_id, subquery_id=sub_index,
+                   candidate_count=len(global_chunks) + len(topic_chunks)) as observed:
+        fused = _fuse_two_routes(global_chunks, topic_chunks, sub_index)
+        observed.set_attributes(
+            accepted_count=len(fused),
+            candidate_ids=bounded_ids([chunk.chunk_id for chunk in fused]),
+            rrf_score=[round(chunk.score, 6) for chunk in fused][:20],
+        )
+    return fused
 
 
 def _merge_with_coverage(per_sub: list[list[RetrievedChunk]], plan: QueryPlan) -> list[RetrievedChunk]:
@@ -146,7 +168,10 @@ def _rerank_and_keep_coverage(query: str, candidates: list[RetrievedChunk], per_
 
 def retrieve(kb_id: str, query: str, history_context: str = "") -> OrchestratedRetrieval:
     """增强检索总入口。规划失败时 plan_query 已退为单问题。"""
-    plan = plan_query(query, history_context)
+    with stage_for("retrieval", "query.plan", kb_id=kb_id) as observed:
+        plan = plan_query(query, history_context)
+        observed.set_attributes(executed=True, subquery_count=len(plan.sub_queries),
+                                mode=plan.mode if hasattr(plan, "mode") else None)
     sub_count = len(plan.sub_queries)
     try:
         per_sub: list[list[RetrievedChunk]] = [[] for _ in plan.sub_queries]
@@ -161,11 +186,31 @@ def retrieve(kb_id: str, query: str, history_context: str = "") -> OrchestratedR
                     per_sub[index] = future.result()
                 except Exception:
                     record_failure("subquery_retrieval_failed")
-                    logger.exception("子问题检索失败，跳过该子问题：%s", plan.sub_queries[index][:40])
-        candidates = _merge_with_coverage(per_sub, plan)
-        ranked = _rerank_and_keep_coverage(query, candidates, per_sub)
+                    logger.exception("子问题检索失败，跳过该子问题：subquery_id=%d", index)
+        with stage_for("retrieval", "retrieval.fuse", kb_id=kb_id,
+                       candidate_count=sum(len(chunks) for chunks in per_sub)) as observed:
+            candidates = _merge_with_coverage(per_sub, plan)
+            observed.set_attributes(
+                accepted_count=len(candidates),
+                candidate_ids=bounded_ids([chunk.chunk_id for chunk in candidates]),
+            )
+        with stage_for("retrieval", "retrieval.rerank", kb_id=kb_id,
+                       candidate_count=len(candidates)) as observed:
+            ranked = _rerank_and_keep_coverage(query, candidates, per_sub)
+            observed.set_attributes(
+                accepted_count=len(ranked),
+                candidate_ids=bounded_ids([chunk.chunk_id for chunk in ranked]),
+                rerank_score=[
+                    round(chunk.rerank_score, 6) for chunk in ranked
+                    if chunk.rerank_score is not None
+                ][:20],
+            )
         final_count = max(settings.retrieval_top_k, sum(bool(chunks) for chunks in per_sub))
-        chunks = retriever.truncate_to_budget(ranked[:final_count], settings.max_context_tokens)
+        with stage_for("retrieval", "retrieval.truncate", kb_id=kb_id,
+                       candidate_count=min(len(ranked), final_count),
+                       budget_tokens=settings.max_context_tokens) as observed:
+            chunks = retriever.truncate_to_budget(ranked[:final_count], settings.max_context_tokens)
+            observed.set_attributes(accepted_count=len(chunks))
         logger.info("编排检索：mode=%s sub=%d candidates=%d final=%d", plan.mode, sub_count, len(candidates), len(chunks))
         return OrchestratedRetrieval(chunks, plan)
     except Exception:

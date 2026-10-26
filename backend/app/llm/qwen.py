@@ -16,6 +16,7 @@ from dashscope import Generation, MultiModalConversation, TextEmbedding, TextReR
 from app.config import settings
 from app.core.agent.runtime import current_budget, timeout_seconds
 from app.llm.errors import LLMError
+from app.observability.tracing import stage_for
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,35 @@ class ContextCacheProbeResult:
     usage: ContextCacheUsage
     ttft_seconds: float | None
     elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    """供应商实际返回的 token 用量；缺失字段保持 None，不推算。"""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    cached_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+
+    @property
+    def present(self) -> bool:
+        return any(value is not None for value in (
+            self.input_tokens, self.output_tokens, self.total_tokens,
+            self.cached_tokens, self.cache_creation_tokens,
+        ))
+
+    def attributes(self) -> dict:
+        values = {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "cached_tokens": self.cached_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "usage_present": self.present,
+        }
+        return {key: value for key, value in values.items() if value is not None}
 
 
 def _api_key() -> str:
@@ -148,6 +178,62 @@ def context_cache_usage(response: Any) -> ContextCacheUsage:
     )
 
 
+def token_usage(response: Any) -> TokenUsage:
+    """读取供应商实际用量；不把缺失字段补成 0，也不累加流式累计值。"""
+    usage = _response_value(response, "usage")
+    if usage is None:
+        return TokenUsage()
+    cache = context_cache_usage(response)
+    return TokenUsage(
+        input_tokens=_optional_int(
+            _response_value(usage, "input_tokens", _response_value(usage, "prompt_tokens"))
+        ),
+        output_tokens=_optional_int(
+            _response_value(usage, "output_tokens", _response_value(usage, "completion_tokens"))
+        ),
+        total_tokens=_optional_int(_response_value(usage, "total_tokens")),
+        cached_tokens=cache.cached_tokens,
+        cache_creation_tokens=cache.cache_creation_input_tokens,
+    )
+
+
+def provider_request_id(response: Any) -> str | None:
+    """供应商 request ID 单独记录，不能覆盖本地 request_id。"""
+    output = _response_value(response, "output")
+    for source in (response, output):
+        for field in ("request_id", "id"):
+            value = _response_value(source, field) if source is not None else None
+            if isinstance(value, str) and value:
+                return value[:160]
+    return None
+
+
+def _response_telemetry(response: Any) -> dict:
+    """观测字段解析失败时保持业务路径不变，只放弃本次用量记录。"""
+    try:
+        attrs = token_usage(response).attributes()
+        request_id = provider_request_id(response)
+        if request_id:
+            attrs["provider_request_id"] = request_id
+        return attrs
+    except Exception:
+        return {}
+
+
+def _safe_token_usage(response: Any) -> TokenUsage:
+    try:
+        return token_usage(response)
+    except Exception:
+        return TokenUsage()
+
+
+def _safe_provider_request_id(response: Any) -> str | None:
+    try:
+        return provider_request_id(response)
+    except Exception:
+        return None
+
+
 def build_context_cache_probe_messages(stable_prefix: str, query: str) -> list[dict]:
     """构造 P0 专用显式缓存消息，稳定前缀与动态问题严格分离。"""
     if not stable_prefix.strip() or not query.strip():
@@ -165,76 +251,104 @@ def build_context_cache_probe_messages(stable_prefix: str, query: str) -> list[d
     ]
 
 
-def _retry(fn, *args, **kwargs):
-    """指数退避重试：429/5xx 状态码或网络异常时重试，最多 MAX_RETRIES 次。"""
+def _retry(fn, *args, purpose: str = "unknown", model_name: str | None = None, **kwargs):
+    """指数退避重试：429/5xx 状态码或网络异常时重试，最多 MAX_RETRIES 次。
+
+    每次尝试与整体调用分别记录 purpose、模型、供应商 ID 和实际用量；
+    观测失败不能改变原重试策略。
+    """
     last_err = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            if current_budget.get():
-                kwargs["timeout"] = timeout_seconds(kwargs.get("timeout", settings.llm_timeout))
-            resp = fn(*args, **kwargs)
-            if resp.status_code == 200:
-                return resp
-            if resp.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES - 1:
-                wait = 2 ** attempt
-                logger.warning("DashScope 返回 %s，%.1fs 后重试（第 %d 次）", resp.status_code, wait, attempt + 1)
-                time.sleep(timeout_seconds(wait))
-                continue
-            raise LLMError(
-                code=f"llm_status_{resp.status_code}",
-                message=f"模型接口返回错误（{resp.status_code}）：{getattr(resp, 'message', '') or resp.code}",
-            )
-        except LLMError:
-            raise
-        except Exception as exc:  # 网络异常等
-            last_err = exc
-            if attempt < MAX_RETRIES - 1:
-                wait = 2 ** attempt
-                logger.warning("模型调用异常：%s，%.1fs 后重试（第 %d 次）", exc, wait, attempt + 1)
-                time.sleep(timeout_seconds(wait))
-    raise LLMError(code="llm_call_failed", message=f"模型调用失败：{last_err}")
+    with stage_for("model", "model.call", purpose=purpose, model=model_name,
+                   max_attempts=MAX_RETRIES) as observed:
+        for attempt in range(MAX_RETRIES):
+            with stage_for("model", "model.attempt", purpose=purpose, model=model_name,
+                           attempt=attempt + 1, max_attempts=MAX_RETRIES) as attempt_span:
+                try:
+                    if current_budget.get():
+                        kwargs["timeout"] = timeout_seconds(kwargs.get("timeout", settings.llm_timeout))
+                    resp = fn(*args, **kwargs)
+                    if resp.status_code == 200:
+                        telemetry = _response_telemetry(resp)
+                        attempt_span.set_attributes(**telemetry)
+                        observed.set_attributes(attempt=attempt + 1, retry_count=attempt,
+                                                **telemetry)
+                        return resp
+                    attempt_span.set_attributes(http_status=resp.status_code,
+                                                retry_count=attempt)
+                    if resp.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES - 1:
+                        wait = 2 ** attempt
+                        logger.warning("DashScope 返回 %s，%.1fs 后重试（第 %d 次）", resp.status_code, wait, attempt + 1)
+                        time.sleep(timeout_seconds(wait))
+                        attempt_span.finish("degraded", reason="retryable_status")
+                        continue
+                    observed.set_attributes(attempt=attempt + 1, retry_count=attempt,
+                                            error_code=f"llm_status_{resp.status_code}")
+                    raise LLMError(
+                        code=f"llm_status_{resp.status_code}",
+                        message=f"模型接口返回错误（{resp.status_code}）：{getattr(resp, 'message', '') or resp.code}",
+                    )
+                except LLMError:
+                    raise
+                except Exception as exc:  # 网络异常等
+                    last_err = exc
+                    attempt_span.finish("error", error_code=type(exc).__name__)
+                    if attempt < MAX_RETRIES - 1:
+                        wait = 2 ** attempt
+                        logger.warning("模型调用异常：%s，%.1fs 后重试（第 %d 次）", exc, wait, attempt + 1)
+                        time.sleep(timeout_seconds(wait))
+        observed.set_attributes(attempt=MAX_RETRIES, retry_count=MAX_RETRIES - 1,
+                                error_code="llm_call_failed")
+        raise LLMError(code="llm_call_failed", message=f"模型调用失败：{last_err}")
 
 
 def tool_completion(messages: list[dict], tools: list[dict], *, timeout: float) -> dict:
     """原生工具消息协议。预算内单次决策，不复用无界重试。"""
-    try:
-        resp = _model_call(
-            model=settings.llm_model, messages=messages, tools=tools,
-            result_format="message", api_key=_api_key(), stream=False,
-            timeout=timeout_seconds(timeout),
-            **_base_address(),
-        )
-        if resp.status_code != 200:
-            raise LLMError("agent_route_failed", "工具选择服务暂不可用，请稍后重试。")
-        message = (resp.output or {}).get("choices", [])[0]["message"]
-        content = message.get("content") or ""
-        calls = message.get("tool_calls") or []
-        if not isinstance(content, str) or not isinstance(calls, list) or len(calls) > 8:
-            raise ValueError("invalid tool message")
-        seen = set()
-        normalized = []
-        for call in calls:
-            cid, fn = call["id"], call["function"]
-            if (not isinstance(cid, str) or not cid or len(cid) > 200 or cid in seen
-                    or call.get("type") != "function"
-                    or not isinstance(fn.get("name"), str)
-                    or not isinstance(fn.get("arguments"), str)):
-                raise ValueError("invalid tool call")
-            seen.add(cid)
-            normalized.append({"id": cid, "type": "function", "function": {
-                "name": fn["name"], "arguments": fn["arguments"],
-            }})
-        result = {"role": "assistant", "content": content}
-        if normalized:
-            result["tool_calls"] = normalized
-        return result
-    except LLMError:
-        raise
-    except Exception:
-        raise LLMError("agent_route_failed", "工具选择失败或响应格式无效，请稍后重试。") from None
+    with stage_for("model", "model.call", purpose="agent_decision",
+                   model=settings.llm_model, max_attempts=1) as observed:
+        try:
+            resp = _model_call(
+                model=settings.llm_model, messages=messages, tools=tools,
+                result_format="message", api_key=_api_key(), stream=False,
+                timeout=timeout_seconds(timeout),
+                **_base_address(),
+            )
+            if resp.status_code != 200:
+                observed.set_attributes(attempt=1, http_status=resp.status_code,
+                                        error_code="agent_route_failed")
+                raise LLMError("agent_route_failed", "工具选择服务暂不可用，请稍后重试。")
+            message = (resp.output or {}).get("choices", [])[0]["message"]
+            content = message.get("content") or ""
+            calls = message.get("tool_calls") or []
+            if not isinstance(content, str) or not isinstance(calls, list) or len(calls) > 8:
+                raise ValueError("invalid tool message")
+            seen = set()
+            normalized = []
+            for call in calls:
+                cid, fn = call["id"], call["function"]
+                if (not isinstance(cid, str) or not cid or len(cid) > 200 or cid in seen
+                        or call.get("type") != "function"
+                        or not isinstance(fn.get("name"), str)
+                        or not isinstance(fn.get("arguments"), str)):
+                    raise ValueError("invalid tool call")
+                seen.add(cid)
+                normalized.append({"id": cid, "type": "function", "function": {
+                    "name": fn["name"], "arguments": fn["arguments"],
+                }})
+            result = {"role": "assistant", "content": content}
+            if normalized:
+                result["tool_calls"] = normalized
+            observed.set_attributes(attempt=1, tool_count=len(normalized),
+                                    output_chars=len(content), **_response_telemetry(resp))
+            return result
+        except LLMError:
+            raise
+        except Exception:
+            observed.set_attributes(attempt=1, error_code="agent_route_failed")
+            raise LLMError("agent_route_failed", "工具选择失败或响应格式无效，请稍后重试。") from None
 
 
-def chat_completion(messages: list[dict], model: str | None = None, stream: bool = False) -> str:
+def chat_completion(messages: list[dict], model: str | None = None, stream: bool = False,
+                    purpose: str = "answer") -> str:
     """非流式对话（流式请用 chat_completion_stream；stream 参数保留仅为兼容旧调用）。"""
     key = _api_key()
     model = model or settings.llm_model
@@ -245,6 +359,8 @@ def chat_completion(messages: list[dict], model: str | None = None, stream: bool
         api_key=key,
         stream=stream,
         timeout=settings.llm_timeout,
+        purpose=purpose,
+        model_name=model,
         **_base_address(),
     )
     text = _output_text(resp.output)
@@ -253,7 +369,8 @@ def chat_completion(messages: list[dict], model: str | None = None, stream: bool
     return text
 
 
-def _start_stream_with_retry(fn) -> Iterator:
+def _start_stream_with_retry(fn, *, purpose: str = "unknown",
+                             model_name: str | None = None, observed=None) -> Iterator:
     """流式首块前重试（实测：Generation.call(stream=True) 返回同步生成器）。
 
     连接级失败（首块 429/5xx）可以整体重试——尚未产出任何 token，无重复风险；
@@ -262,35 +379,52 @@ def _start_stream_with_retry(fn) -> Iterator:
     """
     last_err = None
     for attempt in range(MAX_RETRIES):
-        try:
-            gen = fn()
-            first = next(gen)  # 空生成器 → StopIteration 落入 except 走重试
-            if first.status_code == 200:
-                return itertools.chain([first], gen)
-            if first.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES - 1:
-                wait = 2 ** attempt
-                logger.warning(
-                    "流式首块返回 %s，%.1fs 后重试（第 %d 次）", first.status_code, wait, attempt + 1
+        with stage_for("model", "model.attempt", purpose=purpose, model=model_name,
+                       attempt=attempt + 1, max_attempts=MAX_RETRIES) as attempt_span:
+            try:
+                gen = fn()
+                first = next(gen)  # 空生成器 → StopIteration 落入 except 走重试
+                if first.status_code == 200:
+                    telemetry = _response_telemetry(first)
+                    attempt_span.set_attributes(retry_count=attempt, **telemetry)
+                    if observed is not None:
+                        observed.set_attributes(attempt=attempt + 1, retry_count=attempt,
+                                                **telemetry)
+                    return itertools.chain([first], gen)
+                attempt_span.set_attributes(http_status=first.status_code, retry_count=attempt)
+                if first.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES - 1:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "流式首块返回 %s，%.1fs 后重试（第 %d 次）", first.status_code, wait, attempt + 1
+                    )
+                    time.sleep(wait)
+                    attempt_span.finish("degraded", reason="retryable_status")
+                    continue
+                if observed is not None:
+                    observed.set_attributes(attempt=attempt + 1, retry_count=attempt,
+                                            error_code=f"llm_status_{first.status_code}")
+                raise LLMError(
+                    code=f"llm_status_{first.status_code}",
+                    message=f"模型接口返回错误（{first.status_code}）："
+                    f"{getattr(first, 'message', '') or first.code}",
                 )
-                time.sleep(wait)
-                continue
-            raise LLMError(
-                code=f"llm_status_{first.status_code}",
-                message=f"模型接口返回错误（{first.status_code}）："
-                f"{getattr(first, 'message', '') or first.code}",
-            )
-        except LLMError:
-            raise
-        except Exception as exc:  # 网络异常、空生成器等
-            last_err = exc
-            if attempt < MAX_RETRIES - 1:
-                wait = 2 ** attempt
-                logger.warning("流式调用异常：%s，%.1fs 后重试（第 %d 次）", exc, wait, attempt + 1)
-                time.sleep(wait)
+            except LLMError:
+                raise
+            except Exception as exc:  # 网络异常、空生成器等
+                last_err = exc
+                attempt_span.finish("error", error_code=type(exc).__name__)
+                if attempt < MAX_RETRIES - 1:
+                    wait = 2 ** attempt
+                    logger.warning("流式调用异常：%s，%.1fs 后重试（第 %d 次）", exc, wait, attempt + 1)
+                    time.sleep(wait)
+    if observed is not None:
+        observed.set_attributes(attempt=MAX_RETRIES, retry_count=MAX_RETRIES - 1,
+                                error_code="llm_call_failed")
     raise LLMError(code="llm_call_failed", message=f"模型调用失败：{last_err}")
 
 
-def chat_completion_stream(messages: list[dict], model: str | None = None) -> Iterator[str]:
+def chat_completion_stream(messages: list[dict], model: str | None = None,
+                           purpose: str = "answer") -> Iterator[str]:
     """流式对话：逐增量 yield 文本（SSE delta 的数据源）。
 
     实测（2026-08-31 smoke_test_stream.py）：
@@ -299,39 +433,60 @@ def chat_completion_stream(messages: list[dict], model: str | None = None) -> It
     因此做差分兜底：text 以 prev 开头 → 按累积处理切出差量，否则按增量处理直接产出，
     两种模式下输出都是正确增量。
     - 流结束块 text 为空且 status=200，跳过；全程无产出 → llm_empty_response（与非流式口径一致）。
+    - 用量只取供应商最终累计值，不累加每块重复出现的累计量。
     """
     key = _api_key()
     model = model or settings.llm_model
-    gen = _start_stream_with_retry(
-        lambda: _model_call(
-            model=model,
-            messages=messages,
-            api_key=key,
-            stream=True,
-            incremental_output=True,
-            timeout=settings.llm_stream_timeout,
-            **_base_address(),
+    with stage_for("model", "model.stream", purpose=purpose, model=model,
+                   max_attempts=MAX_RETRIES) as observed:
+        started = time.monotonic()
+        gen = _start_stream_with_retry(
+            lambda: _model_call(
+                model=model,
+                messages=messages,
+                api_key=key,
+                stream=True,
+                incremental_output=True,
+                timeout=settings.llm_stream_timeout,
+                **_base_address(),
+            ),
+            purpose=purpose,
+            model_name=model,
+            observed=observed,
         )
-    )
-    prev = ""
-    emitted = False
-    for chunk in gen:
-        if chunk.status_code != 200:
-            raise LLMError(
-                code="llm_stream_interrupted",
-                message=f"流式输出中断（{chunk.status_code}）：{getattr(chunk, 'message', '') or chunk.code}",
-            )
-        text = _output_text(getattr(chunk, "output", None))
-        if text.startswith(prev):
-            delta = text[len(prev):]  # merge 模式：累积 → 切差量
-        else:
-            delta = text  # incremental 模式：本身就是增量
-        prev = text
-        if delta:
-            emitted = True
-            yield delta
-    if not emitted:
-        raise LLMError(code="llm_empty_response", message="模型返回为空")
+        prev = ""
+        emitted = False
+        usage = TokenUsage()
+        provider_id = None
+        for chunk in gen:
+            if chunk.status_code != 200:
+                raise LLMError(
+                    code="llm_stream_interrupted",
+                    message=f"流式输出中断（{chunk.status_code}）：{getattr(chunk, 'message', '') or chunk.code}",
+                )
+            observed_usage = _safe_token_usage(chunk)
+            if observed_usage.present:
+                usage = observed_usage
+            provider_id = _safe_provider_request_id(chunk) or provider_id
+            text = _output_text(getattr(chunk, "output", None))
+            if text.startswith(prev):
+                delta = text[len(prev):]  # merge 模式：累积 → 切差量
+            else:
+                delta = text  # incremental 模式：本身就是增量
+            prev = text
+            if delta:
+                if not emitted:
+                    observed.set_attributes(
+                        first_text_ms=round((time.monotonic() - started) * 1000, 3)
+                    )
+                emitted = True
+                yield delta
+        if not emitted:
+            raise LLMError(code="llm_empty_response", message="模型返回为空")
+        attributes = usage.attributes()
+        if provider_id:
+            attributes["provider_request_id"] = provider_id
+        observed.set_attributes(**attributes)
 
 
 def probe_context_cache(
@@ -367,7 +522,9 @@ def probe_context_cache(
             incremental_output=True,
             timeout=settings.llm_stream_timeout,
             **_base_address(),
-        )
+        ),
+        purpose="context_cache_probe",
+        model_name=selected_model,
     )
     for chunk in stream:
         if chunk.status_code != 200:
@@ -376,7 +533,10 @@ def probe_context_cache(
                 message=f"Context Cache POC 流式响应中断（{chunk.status_code}）："
                         f"{getattr(chunk, 'message', '') or chunk.code}",
             )
-        observed = context_cache_usage(chunk)
+        try:
+            observed = context_cache_usage(chunk)
+        except Exception:
+            observed = ContextCacheUsage()
         if any(value is not None for value in (
             observed.input_tokens,
             observed.cached_tokens,
@@ -413,6 +573,8 @@ def chat_completion_with_context_cache(messages: list[dict], model: str | None =
         api_key=_api_key(),
         stream=False,
         timeout=settings.llm_timeout,
+        purpose="answer",
+        model_name=selected_model,
         **_base_address(),
     )
     text = _output_text(response.output)
@@ -431,49 +593,62 @@ def chat_completion_stream_with_context_cache(
     if not settings.context_cache_enabled:
         raise LLMError("context_cache_disabled", "Context Cache 未启用")
     selected_model = model or settings.context_cache_model or settings.llm_model
-    stream = _start_stream_with_retry(
-        lambda: MultiModalConversation.call(
-            model=selected_model,
-            messages=messages,
-            api_key=_api_key(),
-            stream=True,
-            incremental_output=True,
-            timeout=settings.llm_stream_timeout,
-            **_base_address(),
+    with stage_for("model", "model.stream", purpose="answer", model=selected_model,
+                   max_attempts=MAX_RETRIES) as observed:
+        started = time.monotonic()
+        stream = _start_stream_with_retry(
+            lambda: MultiModalConversation.call(
+                model=selected_model,
+                messages=messages,
+                api_key=_api_key(),
+                stream=True,
+                incremental_output=True,
+                timeout=settings.llm_stream_timeout,
+                **_base_address(),
+            ),
+            purpose="answer",
+            model_name=selected_model,
+            observed=observed,
         )
-    )
-    previous = ""
-    emitted = False
-    usage = ContextCacheUsage()
-    for chunk in stream:
-        if chunk.status_code != 200:
-            raise LLMError(
-                code="llm_stream_interrupted",
-                message=f"流式输出中断（{chunk.status_code}）：{getattr(chunk, 'message', '') or chunk.code}",
-            )
-        observed = context_cache_usage(chunk)
-        if any(value is not None for value in (
-            observed.input_tokens,
-            observed.cached_tokens,
-            observed.cache_creation_input_tokens,
-        )):
-            usage = observed
-        text = _output_text(getattr(chunk, "output", None))
-        delta = text[len(previous):] if text.startswith(previous) else text
-        previous = text
-        if delta:
-            emitted = True
-            yield delta
-    if not emitted:
-        raise LLMError(code="llm_empty_response", message="模型返回为空")
-    logger.info("FAQ Context Cache：model=%s cached_tokens=%s creation_tokens=%s",
-                selected_model, usage.cached_tokens, usage.cache_creation_input_tokens)
+        previous = ""
+        emitted = False
+        usage = TokenUsage()
+        provider_id = None
+        for chunk in stream:
+            if chunk.status_code != 200:
+                raise LLMError(
+                    code="llm_stream_interrupted",
+                    message=f"流式输出中断（{chunk.status_code}）：{getattr(chunk, 'message', '') or chunk.code}",
+                )
+            observed_usage = _safe_token_usage(chunk)
+            if observed_usage.present:
+                usage = observed_usage
+            provider_id = _safe_provider_request_id(chunk) or provider_id
+            text = _output_text(getattr(chunk, "output", None))
+            delta = text[len(previous):] if text.startswith(previous) else text
+            previous = text
+            if delta:
+                if not emitted:
+                    observed.set_attributes(
+                        first_text_ms=round((time.monotonic() - started) * 1000, 3)
+                    )
+                emitted = True
+                yield delta
+        if not emitted:
+            raise LLMError(code="llm_empty_response", message="模型返回为空")
+        attributes = usage.attributes()
+        if provider_id:
+            attributes["provider_request_id"] = provider_id
+        observed.set_attributes(**attributes)
+        logger.info("FAQ Context Cache：model=%s cached_tokens=%s creation_tokens=%s",
+                    selected_model, usage.cached_tokens, usage.cache_creation_tokens)
 
 
 def embed_texts(
     texts: list[str],
     model: str | None = None,
     on_batch: callable = None,
+    purpose: str = "embedding",
 ) -> list[list[float]]:
     """批量向量化，10 条/批；断言 1024 维，防静默写脏数据。
     on_batch(done, total) 每批完成后回调，供进度日志/前端使用。"""
@@ -489,6 +664,8 @@ def embed_texts(
             dimension=EMBEDDING_DIM,
             api_key=key,
             timeout=settings.llm_timeout,
+            purpose=purpose,
+            model_name=model,
             **_base_address(),
         )
         # 注意：dashscope 1.27 的 TextEmbedding 响应 output 是 dict（实测），
@@ -517,7 +694,7 @@ def embed_texts(
 
 def embed_query(text: str) -> list[float]:
     """单条查询向量化（复用批量入口，保持同模型同参数）。"""
-    return embed_texts([text])[0]
+    return embed_texts([text], purpose="embedding_query")[0]
 
 
 def rerank_texts(
@@ -530,14 +707,17 @@ def rerank_texts(
     index 指向 documents 原列表下标，SDK 已按分数降序返回（此处再排一次保序）。
     """
     key = _api_key()
+    selected_model = model or settings.rerank_model
     resp = _retry(
         TextReRank.call,
-        model=model or settings.rerank_model,
+        model=selected_model,
         query=query,
         documents=documents,
         top_n=len(documents),
         api_key=key,
         timeout=settings.llm_timeout,
+        purpose="rerank",
+        model_name=selected_model,
         **_base_address(),
     )
     results = sorted(resp.output.results, key=lambda r: r.relevance_score, reverse=True)

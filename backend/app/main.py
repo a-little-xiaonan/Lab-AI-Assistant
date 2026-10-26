@@ -35,8 +35,9 @@ from app.llm.errors import LLMError
 from app.middleware.request_context import RequestContextMiddleware, RequestIdFilter
 from app.observability.exporter import start_exporter, stop_exporter
 from app.observability.middleware import ChatTraceMiddleware
-from app.observability.tracing import mark_error
+from app.observability.tracing import PIPELINE_VERSION, mark_error
 from app.store.db import init_db
+from app.tools import registry
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,10 @@ async def lifespan(_app: FastAPI):
         logger.exception("后台任务恢复扫描失败，不阻断只读问答服务")
         recovery = {"stale": 0, "recovered": 0, "failed": 1}
     cleanup_task = asyncio.create_task(_periodic_cleanup())
-    logger.info("服务启动：数据库就绪，恢复任务=%s，过期会话清理已启动", recovery)
+    logger.info(
+        "服务启动：数据库就绪，恢复任务=%s，过期会话清理已启动，pipeline_version=%s，有效工具=%s",
+        recovery, PIPELINE_VERSION, sorted(registry.TOOLS),
+    )
     start_exporter()
     try:
         yield
